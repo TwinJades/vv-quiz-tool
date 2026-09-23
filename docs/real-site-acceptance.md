@@ -29,10 +29,11 @@ QuizzyDaily 会把整场题目留在 DOM 中，仅显示当前题，且每题的
 
 | 题型 | 测试入口 | 页面核对 | VV 验收状态 |
 | --- | --- | --- | --- |
-| 多选及图片选项 | [H5P Image Choice](https://h5p.org/h5p/embed/1249570) | 已在隐藏浏览器看到 7 个图片选项，控件为 ARIA checkbox；修复了这类控件内的图片提取。 | 模型实测尚未完成：新站点权限请求在隐藏浏览器中未返回，不能算通过。 |
+| 多选及图片选项 | [H5P Image Choice](https://h5p.org/h5p/embed/1249570) | 已在隐藏浏览器看到 7 个图片选项，控件为 ARIA checkbox；修复了这类控件内的图片提取。 | 隐藏浏览器 + Gemini 3.8 实测：7 个图片选项中选中 4 个正确答案，网站 4/4，VV COMPLETE；1 次模型调用，0 猜答/重试/失败。 |
 | 多选 | [H5P APA Style Review](https://h5p.org/h5p/embed/1208207) | 已打开；多选题在课件后续页面，题干为“Why do we cite our sources? Select all that apply.” | 尚未完成交互和模型验收。 |
 | 多选 | [H5P ConfirmationDialog 示例](https://h5p.org/h5p/embed/1463425) | 已打开；两个 ARIA checkbox 和 Check 按钮，属于课件内控件。 | 尚未完成交互和模型验收。 |
 | 多空填空及题目图片 | [H5P Fill in the Blanks](https://h5p.org/node/611) | 已打开；首个示例在同源 iframe 中显示 3 个文本空格和图片。 | 尚未完成模型验收；此页直接 embed/837 返回 Content unavailable。 |
+| 多空填空 | [H5P Passive Voice Past Negative](https://h5p.org/h5p/embed/1039075) | 独立活动，5 个文本空格和 Check 按钮。 | 隐藏浏览器 + Gemini 3.8 实测：填写 5 空并提交，网站最终 5/5，VV COMPLETE；1 次模型调用，0 猜答/重试/失败。 |
 | 整页填空参考 | [EngQuiz Present Simple B1](https://www.engquiz.pro/grammar/exercises/tenses/gap-fill-present-simple-b1) | 已打开；同页 20 道填空。 | 属于 1.1.0 整页多题范围，不作为 1.0.0 逐题验收。 |
 | 主观题安全暂停 | [UBC H5P Essay 示例](https://h5p.open.ubc.ca/h5p-examples/essay/) | 页面说明主观题，但隐藏浏览器中嵌入内容未加载。 | 1.0.0 不自动作答；本地长文本框定向测试已验证作答前暂停，真实站点尚未验收。 |
 

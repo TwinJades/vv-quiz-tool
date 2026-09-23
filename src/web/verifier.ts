@@ -40,8 +40,8 @@ export class WebVerifier implements Verifier {
     if (
       failedAction ||
       (unknownAction && !strongControlSignal) ||
-      (!selectionMatches && !contextChanged) ||
-      (!valuesMatch && !contextChanged) ||
+      (!after.completed && !selectionMatches && !contextChanged) ||
+      (!after.completed && !valuesMatch && !contextChanged) ||
       (submitted && !submissionSignal) ||
       (advanced && !contextChanged && !after.completed)
     ) {

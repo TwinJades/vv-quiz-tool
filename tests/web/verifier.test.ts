@@ -30,6 +30,16 @@ function plan(kind: "submit_question" | "advance"): ExecutionPlan {
 const succeeded: ActionResult[] = [{ action_id: "control", status: "succeeded" }];
 
 describe("WebVerifier", () => {
+  it("accepts a scored result page after question controls disappear", () => {
+    const result = new WebVerifier().verify(baseState, plan("submit_question"), succeeded, {
+      ...baseState,
+      fingerprint: "missing",
+      selected_target_ids: [],
+      completed: true,
+    });
+    expect(result).toMatchObject({ status: "verified", stage: "session_completed", next_action: "complete" });
+  });
+
   it("does not treat a successful click alone as verified submission", () => {
     const result = new WebVerifier().verify(baseState, plan("submit_question"), succeeded, baseState);
     expect(result).toMatchObject({ status: "uncertain", next_action: "pause" });

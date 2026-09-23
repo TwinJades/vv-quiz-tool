@@ -16,6 +16,12 @@ afterEach(() => {
 });
 
 describe("DomWebAdapter", () => {
+  it("recognizes a score page after a submitted question disappears", async () => {
+    document.body.innerHTML = "<main>You got 4 out of 4 points</main>";
+    const state = await new DomWebAdapter(document).readState(abortSignal());
+    expect(state).toMatchObject({ fingerprint: "missing", completed: true, visible_score: "4/4" });
+  });
+
   it("pauses before answering a free-form essay", async () => {
     document.body.innerHTML = `<form class="question"><h2>Explain your answer.</h2><textarea></textarea><button>Submit</button></form>`;
     const adapter = new DomWebAdapter(document);
@@ -106,6 +112,8 @@ describe("DomWebAdapter", () => {
     const plan = buildAnswerExecutionPlan(question, answer, locatorMap, "supervised");
     await adapter.execute(plan, locatorMap, abortSignal());
     expect(Array.from(document.querySelectorAll<HTMLInputElement>("input")).map((input) => input.value)).toEqual(["A", "B"]);
+    const after = await adapter.readState(abortSignal());
+    expect(after.field_values).toMatchObject({ blank_1: "A", blank_2: "B" });
   });
 
   it("prefers a quiz form over a navigation search field", async () => {

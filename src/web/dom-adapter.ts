@@ -186,6 +186,9 @@ function targetText(document: Document, element: HTMLElement): string {
   if (element.matches("input[type='radio'], input[type='checkbox'], [role='radio'], [role='checkbox']")) {
     return optionLabel(document, element);
   }
+  if (element.matches("input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']")) {
+    return labelText(document, element) || normalizedText(element.getAttribute("placeholder") || element.getAttribute("name"));
+  }
   return normalizedText(element instanceof HTMLInputElement ? element.value : element.getAttribute("aria-label") || element.textContent);
 }
 
@@ -199,7 +202,7 @@ function targetIdentity(
     role,
     question_fingerprint: questionFingerprint,
     input_name: elementInputName(element),
-    input_value: elementInputValue(element),
+    input_value: role === "blank" ? "" : elementInputValue(element),
     text_digest: fnv1a(targetText(document, element)),
   };
 }
@@ -575,6 +578,10 @@ export class DomWebAdapter implements PlatformAdapter {
     });
     const pathname = this.#document.location?.pathname ?? "";
     const completedPath = /\/(?:completed?|results?)\/?$/i.test(pathname);
+    const scoredMatches = [...pageText.matchAll(/you got\s+(\d+)\s+out of\s+(\d+)\s+points?/gi)];
+    const scoredResult = scoredMatches.length > 0 && this.#fingerprintCurrentQuestion() === "missing";
+    const finalScore = scoredMatches.at(-1);
+    const visibleScore = this.#readVisibleScore() ?? (finalScore ? `${finalScore[1]}/${finalScore[2]}` : null);
     const position = this.#readQuestionPosition();
     const sessionSubmit = this.#findButton(SESSION_SUBMIT_PATTERN);
     return {
@@ -584,7 +591,7 @@ export class DomWebAdapter implements PlatformAdapter {
       field_values: fieldValues,
       feedback,
       ...(feedbackEvidence.trim() ? { feedback_text: feedbackEvidence.trim() } : {}),
-      ...(this.#readVisibleScore() ? { visible_score: this.#readVisibleScore()! } : {}),
+      ...(visibleScore ? { visible_score: visibleScore } : {}),
       can_retry:
         this.#findButton(RETRY_PATTERN) !== null ||
         (feedback === "incorrect" && editableAnswerTarget),
@@ -593,6 +600,7 @@ export class DomWebAdapter implements PlatformAdapter {
       at_last_question: position !== null && position.current >= position.total,
       completed:
         completedPath ||
+        scoredResult ||
         /quiz complete|test complete|interview complete|completed|your results?|测验完成|测试完成|答题完成|已交卷/i.test(pageText),
     };
   }
