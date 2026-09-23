@@ -1,0 +1,8 @@
+node_modules/
+coverage/
+dist/
+*.tsbuildinfo
+*.log
+.browser-regression-runtime/
+.edge-real-regression-profile/
+.pnpm-store/

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VV 自动答题</title>
+    <link rel="stylesheet" href="ui.css">
+  </head>
+  <body class="popup-page">
+    <main>
+      <header class="popup-header">
+        <div><span class="eyebrow">VV 1.0</span><h1>自动答题</h1></div>
+        <button id="open-options" class="icon-button" type="button" aria-label="打开设置">设置</button>
+      </header>
+      <section class="panel compact">
+        <label>Provider<select id="provider"></select></label>
+        <label>模型<select id="model"></select></label>
+        <div class="split">
+          <label>策略<select id="strategy"><option value="supervised">监督自动</option><option value="unattended">无人值守</option></select></label>
+          <label>调用上限<input id="call-limit" type="number" min="1" value="300"></label>
+        </div>
+        <div class="input-mode">
+          <div class="input-mode-heading"><span>模型输入</span><strong id="input-mode-title">首次快照</strong></div>
+          <div class="mode-slider" id="mode-slider">
+            <div class="mode-slider-track" aria-hidden="true"><span class="mode-slider-thumb"></span></div>
+            <input id="input-mode" type="range" min="0" max="2" step="0.01" value="1" aria-label="模型输入模式" aria-describedby="input-mode-description">
+          </div>
+          <p id="input-mode-description" class="input-mode-description">首次发送清洗后的页面文本与控件，后续发送结构化题目；结构失效时重新校准。</p>
+        </div>
+        <button id="start" class="primary" type="button">启动当前测验</button>
+      </section>
+      <section class="panel compact status-panel">
+        <div class="status-heading"><span>会话状态</span><strong id="session-status">未启动</strong></div>
+        <p id="session-detail" class="muted">打开一个逐题测验后启动。</p>
+        <p id="session-progress" class="progress"></p>
+        <div class="button-grid">
+          <button id="pause" type="button" disabled>暂停</button>
+          <button id="resume" type="button" disabled>继续</button>
+          <button id="stop" type="button" disabled>停止</button>
+          <button id="clear" type="button" disabled>清除</button>
+        </div>
+        <button id="apply-strategy" type="button" disabled>从下一动作应用当前策略</button>
+      </section>
+      <p class="privacy">页面、图片和模型输出均按不可信数据处理。遇到验证码、登录失效或监考提示会停止。</p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VV Provider 设置</title>
+    <link rel="stylesheet" href="ui.css">
+  </head>
+  <body class="options-page">
+    <main>
+      <header class="page-header">
+        <div><span class="eyebrow">VV 1.0</span><h1>Provider 设置</h1></div>
+        <button id="new-profile" type="button">新建配置</button>
+      </header>
+      <p class="notice">所有配置与密钥仅保存在浏览器本地。API Key 不会显示在 Provider 列表中。</p>
+      <section class="panel">
+        <h2>本地 Provider</h2>
+        <div id="profile-list" class="stack"></div>
+      </section>
+      <section class="panel">
+        <h2>编辑配置</h2>
+        <form id="provider-form" class="form-grid">
+          <input id="profile-id" type="hidden">
+          <label>显示名称<input id="display-name" required autocomplete="off" placeholder="例如：个人 CPA"></label>
+          <label>OpenAI Compatible Base URL<input id="base-url" type="url" required placeholder="https://provider.example/v1"></label>
+          <label>API Key<input id="api-key" type="password" autocomplete="new-password" placeholder="编辑时留空表示保持原值"></label>
+          <label>模型 ID（自动读取失败时每行填写一个）<textarea id="models" rows="5" placeholder="model-a&#10;model-b"></textarea></label>
+          <label class="check"><input id="image-input" type="checkbox">该模型支持图片输入</label>
+          <label class="check"><input id="image-authorization" type="checkbox">允许将必要题目图片发送给此 Provider</label>
+          <p class="muted full">图片授权只保存在本机。VV 不会上传整页截图；当前版本不做 OCR。</p>
+          <button class="primary full" type="submit">保存 Provider</button>
+        </form>
+        <p id="status" role="status"></p>
+      </section>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>
