@@ -11,6 +11,7 @@
       <header class="popup-header">
         <div><span class="eyebrow">VV 1.0</span><h1>自动答题</h1></div>
         <button id="open-options" class="icon-button" type="button" aria-label="打开设置">设置</button>
+        <button id="open-tasks" class="icon-button" type="button">所有任务</button>
       </header>
       <section class="panel compact">
         <label>Provider<select id="provider"></select></label>
@@ -20,16 +21,30 @@
           <label>调用上限<input id="call-limit" type="number" min="1" value="300"></label>
         </div>
         <div class="input-mode">
-          <div class="input-mode-heading"><span>模型输入</span><strong id="input-mode-title">首次快照</strong></div>
+          <div class="input-mode-heading"><span>模型输入</span><strong id="input-mode-title">允许快照</strong></div>
           <div class="mode-slider" id="mode-slider">
             <div class="mode-slider-track" aria-hidden="true"><span class="mode-slider-thumb"></span></div>
             <input id="input-mode" type="range" min="0" max="2" step="0.01" value="1" aria-label="模型输入模式" aria-describedby="input-mode-description">
           </div>
-          <p id="input-mode-description" class="input-mode-description">首次发送清洗后的页面文本与控件，后续发送结构化题目；结构失效时重新校准。</p>
+          <p id="input-mode-description" class="input-mode-description">首次默认发送页面语义快照；题型或控件结构变化时再次发送，辅助识别网页结构。</p>
         </div>
         <button id="start" class="primary" type="button">启动当前测验</button>
+        <label class="check"><input id="native-search" type="checkbox" disabled>本场允许 Provider 原生网页搜索</label>
+        <p class="muted" id="native-search-description">仅明确支持的模型可开启；必要题目内容会发送给所选 Provider 的搜索功能。</p>
       </section>
       <section class="panel compact status-panel">
+        <details id="course-mode"><summary>学习通／知到课程模式（实验）</summary>
+          <p class="muted">先自行登录并进入课程，再读取目录和明确选择范围。当前为课程核心实验入口，两平台真实页面结构仍待适配；可先生成只读结构资料。</p>
+          <button id="preview-course" type="button">读取当前课程（只读）</button>
+          <button id="inspect-course" type="button">生成只读结构资料</button>
+          <textarea id="course-inspection" rows="5" readonly hidden aria-label="只读课程结构资料，可全选复制"></textarea>
+          <p id="course-preview" class="muted"></p>
+          <label>本次范围<select id="course-range" disabled><option value="">请先读取目录</option></select></label>
+          <div id="course-tasks"></div>
+          <p class="muted">仅视频及关联课时/章节测验；不含期末考试、作业、讨论和见面课。模型按3.8 Flash→3.7 Flash→3.1 Pro授权顺序，共享上方调用上限。</p>
+          <p class="muted">播放前通过正常控件静音并确认。仅使用课程允许的播放器倍速；播放结束后仍须核对平台学习记录。</p>
+          <button id="start-course" type="button" disabled>启动选定课程范围</button>
+        </details>
         <div class="status-heading"><span>会话状态</span><strong id="session-status">未启动</strong></div>
         <p id="session-detail" class="muted">打开一个逐题测验后启动。</p>
         <p id="session-progress" class="progress"></p>

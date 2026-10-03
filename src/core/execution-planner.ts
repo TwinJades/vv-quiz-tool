@@ -31,10 +31,10 @@ function assertSameContext(question: QuestionFrame, answer: AnswerResult, locato
   }
 }
 
-function requireSemanticTarget(locatorMap: LocatorMap, targetId: string): void {
+function requireReliableTarget(locatorMap: LocatorMap, targetId: string): void {
   const target = locatorMap.targets[targetId];
-  if (!target || target.kind !== "semantic") {
-    throw new ExecutionPlanError(`No semantic target exists for ${targetId}.`);
+  if (!target || (target.kind === "coordinate" && (target.confidence < 0.85 || !target.expected_label.trim()))) {
+    throw new ExecutionPlanError(`No reliable target exists for ${targetId}.`);
   }
 }
 
@@ -49,7 +49,7 @@ export function buildAnswerExecutionPlan(
 
   if (question.type === "fill_blank") {
     for (const item of answer.blank_answers) {
-      requireSemanticTarget(locatorMap, item.blank_id);
+      requireReliableTarget(locatorMap, item.blank_id);
       actions.push({
         action_id: `set_${item.blank_id}`,
         kind: "set_value",
@@ -59,8 +59,11 @@ export function buildAnswerExecutionPlan(
     }
   } else {
     const selected = new Set(answer.selected_option_ids);
-    for (const option of question.options) {
-      requireSemanticTarget(locatorMap, option.id);
+    // Some single-choice widgets navigate immediately on selection. Clear
+    // non-selected controls first so no stale actions follow the final click.
+    const orderedOptions = [...question.options].sort((left, right) => Number(selected.has(left.id)) - Number(selected.has(right.id)));
+    for (const option of orderedOptions) {
+      requireReliableTarget(locatorMap, option.id);
       actions.push({
         action_id: `select_${option.id}`,
         kind: "set_selected",

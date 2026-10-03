@@ -120,12 +120,12 @@ export function validateBatchAnswer(
   const missingQuestionIds = batch.question_ids.filter(
     (questionId) => !seenIds.has(questionId) && !explicitErrorIds.has(questionId),
   );
-  const failedQuestionIds = batch.question_ids.filter((questionId) => !acceptedIds.has(questionId));
-
+  const rejectedIds = new Set([...explicitErrorIds, ...issues.filter(issue => issue.code === "DUPLICATE_QUESTION_RESULT").map(issue => issue.question_id!)]);
+  for (const id of rejectedIds) acceptedIds.delete(id);
   return {
-    valid_answers: validAnswers,
-    executable_answers: executableAnswers,
-    failed_question_ids: failedQuestionIds,
+    valid_answers: validAnswers.filter(answer => !rejectedIds.has(answer.question_id)),
+    executable_answers: executableAnswers.filter(answer => !rejectedIds.has(answer.question_id)),
+    failed_question_ids: batch.question_ids.filter(questionId => !acceptedIds.has(questionId)),
     missing_question_ids: missingQuestionIds,
     issues,
   };

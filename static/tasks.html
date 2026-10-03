@@ -1,0 +1,6 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VV 任务面板</title><link rel="stylesheet" href="ui.css"><style>
+body{max-width:1150px;margin:24px auto;padding:0 20px}.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.toolbar input{max-width:80px}.tasks{display:grid;gap:16px}.task h2{font-size:18px;margin:0}.task p{overflow-wrap:anywhere}.task-actions{display:flex;gap:8px;flex-wrap:wrap}.state{font-weight:700;color:#176b52}.task[data-paused=true] .state{color:#b54708}.notice{white-space:pre-wrap}.error{color:#b42318}
+</style></head><body><main><header><h1>VV 任务面板</h1><p class="muted">在各网站的 VV 弹窗启动测验，所有任务会显示在这里。每场使用独立的 Provider、模型及调用额度。</p></header>
+<section class="panel"><div class="toolbar"><label>最多同时运行<input id="concurrency" type="number" min="1" max="10" value="3"></label><button id="apply" type="button">应用</button><strong id="queue"></strong></div><p class="muted">超出上限的任务按启动顺序排队。无人值守关闭面板后继续；监督自动失去所有控制面板时暂停。关闭网站标签会清除该场临时总结。</p><p id="error" class="error" role="alert"></p></section>
+<section id="tasks" class="tasks" aria-live="polite"></section></main><script src="tasks.js"></script></body></html>

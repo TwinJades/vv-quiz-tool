@@ -60,6 +60,7 @@ export interface PlatformObservation {
 }
 
 export interface PlatformState {
+  timer_remaining_seconds?: number | null;
   observation_id: string;
   fingerprint: string;
   selected_target_ids: string[];
@@ -75,6 +76,7 @@ export interface PlatformState {
 }
 
 export interface PlatformAdapter {
+  readTimer?(signal: AbortSignal): Promise<number | null>;
   capabilities(): PlatformCapabilities;
   waitUntilReady(signal: AbortSignal): Promise<ReadinessResult>;
   observeSession(sessionId: string, signal: AbortSignal, mode?: ObservationInputMode): Promise<PlatformObservation>;

@@ -87,6 +87,7 @@ describe("validateBatchAnswer", () => {
       ]),
     );
     expect(result.missing_question_ids).toEqual(["q2"]);
+    expect(result.executable_answers).toEqual([]);
   });
 
   it("does not accept otherwise valid answers from the wrong batch", () => {
@@ -95,5 +96,11 @@ describe("validateBatchAnswer", () => {
     expect(result.executable_answers).toEqual([]);
     expect(result.failed_question_ids).toEqual(["q1", "q2"]);
     expect(result.issues).toEqual(expect.arrayContaining([expect.objectContaining({ code: "BATCH_MISMATCH" })]));
+  });
+
+  it("rejects an answer contradicted by a same-question error and keeps valid siblings", () => {
+    const result = validateBatchAnswer(batch, { ...response([answer(questions[0]!), answer(questions[1]!)]), errors: [{ question_id: "q1", code: "uncertain", retryable: true }] });
+    expect(result.executable_answers.map(item => item.question_id)).toEqual(["q2"]);
+    expect(result.failed_question_ids).toEqual(["q1"]);
   });
 });

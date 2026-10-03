@@ -8,6 +8,7 @@ export class ModelCallLimitError extends Error {
 export class ModelCallBudget {
   readonly limit: number;
   #used = 0;
+  #reserved = 0;
 
   constructor(limit = 300) {
     if (!Number.isInteger(limit) || limit <= 0) {
@@ -21,15 +22,28 @@ export class ModelCallBudget {
   }
 
   get remaining(): number {
-    return this.limit - this.#used;
+    return this.limit - this.#used - this.#reserved;
   }
 
   consume(): number {
-    if (this.#used >= this.limit) {
+    if (this.remaining <= 0) {
       throw new ModelCallLimitError(this.limit);
     }
     this.#used += 1;
     return this.#used;
+  }
+
+  reserve(amount: number): { settle: (actual: number) => void } {
+    if (!Number.isInteger(amount) || amount <= 0) throw new RangeError("Reservation must be a positive integer.");
+    if (amount > this.remaining) throw new ModelCallLimitError(this.limit);
+    this.#reserved += amount;
+    let settled = false;
+    return { settle: actual => {
+      if (settled || !Number.isInteger(actual) || actual < 0 || actual > amount) throw new RangeError("Invalid call reservation settlement.");
+      settled = true;
+      this.#reserved -= amount;
+      this.#used += actual;
+    } };
   }
 }
 

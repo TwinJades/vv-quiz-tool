@@ -404,13 +404,22 @@ export const quizSessionSchema = z
   .strict();
 export type QuizSession = z.infer<typeof quizSessionSchema>;
 
+export const modelBatchLimitsSchema = z.object({
+  max_questions: z.number().int().min(1).max(50),
+  max_estimated_tokens: z.number().int().min(1).max(10000000),
+  max_images: z.number().int().min(0).max(64),
+}).strict();
+
 export const providerProfileSchema = z
   .object({
     schema_version: z.literal(SCHEMA_VERSION),
     provider_profile_id: idSchema,
     display_name: z.string().trim().min(1),
-    provider_type: z.literal("openai_compatible"),
-    base_url: z.string().url().refine((value) => value.startsWith("https://") || value.startsWith("http://localhost") || value.startsWith("http://127.0.0.1"), {
+    provider_type: z.enum(["openai_compatible", "google", "anthropic"]),
+    base_url: z.string().url().refine((value) => {
+      const url = new URL(value);
+      return url.protocol === "https:" || (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
+    }, {
       message: "Provider URL must use HTTPS unless it is a local development endpoint.",
     }),
     secret_ref: idSchema,
@@ -419,16 +428,29 @@ export const providerProfileSchema = z
         source: z.enum(["provider_api", "manual"]),
         models: z.array(idSchema),
         refreshed_at: isoDateSchema.nullable(),
+        input_token_limits: z.record(idSchema, z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).optional(),
       })
       .strict(),
     capabilities: z
       .object({
         image_input: z.boolean(),
         structured_output: z.boolean(),
-        native_web_search: z.literal(false),
+        native_web_search: z.boolean(),
       })
       .strict(),
     image_upload_authorized: z.boolean(),
+    native_web_search_model_ids: z.array(idSchema).optional(),
+    model_batch_limits: z.record(idSchema, modelBatchLimitsSchema).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((profile, context) => {
+    if (profile.capabilities.native_web_search &&
+      (profile.provider_type !== "anthropic" || !profile.native_web_search_model_ids?.length)) {
+      context.addIssue({ code: "custom", path: ["capabilities", "native_web_search"],
+        message: "Native search requires the Anthropic adapter and explicitly confirmed model ids." });
+    }
+    if (profile.native_web_search_model_ids?.some(id => !profile.model_catalog.models.includes(id))) {
+      context.addIssue({ code: "custom", path: ["native_web_search_model_ids"], message: "Search model ids must belong to this model catalog." });
+    }
+  });
 export type ProviderProfile = z.infer<typeof providerProfileSchema>;

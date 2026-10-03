@@ -6,3 +6,6 @@ export * from "./orchestrator";
 export * from "./platform";
 export * from "./schema";
 export * from "./session-machine";
+export * from "./session-queue";
+export * from "./batch-planner";
+export * from "./course";

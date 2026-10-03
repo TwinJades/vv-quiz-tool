@@ -2,6 +2,10 @@ import type { ObservationInputMode, ProviderProfile, RunStrategy, SessionRuntime
 import { ProviderManager } from "../provider/provider-manager";
 import type { ExtensionRequest } from "./messages";
 import { ChromeLocalStore } from "./storage";
+import { supportsNativeSearch } from "../provider/provider-capabilities";
+import { requestCurrentWebsite } from "./website-access";
+import { courseModels, validateCourseScope } from '../core/course';
+import type { CourseCatalog } from '../core/course';
 
 interface RuntimeResponse<T> {
   ok: boolean;
@@ -19,11 +23,15 @@ interface PopupPreferences {
 const POPUP_PREFERENCES_KEY = "vv-popup-preferences";
 
 const manager = new ProviderManager(new ChromeLocalStore());
+document.querySelector("#open-tasks")!.addEventListener("click", () => {
+  void chrome.tabs.create({ url: chrome.runtime.getURL("tasks.html") });
+});
 const providerSelect = document.querySelector<HTMLSelectElement>("#provider")!;
 const modelSelect = document.querySelector<HTMLSelectElement>("#model")!;
 const strategySelect = document.querySelector<HTMLSelectElement>("#strategy")!;
 const callLimit = document.querySelector<HTMLInputElement>("#call-limit")!;
 const inputMode = document.querySelector<HTMLInputElement>("#input-mode")!;
+const nativeSearch = document.querySelector<HTMLInputElement>("#native-search")!;
 const modeSlider = document.querySelector<HTMLElement>("#mode-slider")!;
 const inputModeTitle = document.querySelector<HTMLElement>("#input-mode-title")!;
 const inputModeDescription = document.querySelector<HTMLElement>("#input-mode-description")!;
@@ -40,11 +48,65 @@ let profiles: ProviderProfile[] = [];
 let activeTabId: number | undefined;
 let activeTabUrl: string | undefined;
 let port: chrome.runtime.Port | undefined;
+let courseCatalog: CourseCatalog | null = null;
+let hasLiveSession=false;
+const courseRange = document.querySelector<HTMLSelectElement>('#course-range')!;
+const courseStart = document.querySelector<HTMLButtonElement>('#start-course')!;
+const coursePreview = document.querySelector<HTMLElement>('#course-preview')!;
+function courseScope():string[] {
+  if(!courseCatalog||!courseRange.value)return [];
+  return courseCatalog.tasks.filter(task=>task.kind!=='excluded'&&(courseRange.value==='all'||courseRange.value==='lesson:'+task.lesson_id||courseRange.value==='chapter:'+task.chapter_id)).map(task=>task.id);
+}
+function renderCourseScope():void {
+  const ids=courseScope();const container=document.querySelector('#course-tasks')!;container.replaceChildren();
+  for(const task of courseCatalog?.tasks.filter(t=>ids.includes(t.id))??[]){const p=document.createElement('p');p.textContent=`${task.title} · ${task.kind} · ${task.status}`;container.append(p);}
+  courseStart.disabled=ids.length===0||hasLiveSession;
+}
+courseRange.addEventListener('change',renderCourseScope);
+document.querySelector('#inspect-course')!.addEventListener('click',()=>{
+  void(async()=>{
+    if(activeTabId===undefined)throw new Error('没有当前网站标签页。');
+    await requestCurrentWebsite(activeTabId);
+    const result=await send<unknown>({type:'VV_INSPECT_COURSE',tab_id:activeTabId});
+    const output=document.querySelector<HTMLTextAreaElement>('#course-inspection')!;
+    output.value=JSON.stringify(result,null,2);output.hidden=false;output.focus();output.select();
+    coursePreview.textContent='只读结构资料已生成，可复制；不会播放视频、作答或提交。';
+  })().catch(error=>{coursePreview.textContent=String(error.message||error);});
+});
+document.querySelector('#preview-course')!.addEventListener('click',()=>{
+  void (async()=>{
+    courseCatalog=null;courseRange.disabled=true;courseStart.disabled=true;coursePreview.textContent='正在只读核对目录…';
+    if(activeTabId===undefined)throw new Error('没有当前课程标签页。');
+    await requestCurrentWebsite(activeTabId);
+    const catalog=await send<CourseCatalog>({type:'VV_PREVIEW_COURSE',tab_id:activeTabId});
+    if(!catalog.complete||catalog.diagnostics.length)throw new Error(catalog.diagnostics.join('；')||'目录不完整。');
+    courseCatalog=catalog;coursePreview.textContent=`${catalog.platform==='chaoxing'?'学习通':'知到'} · ${catalog.title} · ${catalog.tasks.length}个已识别任务`;
+    courseRange.replaceChildren();
+    for(const [value,label] of [['','请选择范围'],['all','当前课程全部视频及关联测验'],
+      ...[...new Set(catalog.tasks.map(t=>t.chapter_id))].map(id=>['chapter:'+id,'章节 '+id]),
+      ...[...new Set(catalog.tasks.map(t=>t.lesson_id))].map(id=>['lesson:'+id,'课时 '+id])]){const option=document.createElement('option');option.value=value!;option.textContent=label!;courseRange.append(option);}
+    courseRange.disabled=false;renderCourseScope();
+  })().catch(error=>{coursePreview.textContent=String(error.message||error);});
+});
+courseStart.addEventListener('click',()=>{
+  void (async()=>{
+    if(!courseCatalog||activeTabId===undefined)throw new Error('请先读取并选择课程范围。');
+    const scope=courseScope();validateCourseScope(courseCatalog,scope);
+    const profile=profiles.find(p=>p.provider_profile_id===providerSelect.value);if(!profile)throw new Error('请先配置Provider。');
+    const model=courseModels(profile.model_catalog.models)[0];if(!model)throw new Error('当前Provider没有授权Gemini课程模型。');
+    const limit=Number(callLimit.value);if(!Number.isInteger(limit)||limit<=0)throw new Error('调用上限必须为正整数。');
+    await requestCurrentWebsite(activeTabId);
+    const snapshot=await send<SessionRuntimeSnapshot>({type:'VV_START_SESSION',tab_id:activeTabId,provider_profile_id:profile.provider_profile_id,model_id:model,
+      strategy:strategySelect.value as RunStrategy,model_call_limit:limit,observation_input_mode:'structured',
+      course:{course_id:courseCatalog.course_id,platform:courseCatalog.platform,scope,revision:courseCatalog.revision}});
+    renderSession(snapshot);
+  })().catch(error=>setError(String(error.message||error)));
+});
 
 const INPUT_MODES: Array<{ value: ObservationInputMode; title: string; description: string }> = [
   { value: "structured", title: "仅结构化数据", description: "只发送数据分离层提取的题干、选项和必要图片。" },
-  { value: "semantic_snapshot", title: "首次快照", description: "首次发送清洗后的页面文本与控件，后续发送结构化题目；结构失效时重新校准。" },
-  { value: "visual_snapshot", title: "允许加入截图", description: "再加入当前可见页面截图供模型解答与分离；需要 Provider 已授权图片输入。" },
+  { value: "semantic_snapshot", title: "允许快照", description: "首次默认发送页面语义快照；题型或控件结构变化时再次发送，辅助识别网页结构。" },
+  { value: "visual_snapshot", title: "允许加入截图", description: "必要区域截图发送给已授权图片输入的 Provider；Canvas 可据截图定位并操作，浏览器可能显示调试连接提示。" },
 ];
 
 function selectedInputMode(): ObservationInputMode {
@@ -101,6 +163,14 @@ function renderModels(): void {
     option.textContent = model;
     modelSelect.append(option);
   }
+  renderSearchPermission();
+}
+
+function renderSearchPermission(): void {
+  const profile = profiles.find(item => item.provider_profile_id === providerSelect.value);
+  const supported = Boolean(profile && supportsNativeSearch(profile, modelSelect.value));
+  nativeSearch.disabled = !supported;
+  if (!supported) nativeSearch.checked = false;
 }
 
 async function loadPreferences(): Promise<PopupPreferences> {
@@ -121,13 +191,21 @@ async function savePreferences(): Promise<void> {
 }
 
 function renderSession(snapshot: SessionRuntimeSnapshot | null): void {
+  hasLiveSession=Boolean(snapshot&&!['COMPLETE','CANCELLED','FAILED'].includes(snapshot.state));
   const active = snapshot && !["COMPLETE", "CANCELLED", "FAILED", "PAUSED"].includes(snapshot.state);
   statusText.dataset.kind = snapshot?.state === "FAILED" ? "error" : snapshot?.state === "PAUSED" ? "warning" : "";
   statusText.textContent = snapshot?.state ?? "未启动";
-  detailText.textContent = snapshot?.notice ?? "打开一个逐题测验后启动。";
+  detailText.textContent = /question_not_found|readiness_timeout/.test(snapshot?.notice??'')
+    ? '尚未识别到题目控件，未开始求解。请确认已进入答题页、已授予该页网站权限；可在课程模式中生成只读结构资料定位原因。'
+    : snapshot?.notice ?? "打开一个逐题测验后启动。";
   progressText.textContent = snapshot
     ? `已答 ${snapshot.progress.answered} · 猜答 ${snapshot.progress.guessed} · 重试 ${snapshot.progress.retried} · 调用 ${snapshot.model_calls.used}/${snapshot.model_calls.limit}`
     : "";
+  if(snapshot?.course){
+    detailText.textContent=[snapshot.notice,`${snapshot.course.title} · ${snapshot.course.phase}`,
+      `预计剩余播放时间：${snapshot.course.estimate_seconds===null?'暂无法估计':snapshot.course.estimate_seconds+'秒'}${snapshot.course.estimate_frozen?'（冻结）':''}；不含答题、缓冲及平台同步耗时。`].filter(Boolean).join('\n');
+  }
+  courseStart.disabled=hasLiveSession||courseScope().length===0;
   startButton.disabled = Boolean(snapshot && !["COMPLETE", "CANCELLED", "FAILED"].includes(snapshot.state));
   inputMode.disabled = Boolean(snapshot && !["COMPLETE", "CANCELLED", "FAILED"].includes(snapshot.state));
   pauseButton.disabled = !active;
@@ -173,6 +251,7 @@ async function initialize(): Promise<void> {
   if (preferences.model_id && Array.from(modelSelect.options).some((option) => option.value === preferences.model_id)) {
     modelSelect.value = preferences.model_id;
   }
+  renderSearchPermission();
   if (preferences.strategy && ["supervised", "unattended"].includes(preferences.strategy)) {
     strategySelect.value = preferences.strategy;
   }
@@ -198,10 +277,11 @@ async function initialize(): Promise<void> {
 }
 
 providerSelect.addEventListener("change", () => {
+  nativeSearch.checked = false;
   renderModels();
   void savePreferences();
 });
-modelSelect.addEventListener("change", () => void savePreferences());
+modelSelect.addEventListener("change", () => { nativeSearch.checked = false; renderSearchPermission(); void savePreferences(); });
 strategySelect.addEventListener("change", () => void savePreferences());
 inputMode.addEventListener("pointerdown", () => modeSlider.classList.add("is-dragging"));
 inputMode.addEventListener("input", renderInputMode);
@@ -229,6 +309,7 @@ startButton.addEventListener("click", async () => {
       strategy: strategySelect.value as RunStrategy,
       model_call_limit: limit,
       observation_input_mode: selectedInputMode(),
+      allow_native_search: !nativeSearch.disabled && nativeSearch.checked,
     } satisfies ExtensionRequest;
     await savePreferences();
     const origins = await tabSitePermissionOrigins(activeTabId, activeTabUrl);
@@ -258,16 +339,10 @@ pauseButton.addEventListener("click", async () => {
 });
 resumeButton.addEventListener("click", async () => {
   if (activeTabId === undefined) return;
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab?.url?.startsWith("http")) {
-    const origins = await tabSitePermissionOrigins(activeTabId, tab.url);
-    const granted = await chrome.permissions.request({ origins });
-    if (!granted) {
-      setError("恢复前需要当前网站权限。");
-      return;
-    }
-  }
-  renderSession(await send({ type: "VV_RESUME_SESSION", tab_id: activeTabId }));
+  try {
+    await requestCurrentWebsite(activeTabId);
+    renderSession(await send({ type: "VV_RESUME_SESSION", tab_id: activeTabId }));
+  } catch (error) { setError(error instanceof Error ? error.message : "恢复失败。"); }
 });
 applyStrategyButton.addEventListener("click", async () => {
   if (activeTabId === undefined) return;

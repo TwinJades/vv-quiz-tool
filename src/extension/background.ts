@@ -1,21 +1,37 @@
-import { ModelCallBudget, QuizOrchestrator } from "../core";
+import { ModelCallBudget, QuizOrchestrator, SessionQueue } from "../core";
 import type { SessionRuntimeSnapshot } from "../core";
 import { ProviderManager } from "../provider/provider-manager";
 import { VercelAiSolverProvider } from "../provider/solver-provider";
+import { supportsNativeSearch } from "../provider/provider-capabilities";
 import { WebVerifier } from "../web/verifier";
-import type { ArmSessionStartRequest, ExtensionRequest, StartSessionRequest } from "./messages";
+import type { ArmSessionStartRequest, ExtensionRequest, StartSessionRequest, TaskPanelSnapshot } from "./messages";
 import { ChromeLocalStore } from "./storage";
 import { ensureContentInjected, TabPlatformProxy } from "./tab-platform";
+import { requireCurrentWebsite, websiteIsAuthorized } from "./website-access";
+import { SessionAttentionNotifications } from "./attention-notifications";
+import { CourseTabPlatform, createCourseRun } from './course-platform';
+import type { CourseOrchestrator } from '../core/course';
 
 interface ManagedSession {
-  orchestrator: QuizOrchestrator;
+  orchestrator: QuizOrchestrator | CourseOrchestrator;
+  platform: TabPlatformProxy | CourseTabPlatform;
   snapshot: SessionRuntimeSnapshot;
-  lastNotifiedState?: string;
+  attention: SessionAttentionNotifications;
 }
 
 const sessions = new Map<number, ManagedSession>();
 const startupFailures = new Map<number, SessionRuntimeSnapshot>();
 const pendingCommits = new Map<number, Promise<SessionRuntimeSnapshot>>();
+const startingTabs = new Set<number>();
+const controls = new Map<chrome.runtime.Port, number | "all">();
+const latestMainNavigation = new Map<number, string>();
+const queue = new SessionQueue((tabId, error) => {
+  sessions.get(tabId)?.orchestrator.pause(publicError(error));
+});
+const queueReady = chrome.storage.local.get("vv-concurrency").then(data => {
+  const limit = data["vv-concurrency"];
+  if (typeof limit === "number" && Number.isInteger(limit) && limit >= 1 && limit <= 10) queue.setConcurrency(limit);
+});
 const PENDING_START_PREFIX = "vv-pending-start:";
 const SESSION_SNAPSHOT_PREFIX = "vv-session-snapshot:";
 const PENDING_START_LIFETIME_MS = 2 * 60 * 1000;
@@ -147,18 +163,17 @@ async function updateBadge(tabId: number, snapshot: SessionRuntimeSnapshot): Pro
 }
 
 async function notifyAttention(tabId: number, session: ManagedSession): Promise<void> {
-  const { snapshot } = session;
-  if (!["PAUSED", "FAILED"].includes(snapshot.state) || session.lastNotifiedState === snapshot.state) return;
-  session.lastNotifiedState = snapshot.state;
+  const notice = session.attention.next(session.snapshot);
+  if (!notice) return;
   await chrome.notifications.create(`vv-${tabId}-${Date.now()}`, {
     type: "basic",
     iconUrl: NOTIFICATION_ICON,
-    title: snapshot.state === "FAILED" ? "VV session failed" : "VV session paused",
-    message: snapshot.notice ?? "Open VV to review the session.",
+    ...notice,
   });
 }
 
 async function startSession(request: StartSessionRequest): Promise<SessionRuntimeSnapshot> {
+  await queueReady;
   const existing = sessions.get(request.tab_id);
   if (existing && !["COMPLETE", "CANCELLED", "FAILED"].includes(existing.snapshot.state)) {
     throw new Error("This tab already has an active VV session.");
@@ -168,15 +183,39 @@ async function startSession(request: StartSessionRequest): Promise<SessionRuntim
   if (!profile.model_catalog.models.includes(request.model_id)) {
     throw new Error("The selected model is not configured in this Provider profile.");
   }
+  if (request.allow_native_search === true && !supportsNativeSearch(profile, request.model_id)) {
+    throw new Error("当前接口或模型未明确支持原生网页搜索，请关闭本场搜索或选择已确认支持的模型。");
+  }
   if (
-    request.observation_input_mode === "visual_snapshot" &&
+    !request.course && request.observation_input_mode === "visual_snapshot" &&
     (!profile.image_upload_authorized || !profile.capabilities.image_input)
   ) {
     throw new Error("截图模式需要当前 Provider 已授权并支持图片输入。");
   }
+  await requireCurrentWebsite(request.tab_id);
   await ensureContentInjected(request.tab_id);
 
   const budget = new ModelCallBudget(request.model_call_limit);
+  if (request.course) {
+    const previewPlatform = new CourseTabPlatform(request.tab_id,crypto.randomUUID(),request.course.course_id);
+    const catalog = await previewPlatform.preview(new AbortController().signal);
+    if(catalog.course_id!==request.course.course_id||catalog.platform!==request.course.platform||catalog.revision!==request.course.revision)throw new Error('课程预览已改变，请重新读取并选择范围。');
+    let managed: ManagedSession;
+    const {orchestrator,platform} = await createCourseRun(request.tab_id,profile,await providerManager.getApiKey(profile),budget,{
+      session_id:crypto.randomUUID(),catalog,scope:request.course.scope,strategy:request.strategy,provider_profile_id:profile.provider_profile_id,
+      on_update:snapshot=>{
+        managed.snapshot=snapshot;if(sessions.get(request.tab_id)!==managed)return;
+        void saveSessionSnapshot(request.tab_id,snapshot);void updateBadge(request.tab_id,snapshot);
+        void notifyAttention(request.tab_id,managed).catch(()=>{});
+        if(['PAUSED','COMPLETE','FAILED','CANCELLED'].includes(snapshot.state))void platform.disableInteraction().catch(()=>{});
+      },
+    });
+    managed={orchestrator,platform,attention:new SessionAttentionNotifications(),snapshot:{...orchestrator.snapshot(),state:'QUEUED',notice:'等待课程运行名额。'}};
+    sessions.set(request.tab_id,managed);startupFailures.delete(request.tab_id);
+    await saveSessionSnapshot(request.tab_id,managed.snapshot);
+    try{await platform.enableInteraction();}catch(error){orchestrator.stop('课程人工操作保护安装失败。');sessions.delete(request.tab_id);throw error;}
+    queue.enqueue(request.tab_id,()=>orchestrator.run());return managed.snapshot;
+  }
   const solver = new VercelAiSolverProvider(
     profile,
     request.model_id,
@@ -186,7 +225,8 @@ async function startSession(request: StartSessionRequest): Promise<SessionRuntim
   const platform = new TabPlatformProxy(
     request.tab_id,
     request.observation_input_mode,
-    (snapshot) => solver.calibrateSeparation(snapshot),
+    (snapshot, signal) => solver.calibrateSeparation(snapshot, signal),
+    (capture, signal, context) => solver.recognizeVisual(capture, signal, context),
   );
   const sessionId = crypto.randomUUID();
   let managed: ManagedSession;
@@ -199,19 +239,49 @@ async function startSession(request: StartSessionRequest): Promise<SessionRuntim
     model_call_limit: request.model_call_limit,
     model_call_budget: budget,
     image_upload_authorized: profile.image_upload_authorized,
+    allow_native_search: request.allow_native_search === true,
     on_update: (snapshot) => {
       managed.snapshot = snapshot;
+      if (sessions.get(request.tab_id) !== managed) return;
       void saveSessionSnapshot(request.tab_id, snapshot);
       void updateBadge(request.tab_id, snapshot);
-      void notifyAttention(request.tab_id, managed);
+      void notifyAttention(request.tab_id, managed).catch(() => { /* Notification delivery failure must not interrupt controlled execution. */ });
+      if (["PAUSED", "COMPLETE", "FAILED", "CANCELLED"].includes(snapshot.state)) {
+        void platform.disableInteraction().catch(() => { /* Navigated/closed pages remain locally blocked. */ });
+      }
     },
   });
-  managed = { orchestrator, snapshot: orchestrator.snapshot() };
+  managed = { orchestrator, platform, attention: new SessionAttentionNotifications(), snapshot: { ...orchestrator.snapshot(), state: "QUEUED", notice: "等待并行运行名额。" } };
   sessions.set(request.tab_id, managed);
   startupFailures.delete(request.tab_id);
   await saveSessionSnapshot(request.tab_id, managed.snapshot);
-  void orchestrator.run();
+  try { await platform.enableInteraction(sessionId); }
+  catch (error) { orchestrator.stop("Manual interaction protection could not be installed."); sessions.delete(request.tab_id); throw error; }
+  if (managed.snapshot.state === "PAUSED") return managed.snapshot;
+  queue.enqueue(request.tab_id, () => orchestrator.run());
   return managed.snapshot;
+}
+
+async function scheduleStart(request: StartSessionRequest): Promise<SessionRuntimeSnapshot> {
+  if (startingTabs.has(request.tab_id) || queue.has(request.tab_id)) throw new Error("This tab already has a starting, running or queued task.");
+  startingTabs.add(request.tab_id);
+  try { return await startSession(request); }
+  finally { startingTabs.delete(request.tab_id); }
+}
+
+async function taskPanelSnapshot(): Promise<TaskPanelSnapshot> {
+  await queueReady;
+  const stored = await chrome.storage.session.get(null);
+  const ids = new Set([...sessions.keys(), ...startupFailures.keys(), ...Object.keys(stored).filter(key => key.startsWith(SESSION_SNAPSHOT_PREFIX)).map(key => Number(key.slice(SESSION_SNAPSHOT_PREFIX.length)))]);
+  const tasks: TaskPanelSnapshot["tasks"] = [];
+  for (const tabId of ids) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const snapshot = await visibleSessionSnapshot(tabId);
+      if (snapshot) tasks.push({ tab_id: tabId, title: tab.title || `标签 ${tabId}`, url: tab.url ?? null, provider_name: (await providerManager.get(snapshot.provider_profile_id))?.display_name || "Provider 已移除", snapshot, resumable: sessions.has(tabId) });
+    } catch { /* A closed target is not a task. */ }
+  }
+  return { ...queue.snapshot(), tasks };
 }
 
 function commitPendingStart(tabId: number): Promise<SessionRuntimeSnapshot> {
@@ -232,7 +302,7 @@ function commitPendingStart(tabId: number): Promise<SessionRuntimeSnapshot> {
     if (!granted) throw new Error("Website permission has not been granted yet.");
     await removePendingStart(tabId);
     try {
-      return await startSession(pending.start_request);
+      return await scheduleStart(pending.start_request);
     } catch (error) {
       const failure = startupFailure(pending.start_request, error);
       startupFailures.set(tabId, failure);
@@ -258,6 +328,38 @@ async function handleRequest(
   request: ExtensionRequest,
   sender: chrome.runtime.MessageSender,
 ): Promise<unknown> {
+  if (sender.id !== chrome.runtime.id) throw new Error("Only this extension may control VV tasks.");
+  if (request.type === "VV_USER_INTERACTION") {
+    const tabId = sender.tab?.id;
+    const session = tabId === undefined ? undefined : sessions.get(tabId);
+    if (!session || !session.platform.interactionMatches(request.session_id, request.epoch)) return { ignored: true };
+    queue.cancelQueued(tabId!);
+    session.orchestrator.pause("检测到你在测验页面点击或输入，已暂停。继续后会重新读取当前题目。");
+    return { paused: true };
+  }
+  if (sender.url && !sender.url.startsWith(chrome.runtime.getURL(""))) {
+    throw new Error("Website content may only report manual interaction in its own session.");
+  }
+  if (request.type === "VV_GET_TASKS") return taskPanelSnapshot();
+  if (request.type === 'VV_PREVIEW_COURSE') {
+    const platform = new CourseTabPlatform(request.tab_id,crypto.randomUUID(),'preview');
+    return platform.preview(new AbortController().signal);
+  }
+  if(request.type==='VV_INSPECT_COURSE'){
+    await requireCurrentWebsite(request.tab_id);
+    const frames=await ensureContentInjected(request.tab_id);
+    return Promise.all(frames.map(async frame=>{
+      const response=await chrome.tabs.sendMessage(request.tab_id,{type:'VV_INSPECT_COURSE_PAGE'},{frameId:frame});
+      if(!response?.ok)throw new Error(response?.error??'页面资料读取失败。');
+      return {frame_id:frame,inspection:response.result};
+    }));
+  }
+  if (request.type === "VV_SET_CONCURRENCY") {
+    await queueReady;
+    queue.setConcurrency(request.limit);
+    await chrome.storage.local.set({ "vv-concurrency": request.limit });
+    return taskPanelSnapshot();
+  }
   if (request.type === "VV_DELETE_PROVIDER") {
     await providerManager.delete(request.provider_profile_id);
     return { deleted: true };
@@ -271,7 +373,7 @@ async function handleRequest(
     await removePendingStart(request.tab_id);
     return { cancelled: true };
   }
-  if (request.type === "VV_START_SESSION") return startSession(request);
+  if (request.type === "VV_START_SESSION") return scheduleStart(request);
 
   const session = sessions.get(request.tab_id);
   if (request.type === "VV_GET_SESSION") return visibleSessionSnapshot(request.tab_id);
@@ -283,14 +385,26 @@ async function handleRequest(
     return null;
   }
   if (!session) throw new Error("No VV session exists for this tab.");
-  if (request.type === "VV_PAUSE_SESSION") session.orchestrator.pause();
-  if (request.type === "VV_RESUME_SESSION") void session.orchestrator.resume();
+  if (request.type === "VV_PAUSE_SESSION") { queue.cancelQueued(request.tab_id); session.orchestrator.pause(); }
+  if (request.type === "VV_RESUME_SESSION") {
+    if (session.snapshot.state !== "PAUSED") throw new Error("Only paused sessions can resume.");
+    if (queue.has(request.tab_id)) throw new Error("会话正在完成暂停，请稍后继续。");
+    await requireCurrentWebsite(request.tab_id, latestMainNavigation.get(request.tab_id));
+    await session.platform.enableInteraction(session.snapshot.session_id);
+    if (session.snapshot.state !== "PAUSED") throw new Error("Session changed while resuming.");
+    session.snapshot = { ...session.snapshot, state: "QUEUED", notice: "等待并行运行名额。" };
+    await saveSessionSnapshot(request.tab_id, session.snapshot);
+    queue.enqueue(request.tab_id, () => session.orchestrator.resume());
+    return session.snapshot;
+  }
   if (request.type === "VV_SWITCH_STRATEGY") session.orchestrator.switchStrategy(request.strategy);
-  if (request.type === "VV_STOP_SESSION") session.orchestrator.stop();
+  if (request.type === "VV_STOP_SESSION") { queue.cancelQueued(request.tab_id); session.orchestrator.stop(); }
   if (request.type === "VV_CLEAR_SESSION") {
     if (!["COMPLETE", "CANCELLED", "FAILED", "PAUSED"].includes(session.snapshot.state)) {
       throw new Error("Stop the active session before clearing it.");
     }
+    queue.cancelQueued(request.tab_id);
+    session.orchestrator.stop();
     sessions.delete(request.tab_id);
     await removeSessionSnapshot(request.tab_id);
     await chrome.action.setBadgeText({ tabId: request.tab_id, text: "" });
@@ -308,16 +422,21 @@ chrome.runtime.onMessage.addListener((request: ExtensionRequest, sender, sendRes
 });
 
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== "vv-control") return;
-  let tabId: number | undefined;
+  if (!["vv-control", "vv-tasks"].includes(port.name)) return;
+  if (port.name === "vv-tasks") controls.set(port, "all");
   port.onMessage.addListener((message: { tab_id?: number }) => {
-    if (typeof message.tab_id === "number") tabId = message.tab_id;
+    if (typeof message.tab_id === "number" && port.name === "vv-control") controls.set(port, message.tab_id);
   });
   port.onDisconnect.addListener(() => {
-    if (tabId === undefined) return;
-    const session = sessions.get(tabId);
-    if (session?.snapshot.strategy === "supervised" && !["COMPLETE", "CANCELLED", "FAILED", "PAUSED"].includes(session.snapshot.state)) {
-      session.orchestrator.pause("The supervised control panel was closed.");
+    const affected = controls.get(port);
+    controls.delete(port);
+    for (const [tabId, session] of sessions) {
+      if (affected !== "all" && affected !== tabId) continue;
+      if ([...controls.values()].some(control => control === "all" || control === tabId)) continue;
+      if (session.snapshot.strategy === "supervised" && !["COMPLETE", "CANCELLED", "FAILED", "PAUSED"].includes(session.snapshot.state)) {
+        queue.cancelQueued(tabId);
+        session.orchestrator.pause("The supervised control panel was closed.");
+      }
     }
   });
 });
@@ -326,13 +445,56 @@ chrome.permissions.onAdded.addListener(() => {
   void resumeAuthorizedPendingStarts();
 });
 
+async function pauseWithoutWebsitePermission(tabId: number, url: string): Promise<void> {
+  const session = sessions.get(tabId);
+  if (!session || ["PAUSED", "COMPLETE", "CANCELLED", "FAILED"].includes(session.snapshot.state)) return;
+  let authorized = false;
+  try { authorized = await websiteIsAuthorized(url); } catch { /* An unavailable permission check cannot authorize a site. */ }
+  if (authorized || sessions.get(tabId) !== session) return;
+  if (latestMainNavigation.get(tabId) !== url) return;
+  if (["PAUSED", "COMPLETE", "CANCELLED", "FAILED"].includes(session.snapshot.state)) return;
+  queue.cancelQueued(tabId);
+  session.orchestrator.pause("标签页已进入未授权网站，请授予当前网站权限后再继续。");
+}
+
+// tabs.onUpdated omits URL for ungranted hosts without the broad tabs permission.
+// The already-required webNavigation permission supplies the actual main URL.
+function checkMainNavigation(details: { tabId: number; frameId: number; url: string }): void {
+  if (details.frameId !== 0 || !sessions.has(details.tabId)) return;
+  latestMainNavigation.set(details.tabId, details.url);
+  void pauseWithoutWebsitePermission(details.tabId, details.url);
+}
+chrome.webNavigation.onBeforeNavigate.addListener(checkMainNavigation);
+chrome.webNavigation.onCommitted.addListener(checkMainNavigation);
+chrome.webNavigation.onHistoryStateUpdated.addListener(checkMainNavigation);
+
+chrome.permissions.onRemoved.addListener(() => {
+  for (const tabId of sessions.keys()) {
+    void chrome.webNavigation.getFrame({ tabId, frameId: 0 }).then(frame => {
+      if (frame?.url) { latestMainNavigation.set(tabId, frame.url); return pauseWithoutWebsitePermission(tabId, frame.url); }
+    }).catch(() => {});
+  }
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
+  latestMainNavigation.delete(tabId);
+  queue.cancelQueued(tabId);
   const session = sessions.get(tabId);
   session?.orchestrator.stop("The target tab was closed.");
   sessions.delete(tabId);
   startupFailures.delete(tabId);
   void removePendingStart(tabId);
   void removeSessionSnapshot(tabId);
+});
+
+chrome.debugger.onDetach.addListener(source => {
+  const tabId = source.tabId;
+  if (tabId === undefined) return;
+  const session = sessions.get(tabId);
+  if (session && !["PAUSED", "COMPLETE", "CANCELLED", "FAILED"].includes(session.snapshot.state)) {
+    queue.cancelQueued(tabId);
+    session.orchestrator.pause("视觉页面控制连接已断开，请检查页面后再继续。");
+  }
 });
 
 void resumeAuthorizedPendingStarts();

@@ -1,18 +1,33 @@
 import type { ExecutionPlan, LocatorMap, ObservationInputMode, PlatformObservation, PlatformState, RunStrategy } from "../core";
-import type { ActionResult } from "../core";
+import type { ActionResult, QueueSnapshot, SessionRuntimeSnapshot } from "../core";
 import type { LocalStructure, SeparationRoles, SeparationSnapshot } from "../web/separation-trial";
+import type { InteractionBinding, NativeInputTicket } from "./interaction-guard";
+import type { VisualGeometry } from "../core/visual";
+import type { CourseCatalog, LearningTask, QuizBoundary } from '../core/course';
+import type { CoursePageRequest, CoursePageResult } from '../web/course-adapter';
+import type { CourseInspection } from '../web/course-inspection';
 
 export type ContentRequest =
+  | { type: 'VV_INSPECT_COURSE_PAGE' }
+  | { type: 'VV_COURSE'; request: CoursePageRequest; session_id?: string; interaction_epoch?: string }
+  | { type: 'VV_COURSE_QUIZ'; course_id: string; task: LearningTask; boundary: QuizBoundary; parent_session_id: string; interaction_epoch: string; request: ContentRequest }
   | { type: "VV_WAIT_READY" }
   | { type: "VV_OBSERVE"; session_id: string; mode: ObservationInputMode }
   | { type: "VV_READ_STATE" }
-  | { type: "VV_EXECUTE"; plan: ExecutionPlan; locator_map: LocatorMap }
+  | { type: "VV_READ_TIMER" }
+  | { type: "VV_EXECUTE"; plan: ExecutionPlan; locator_map: LocatorMap; interaction_epoch?: string }
+  | { type: "VV_SET_INTERACTION"; binding: InteractionBinding }
+  | { type: "VV_VISUAL_GEOMETRY"; binding?: InteractionBinding }
+  | { type: "VV_ARM_NATIVE_INPUT"; ticket: NativeInputTicket | null }
   | { type: "VV_RESOLVE_MEDIA"; temporary_handles: string[] }
   | { type: "VV_CAPTURE_SEPARATION" }
   | { type: "VV_APPLY_SEPARATION"; roles: SeparationRoles }
   | { type: "VV_REUSE_SEPARATION"; structure: LocalStructure };
 
 export type ContentResponse =
+  | { ok: true; result: CourseInspection }
+  | { ok: true; result: CoursePageResult }
+  | { ok: true; result: number | null }
   | { ok: true; result: { ready: boolean; reason?: string } }
   | { ok: true; result: PlatformObservation }
   | { ok: true; result: PlatformState }
@@ -20,6 +35,7 @@ export type ContentResponse =
   | { ok: true; result: { snapshot: SeparationSnapshot; suggested: boolean } }
   | { ok: true; result: LocalStructure | null }
   | { ok: true; result: boolean }
+  | { ok: true; result: VisualGeometry }
   | {
       ok: true;
       result: Array<{ temporary_handle: string; source_url: string; mime_type: string }>;
@@ -27,6 +43,7 @@ export type ContentResponse =
   | { ok: false; error: string };
 
 export interface StartSessionRequest {
+  course?: { course_id: string; platform: 'zhidao' | 'chaoxing'; scope: string[]; revision: string };
   type: "VV_START_SESSION";
   tab_id: number;
   provider_profile_id: string;
@@ -34,6 +51,7 @@ export interface StartSessionRequest {
   strategy: RunStrategy;
   model_call_limit: number;
   observation_input_mode: ObservationInputMode;
+  allow_native_search?: boolean;
 }
 
 export interface ArmSessionStartRequest {
@@ -42,9 +60,18 @@ export interface ArmSessionStartRequest {
   required_origins: string[];
 }
 
+export interface TaskPanelSnapshot extends QueueSnapshot {
+  tasks: Array<{ tab_id: number; title: string; url: string | null; provider_name: string; snapshot: SessionRuntimeSnapshot; resumable: boolean }>;
+}
+
 export type ExtensionRequest =
+  | { type: 'VV_INSPECT_COURSE'; tab_id: number }
+  | { type: 'VV_PREVIEW_COURSE'; tab_id: number }
   | StartSessionRequest
   | ArmSessionStartRequest
+  | { type: "VV_USER_INTERACTION"; session_id: string; epoch: string }
+  | { type: "VV_GET_TASKS" }
+  | { type: "VV_SET_CONCURRENCY"; limit: number }
   | { type: "VV_COMMIT_SESSION_START"; tab_id: number }
   | { type: "VV_CANCEL_SESSION_START"; tab_id: number }
   | { type: "VV_GET_SESSION"; tab_id: number }

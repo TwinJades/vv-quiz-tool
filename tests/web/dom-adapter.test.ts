@@ -16,6 +16,225 @@ afterEach(() => {
 });
 
 describe("DomWebAdapter", () => {
+  it.each(['radio','checkbox'] as const)('retains a graded H5P MultiChoice %s question when roles and Check are removed',async role=>{
+    document.body.innerHTML=`<div class="questionset"><section class="h5p-question h5p-multichoice"><p>Choose a topic.</p><div class="h5p-question-content ${role==='radio'?'h5p-radio':'h5p-check'}"><ul class="h5p-answers"><li role="${role}" class="h5p-answer"><span class="h5p-alternative-inner">First</span></li><li role="${role}" class="h5p-answer"><span class="h5p-alternative-inner">Second</span></li></ul></div><button class="h5p-question-check-answer">Check</button><div class="h5p-question-scorebar"></div></section></div>`;
+    const adapter=new DomWebAdapter(document);
+    const before=await adapter.observeSession('last-multichoice',abortSignal());
+    document.querySelectorAll('.h5p-answer').forEach(e=>{e.removeAttribute('role');e.setAttribute('aria-disabled','true');});
+    document.querySelector('.h5p-answer')!.insertAdjacentHTML('beforeend','<span class="h5p-answer-icon">Correct answer.</span><div class="h5p-feedback-dialog">Long grading feedback, not an option.</div>');
+    document.querySelector('.h5p-question-check-answer')!.remove();
+    const score=document.querySelector<HTMLElement>('.h5p-question-scorebar')!;score.classList.add('h5p-question-visible');score.textContent='You got 1 out of 1 points';
+    const state=await adapter.readState(abortSignal());
+    expect(state).toMatchObject({fingerprint:before.fingerprint,feedback:'correct',completed:false});
+    document.querySelector('section')!.insertAdjacentHTML('beforeend','<button class="h5p-question-finish">Finish</button>');
+    const graded=await adapter.observeSession('last-multichoice',abortSignal());
+    expect(graded.fingerprint).toBe(before.fingerprint);
+    expect(graded.questions[0]!.locator_map.targets.control_submit_session).toBeDefined();
+    expect(graded.questions[0]!.locator_map.targets.control_submit).toBeUndefined();
+    expect(graded.questions[0]!.question.type).toBe(role==='radio'?'single_choice':'multiple_choice');
+    expect(graded.questions[0]!.question.options.map(o=>o.text)).toEqual(['First','Second']);
+    const item=graded.questions[0]!;
+    expect(await adapter.execute({schema_version:SCHEMA_VERSION,session_id:'last-multichoice',question_id:item.question.question_id,observation_id:graded.observation_id,strategy:'unattended',actions:[{action_id:'unsafe',kind:'set_selected',target_id:'opt_1',value:true}],preconditions:['same_surface','same_question_fingerprint','target_available']},item.locator_map,abortSignal())).toMatchObject([{status:'failed'}]);
+    document.querySelector('.h5p-alternative-inner')!.textContent='Changed option';
+    expect((await adapter.readState(abortSignal())).fingerprint).not.toBe(before.fingerprint);
+  });
+  it('uses the current H5P live grade while the scorebar still animates the previous attempt',async()=>{
+    document.body.innerHTML='<div class="questionset"><section class="h5p-question"><p>A lesson lasts <input type="text"> minutes.</p><div class="h5p-question-scorebar h5p-question-visible"><div class="h5p-joubelui-score-bar-progress">You got 0 out of 1 points</div></div><div class="h5p-hidden-read" aria-live="polite">You got 1 out of 1 points.</div><a aria-label="Next question"></a></section><section class="h5p-question" hidden><div class="h5p-hidden-read" aria-live="polite">You got 0 out of 1 points.</div></section></div>';
+    const adapter=new DomWebAdapter(document);
+    await adapter.observeSession('grade-animation',abortSignal());
+    expect(await adapter.readState(abortSignal())).toMatchObject({feedback:'correct',completed:false});
+    const live=document.querySelector<HTMLElement>('.h5p-hidden-read')!;
+    const bar=document.querySelector<HTMLElement>('.h5p-joubelui-score-bar-progress')!;
+    bar.textContent='You got 1 out of 1 points';live.textContent='You got 0 out of 1 points.';
+    expect((await adapter.readState(abortSignal())).feedback).toBe('incorrect');
+    // Once the local announcement clears, use the actual local scorebar. A
+    // hidden other question and an unrelated page announcement cannot override it.
+    live.textContent='';
+    document.body.insertAdjacentHTML('beforeend','<div aria-live="polite">You got 0 out of 1 points.</div>');
+    expect((await adapter.readState(abortSignal())).feedback).toBe('correct');
+    document.querySelector('.h5p-question-scorebar')!.classList.remove('h5p-question-visible');
+    live.textContent='You got 0 out of 1 points.';
+    expect((await adapter.readState(abortSignal())).feedback).toBeNull();
+  });
+  it('still recognizes the final score of a standalone H5P activity whose choices are disabled',async()=>{
+    document.body.innerHTML='<section class="h5p-question"><p>Select the pictures.</p><div role="checkbox">First</div><div role="checkbox">Second</div><button class="h5p-question-check-answer">Check</button><div class="h5p-question-scorebar"></div></section>';
+    const adapter=new DomWebAdapter(document);
+    await adapter.observeSession('standalone',abortSignal());
+    document.querySelectorAll('[role=checkbox]').forEach(e=>e.setAttribute('aria-disabled','true'));
+    document.querySelector('.h5p-question-check-answer')!.remove();
+    const score=document.querySelector<HTMLElement>('.h5p-question-scorebar')!;score.classList.add('h5p-question-visible');score.textContent='You got 4 out of 4 points';
+    expect(await adapter.readState(abortSignal())).toMatchObject({completed:true,visible_score:'4/4'});
+  });
+  it('reobserves disabled H5P true/false choices to bind a dynamically created Retry without changing question identity',async()=>{
+    document.body.innerHTML=`<div class="questionset"><section class="h5p-question"><p>Complete both sessions.</p><div role="radio" class="h5p-true-false-answer">True<span class="aria-label"></span></div><div role="radio" class="h5p-true-false-answer">False<span class="aria-label"></span></div><button class="h5p-question-check-answer">Check</button><div class="h5p-question-feedback"></div><a class="h5p-question-next" aria-label="Next question"></a></section></div>`;
+    const adapter=new DomWebAdapter(document);
+    const before=await adapter.observeSession('tf-retry',abortSignal());
+    document.querySelectorAll('[role=radio]').forEach(element=>element.setAttribute('aria-disabled','true'));
+    document.querySelectorAll('.aria-label')[1]!.textContent='.Wrong answer';
+    document.querySelector('.h5p-question-check-answer')!.remove();
+    const feedback=document.querySelector<HTMLElement>('.h5p-question-feedback')!;
+    feedback.classList.add('h5p-question-visible');feedback.textContent='You got 0 of 1 points';
+    document.querySelector('section')!.insertAdjacentHTML('beforeend','<button class="h5p-question-try-again">Retry<span class="hidden-but-read">Retry the task. Reset all responses and start over.</span></button>');
+    expect(await adapter.readState(abortSignal())).toMatchObject({fingerprint:before.fingerprint,feedback:'incorrect',can_retry:true,completed:false});
+    const graded=await adapter.observeSession('tf-retry',abortSignal());
+    expect(graded.fingerprint).toBe(before.fingerprint);
+    expect(graded.questions[0]!.question.options.map(o=>o.text)).toEqual(['True','False']);
+    const retry=document.querySelector<HTMLElement>('.h5p-question-try-again')!;
+    retry.addEventListener('click',()=>{document.querySelectorAll('[role=radio]').forEach(e=>e.removeAttribute('aria-disabled'));document.querySelectorAll('.aria-label').forEach(e=>e.textContent='');feedback.classList.remove('h5p-question-visible');feedback.textContent='';retry.remove();});
+    const item=graded.questions[0]!;
+    expect(await adapter.execute({schema_version:SCHEMA_VERSION,session_id:'tf-retry',question_id:item.question.question_id,observation_id:graded.observation_id,strategy:'unattended',actions:[{action_id:'retry',kind:'retry_question',target_id:'control_retry'}],preconditions:['same_surface','same_question_fingerprint','target_available']},item.locator_map,abortSignal())).toMatchObject([{status:'succeeded'}]);
+    expect((await adapter.observeSession('tf-retry',abortSignal())).fingerprint).toBe(before.fingerprint);
+    expect((await adapter.readState(abortSignal())).feedback).toBeNull();
+  });
+  it('keeps H5P fill grading announcements out of question identity and retries visible scorebar failures',async()=>{
+    document.body.innerHTML=`<div class="questionset"><section class="h5p-question"><p>Fill in the missing word.</p><div class="hidden-but-read"></div><p>A lesson lasts <span class="h5p-input-wrapper"><input type="text" aria-label="Blank input 1 of 1"></span> minutes.</p><button class="h5p-question-check-answer">Check</button><div class="h5p-question-feedback"></div><div class="h5p-question-scorebar" hidden><div class="h5p-joubelui-score-bar-progress">You got 0 out of 1 points</div><svg><title>star</title></svg><span>0/1</span></div><a class="h5p-question-next" aria-label="Next question"></a></section><section class="h5p-question" hidden><input type="text"><div class="h5p-question-scorebar h5p-question-visible">You got 1 out of 1 points</div></section></div>`;
+    const adapter=new DomWebAdapter(document);
+    const initial=await adapter.observeSession('fill-retry',abortSignal());
+    const fingerprint=initial.fingerprint;
+    expect((await adapter.readState(abortSignal())).feedback).toBeNull();
+    const field=document.querySelector<HTMLInputElement>('input')!;
+    field.value='3';field.setAttribute('aria-label','Blank input 1 of 1. Answered incorrectly');
+    const announcement=document.querySelector<HTMLElement>('.hidden-but-read')!;announcement.textContent='Checking mode';
+    const scorebar=document.querySelector<HTMLElement>('.h5p-question-scorebar')!;scorebar.hidden=false;scorebar.classList.add('h5p-question-visible');
+    const root=field.closest('section')!;
+    root.insertAdjacentHTML('beforeend','<button class="h5p-question-try-again" aria-label="Retry the task. Reset all responses and start over.">Retry</button>');
+    expect(await adapter.readState(abortSignal())).toMatchObject({fingerprint,feedback:'incorrect',can_retry:true,completed:false});
+    const graded=await adapter.observeSession('fill-retry',abortSignal());
+    expect(graded.fingerprint).toBe(fingerprint);
+    expect(graded.questions[0]!.question.stem.text).not.toContain('Checking mode');
+    root.querySelector('.h5p-question-try-again')!.addEventListener('click',()=>{field.value='';field.setAttribute('aria-label','Blank input 1 of 1');announcement.textContent='';scorebar.hidden=true;});
+    const item=graded.questions[0]!;
+    const actions=await adapter.execute({schema_version:SCHEMA_VERSION,session_id:'fill-retry',question_id:item.question.question_id,observation_id:graded.observation_id,strategy:'unattended',actions:[{action_id:'retry',kind:'retry_question',target_id:'control_retry'}],preconditions:['same_surface','same_question_fingerprint','target_available']},item.locator_map,abortSignal());
+    expect(actions).toMatchObject([{status:'succeeded'}]);
+    await adapter.observeSession('fill-retry',abortSignal());
+    expect(await adapter.readState(abortSignal())).toMatchObject({fingerprint,feedback:null,field_values:{blank_1:''},completed:false});
+    // Correct H5P blanks become disabled, while Next still belongs to this
+    // question; disabling must not manufacture a zero-blank "new question".
+    field.disabled=true;announcement.textContent='Checking mode';
+    scorebar.hidden=false;scorebar.querySelector('.h5p-joubelui-score-bar-progress')!.textContent='You got 1 out of 1 points';
+    expect(await adapter.readState(abortSignal())).toMatchObject({fingerprint,feedback:'correct',completed:false});
+    const correct=await adapter.observeSession('fill-retry',abortSignal());
+    expect(correct.fingerprint).toBe(fingerprint);
+    expect(correct.questions[0]!.question.blanks).toHaveLength(1);
+    // A real change to the visible lesson question remains a stale-binding stop.
+    root.querySelectorAll('p')[1]!.prepend('Different question: ');
+    expect((await adapter.readState(abortSignal())).fingerprint).not.toBe(fingerprint);
+  });
+  it('keeps a graded H5P question open with an empty next arrow and accessible eight-question progress',async()=>{
+    document.body.innerHTML='<div class="questionset"><div class="h5p-question"><p>Complete both sessions.</p><div role="radio" aria-label="True" aria-checked="false">True</div><div role="radio" aria-label="False" aria-checked="false">False</div><button class="h5p-question-check-answer">Check</button><div class="h5p-question-feedback h5p-question-visible" hidden></div><a href="#" class="h5p-question-next" aria-label="Next question"></a></div><nav>'+Array.from({length:8},(_,i)=>'<a class="progress-dot '+(i===0?'current':'')+'" aria-label="Question '+(i+1)+' of 8, '+(i===0?'Current question':'Unanswered')+'"></a>').join('')+'</nav></div>';
+    const adapter=new DomWebAdapter(document);
+    const observation=await adapter.observeSession('s',abortSignal());
+    expect(observation.question_total).toBe(8);
+    const item=observation.questions[0]!;
+    expect(item.locator_map.targets.control_next).toBeDefined();
+    document.querySelectorAll('[role=radio]').forEach(element=>element.setAttribute('aria-disabled','true'));
+    document.querySelector('.h5p-question-check-answer')!.remove();
+    const feedback=document.querySelector<HTMLElement>('.h5p-question-feedback')!;feedback.hidden=false;feedback.textContent='You got 1 of 1 points';
+    expect(await adapter.readState(abortSignal())).toMatchObject({completed:false,feedback:'correct',has_next:true,at_last_question:false,fingerprint:item.locator_map.question_fingerprint});
+    feedback.textContent='You got 0 of 1 points';
+    expect((await adapter.readState(abortSignal())).feedback).toBe('incorrect');
+    feedback.textContent='You got 1 of 2 points';
+    expect((await adapter.readState(abortSignal())).feedback).toBe('partial');
+    feedback.hidden=true;
+    expect((await adapter.readState(abortSignal())).feedback).toBeNull();
+    document.querySelector('.questionset')!.setAttribute('hidden','');
+    document.body.insertAdjacentHTML('beforeend','<div class="questionset-results">You got 8 out of 8 points</div>');
+    expect(await adapter.readState(abortSignal())).toMatchObject({completed:true,visible_score:'8/8'});
+  });
+  it.each([
+    ['<span role="timer">0:00</span>',null],
+    ['<span class="countdown" hidden>00:01</span>',null],
+    ['<span class="timer">Elapsed time 01:05</span>',null],
+    ['<span class="countdown" aria-label="Elapsed time">01:05</span>',null],
+    ['<span class="countdown" data-timer-scope="question">00:20</span>',null],
+    ['<span class="timer">Question time left 00:20</span>',null],
+    ['<span class="timer">Time left 00:65</span>',null],
+    ['<span class="timer">Time left 01:05</span>',65],
+    ['<span class="countdown">00:00</span>',0],
+    ['<span role="timer">Elapsed 01:05</span><span role="timer" aria-label="Time remaining">00:40</span>',40],
+  ])('only uses an established session countdown: %s',async(markup,expected)=>{
+    document.body.innerHTML=markup+'<fieldset><legend>Choose A</legend><label><input type="radio" name="q">A</label><label><input type="radio" name="q">B</label></fieldset><button>Check</button>';
+    const adapter=new DomWebAdapter(document);
+    expect((await adapter.observeSession('s',abortSignal())).timer_remaining_seconds).toBe(expected);
+    expect((await adapter.readState(abortSignal())).timer_remaining_seconds).toBe(expected);
+  });
+  it("releases old question/media targets while preserving website answers and allowing a fresh observation", async () => {
+    document.body.innerHTML = `<fieldset><legend>Choose A</legend><img src="https://example.test/q.png" width="20" height="20"><label><input type="radio" name="q" checked>A</label><label><input type="radio" name="q">B</label></fieldset><button>Check</button>`;
+    const adapter = new DomWebAdapter(document);
+    const observed = await adapter.observeSession("s", abortSignal());
+    const item = observed.questions[0]!;
+    const handle = item.question.stem.media[0]!.temporary_handle;
+    const answer: AnswerResult = { schema_version: "1.0", session_id: "s", question_id: item.question.question_id, observation_id: observed.observation_id, answer_type: "single_choice", status: "answered", selected_option_ids: [item.question.options[1]!.id], blank_answers: [], confidence: 1, warnings: [] };
+    const oldPlan = buildAnswerExecutionPlan(item.question, answer, item.locator_map, "unattended");
+    expect(adapter.resolveMediaSource(handle)).toBeDefined();
+    adapter.release();
+    expect(adapter.resolveMediaSource(handle)).toBeUndefined();
+    await expect(adapter.execute(oldPlan, item.locator_map, abortSignal())).rejects.toThrow();
+    expect(document.querySelector<HTMLInputElement>("input")!.checked).toBe(true);
+    const fresh = await adapter.observeSession("s", abortSignal());
+    expect(fresh.observation_id).not.toBe(observed.observation_id);
+    expect(fresh.questions).toHaveLength(1);
+  });
+  it("scopes manual interaction to quiz regions and bound external controls", async () => {
+    document.body.innerHTML = `<nav><button id="menu">Menu</button></nav><fieldset><legend>Choose A</legend><label><input type="radio" name="q">A</label><label><input type="radio" name="q">B</label></fieldset><button id="check">Check</button>`;
+    const adapter = new DomWebAdapter(document);
+    expect(adapter.isQuizInteractionTarget(document.querySelector("input"))).toBe(true);
+    expect(adapter.isQuizInteractionTarget(document.querySelector("#menu"))).toBe(false);
+    await adapter.observeSession("s1", abortSignal());
+    expect(adapter.isQuizInteractionTarget(document.querySelector("#check"))).toBe(true);
+    expect(adapter.isQuizInteractionTarget(document.querySelector("#menu"))).toBe(false);
+  });
+  it("binds an external check button only when both the question and control are unique", async () => {
+    const html = `<fieldset><legend>Choose A</legend><label><input type="radio" name="q">A</label><label><input type="radio" name="q">B</label></fieldset>`;
+    document.body.innerHTML = html + `<button>Check</button>`;
+    const observation = await new DomWebAdapter(document).observeSession("s1", abortSignal());
+    expect(observation.questions[0]!.locator_map.targets.control_submit).toBeDefined();
+    document.body.innerHTML = html + `<button>Check</button><button>Submit</button>`;
+    const ambiguous = await new DomWebAdapter(document).observeSession("s1", abortSignal());
+    expect(ambiguous.questions[0]!.locator_map.targets.control_submit).toBeUndefined();
+  });
+  it("does not bind a unique submit belonging to another form or page footer", async () => {
+    const questionHtml = `<main><fieldset><legend>Choose A</legend><label><input type="radio" name="q">A</label><label><input type="radio" name="q">B</label></fieldset></main>`;
+    for (const other of [`<form><button>Submit</button></form>`, `<footer><button>Check</button></footer>`]) {
+      document.body.innerHTML = questionHtml + other;
+      const observation = await new DomWebAdapter(document).observeSession("s1", abortSignal());
+      expect(observation.questions[0]!.locator_map.targets.control_submit).toBeUndefined();
+    }
+  });
+
+  it("recognizes a final result ratio and percentage without relying on the URL", async () => {
+    document.body.innerHTML = "<main><h1>C Quiz</h1><h2>Result:</h2><p>24 of 25</p><p>96%</p></main>";
+    expect(await new DomWebAdapter(document).readState(abortSignal())).toMatchObject({
+      fingerprint: "missing", completed: true, visible_score: "24/25",
+    });
+  });
+
+  it("does not mistake question text or inconsistent percentages for a final result", async () => {
+    document.body.innerHTML = `<fieldset><legend>Result: 24 of 25 96%</legend><label><input type="radio" name="q">A</label><label><input type="radio" name="q">B</label></fieldset>`;
+    expect((await new DomWebAdapter(document).readState(abortSignal())).completed).toBe(false);
+    document.body.innerHTML = "<h2>Result:</h2><p>24 of 25</p><p>50%</p>";
+    expect((await new DomWebAdapter(document).readState(abortSignal())).completed).toBe(false);
+  });
+
+  it("clears unselected options before clicking an answer that immediately changes the question", async () => {
+    document.body.innerHTML = `<fieldset><legend>First question</legend><label><input type="radio" name="q">A</label><label><input type="radio" name="q">B</label><label><input type="radio" name="q">C</label></fieldset>`;
+    const adapter = new DomWebAdapter(document);
+    const observation = await adapter.observeSession("s1", abortSignal());
+    const parsed = observation.questions[0]!;
+    document.querySelector("input")!.addEventListener("click", () => {
+      document.body.innerHTML = `<fieldset><legend>Second question</legend><label><input type="radio" name="next">X</label><label><input type="radio" name="next">Y</label></fieldset>`;
+    });
+    const plan = buildAnswerExecutionPlan(parsed.question, {
+      schema_version: SCHEMA_VERSION, session_id: "s1", question_id: parsed.question.question_id,
+      observation_id: observation.observation_id, answer_type: "single_choice", status: "answered",
+      selected_option_ids: [parsed.question.options[0]!.id], blank_answers: [], confidence: 1, warnings: [],
+    }, parsed.locator_map, "unattended");
+    const results = await adapter.execute(plan, parsed.locator_map, abortSignal());
+    expect(results.every(result => result.status === "succeeded")).toBe(true);
+    expect(document.querySelector("legend")?.textContent).toBe("Second question");
+    expect((await adapter.readState(abortSignal())).fingerprint).not.toBe(observation.fingerprint);
+  });
+
   it("recognizes a score page after a submitted question disappears", async () => {
     document.body.innerHTML = "<main>You got 4 out of 4 points</main>";
     const state = await new DomWebAdapter(document).readState(abortSignal());
@@ -41,6 +260,108 @@ describe("DomWebAdapter", () => {
     const observation = await new DomWebAdapter(document).observeSession("images", abortSignal());
     expect(observation.questions[0]?.question.type).toBe("multiple_choice");
     expect(observation.questions[0]?.question.options.map((option) => option.media.length)).toEqual([1, 1]);
+  });
+
+  it("verifies H5P single-choice controls that mark selection with a class", async () => {
+    document.body.innerHTML = `<section class="question"><h2>Goji berries are also known as ...</h2>
+      <ul role="radiogroup"><li role="radio" class="h5p-sc-alternative">Wolfberries</li>
+      <li role="radio" class="h5p-sc-alternative">Bearberries</li></ul></section>`;
+    const first = document.querySelector<HTMLElement>("[role='radio']")!;
+    first.addEventListener("click", () => first.classList.add("h5p-sc-selected"));
+    const adapter = new DomWebAdapter(document);
+    const observation = await adapter.observeSession("h5p", abortSignal());
+    const { question, locator_map: locatorMap } = observation.questions[0]!;
+    const answer: AnswerResult = {
+      schema_version: SCHEMA_VERSION,
+      session_id: "h5p",
+      question_id: question.question_id,
+      observation_id: observation.observation_id,
+      answer_type: "single_choice",
+      status: "answered",
+      selected_option_ids: ["opt_1"],
+      blank_answers: [],
+      confidence: 1,
+      warnings: [],
+    };
+    const plan = buildAnswerExecutionPlan(question, answer, locatorMap, "unattended");
+    const before = await adapter.readState(abortSignal());
+    const actions = await adapter.execute(plan, locatorMap, abortSignal());
+    const after = await adapter.readState(abortSignal());
+    expect(after.selected_target_ids).toContain("opt_1");
+    expect(new WebVerifier().verify(before, plan, actions, after).status).toBe("verified");
+  });
+
+  it("advances a graded H5P question whose choices disappear before its Next link is clicked", async () => {
+    document.body.innerHTML = `<section class="h5p-question question">
+      <h2>Choose a word</h2>
+      <ul role="radiogroup"><li role="radio">This</li><li role="radio">These</li></ul>
+      <button type="button">Check</button>
+      <div class="h5p-question-feedback"></div>
+      <a class="h5p-question-next" href="#" aria-label="Next">Next</a>
+    </section>`;
+    const adapter = new DomWebAdapter(document);
+    const observation = await adapter.observeSession("h5p-graded", abortSignal());
+    const { question, locator_map: locatorMap } = observation.questions[0]!;
+    expect(locatorMap.targets).toHaveProperty("control_next");
+    const before = await adapter.readState(abortSignal());
+    document.querySelector("ul")!.remove();
+    const feedback = document.querySelector<HTMLElement>(".h5p-question-feedback")!;
+    feedback.classList.add("h5p-question-visible");
+    feedback.textContent = "Correct! You got 1 out of 1 points";
+    const after = await adapter.readState(abortSignal());
+    expect(after.fingerprint).toBe(before.fingerprint);
+    expect(after).toMatchObject({ has_next: true, completed: false });
+    let advanced = false;
+    document.querySelector("a.h5p-question-next")!.addEventListener("click", (event) => {
+      event.preventDefault();
+      advanced = true;
+    });
+    const result = await adapter.execute({
+      schema_version: SCHEMA_VERSION,
+      session_id: "h5p-graded",
+      question_id: question.question_id,
+      observation_id: observation.observation_id,
+      strategy: "unattended",
+      actions: [{ action_id: "next", kind: "advance", target_id: "control_next" }],
+      preconditions: ["same_surface", "same_question_fingerprint", "target_available"],
+    }, locatorMap, abortSignal());
+    expect(result).toMatchObject([{ status: "succeeded" }]);
+    expect(advanced).toBe(true);
+  });
+
+  it("maps H5P Check and final Finish as separate submission controls", async () => {
+    document.body.innerHTML = `<section class="h5p-question question">
+      <h2>Final word</h2><ul role="radiogroup"><li role="radio">This</li><li role="radio">That</li></ul>
+      <button class="h5p-question-check-answer" aria-label="Check the answers. The responses will be marked.">Check</button>
+      <button class="h5p-question-finish">Finish</button>
+      <div class="h5p-question-scorebar"></div>
+    </section>`;
+    const adapter = new DomWebAdapter(document);
+    const observation = await adapter.observeSession("h5p-last", abortSignal());
+    const { question, locator_map: locatorMap } = observation.questions[0]!;
+    expect(locatorMap.targets).toHaveProperty("control_submit");
+    expect(locatorMap.targets).toHaveProperty("control_submit_session");
+    const before = await adapter.readState(abortSignal());
+    document.querySelector("ul")!.remove();
+    const score = document.querySelector<HTMLElement>(".h5p-question-scorebar")!;
+    score.classList.add("h5p-question-visible");
+    score.textContent = "You got 1 out of 1 points";
+    const after = await adapter.readState(abortSignal());
+    expect(after.fingerprint).toBe(before.fingerprint);
+    expect(after).toMatchObject({ has_session_submit: true, completed: false });
+    let finished = false;
+    document.querySelector(".h5p-question-finish")!.addEventListener("click", () => { finished = true; });
+    const result = await adapter.execute({
+      schema_version: SCHEMA_VERSION,
+      session_id: "h5p-last",
+      question_id: question.question_id,
+      observation_id: observation.observation_id,
+      strategy: "unattended",
+      actions: [{ action_id: "finish", kind: "submit_session", target_id: "control_submit_session" }],
+      preconditions: ["same_surface", "same_question_fingerprint", "target_available"],
+    }, locatorMap, abortSignal());
+    expect(result).toMatchObject([{ status: "succeeded" }]);
+    expect(finished).toBe(true);
   });
 
   it("parses and executes a native single-choice question", async () => {
@@ -114,6 +435,20 @@ describe("DomWebAdapter", () => {
     expect(Array.from(document.querySelectorAll<HTMLInputElement>("input")).map((input) => input.value)).toEqual(["A", "B"]);
     const after = await adapter.readState(abortSignal());
     expect(after.field_values).toMatchObject({ blank_1: "A", blank_2: "B" });
+  });
+
+  it("keeps visible sentence context around fill-in-the-blank inputs", async () => {
+    document.body.innerHTML = `<section class="question">
+      <h2>Fill in the missing words</h2>
+      <p>Is <input type="text" aria-label="Blank input 1 of 2"> coffee?</p>
+      <p>No, <input type="text" aria-label="Blank input 2 of 2"> is tea.</p>
+      <span hidden>Hidden solution text</span><button>Check</button>
+    </section>`;
+    const observation = await new DomWebAdapter(document).observeSession("blanks", abortSignal());
+    const stem = observation.questions[0]!.question.stem.text;
+    expect(stem).toContain("Is [blank_1] coffee?");
+    expect(stem).toContain("No, [blank_2] is tea.");
+    expect(stem).not.toContain("Hidden solution text");
   });
 
   it("prefers a quiz form over a navigation search field", async () => {

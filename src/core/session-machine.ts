@@ -1,5 +1,6 @@
 export const sessionStates = [
   "CREATED",
+  "QUEUED",
   "WAIT_READY",
   "OBSERVE_SESSION",
   "VALIDATE_OBSERVATION",
@@ -21,7 +22,8 @@ export const sessionStates = [
 export type SessionState = (typeof sessionStates)[number];
 
 const transitions: Readonly<Record<SessionState, readonly SessionState[]>> = {
-  CREATED: ["WAIT_READY", "CANCELLED"],
+  CREATED: ["QUEUED", "WAIT_READY", "CANCELLED"],
+  QUEUED: ["WAIT_READY", "PAUSED", "CANCELLED", "FAILED"],
   WAIT_READY: ["OBSERVE_SESSION", "PAUSED", "CANCELLED", "FAILED"],
   OBSERVE_SESSION: ["VALIDATE_OBSERVATION", "PAUSED", "CANCELLED", "FAILED"],
   VALIDATE_OBSERVATION: ["PARSE_SESSION", "OBSERVE_SESSION", "PAUSED", "CANCELLED", "FAILED"],
@@ -34,7 +36,7 @@ const transitions: Readonly<Record<SessionState, readonly SessionState[]>> = {
   REPLAN: ["SOLVE", "PAUSED", "CLOSE_OUT", "CANCELLED", "FAILED"],
   ADVANCE: ["OBSERVE_SESSION", "COMPLETE", "CLOSE_OUT", "PAUSED", "CANCELLED", "FAILED"],
   CLOSE_OUT: ["ACT", "VERIFY", "COMPLETE", "PAUSED", "CANCELLED", "FAILED"],
-  PAUSED: ["WAIT_READY", "CANCELLED"],
+  PAUSED: ["QUEUED", "WAIT_READY", "CANCELLED"],
   COMPLETE: [],
   CANCELLED: [],
   FAILED: [],

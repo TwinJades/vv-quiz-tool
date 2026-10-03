@@ -64,6 +64,14 @@ describe("buildAnswerExecutionPlan", () => {
     ).toThrow(ExecutionPlanError);
   });
 
+  it("clears all other choices before an immediately navigating single-choice click", () => {
+    const frame = { ...question, type: "single_choice" as const, constraints: { min_selections: 1, max_selections: 1 } };
+    const result = { ...answer, answer_type: "single_choice" as const, selected_option_ids: ["a"] };
+    const plan = buildAnswerExecutionPlan(frame, result, locatorMap, "unattended");
+    expect(plan.actions.map(action => action.target_id)).toEqual(["b", "a"]);
+    expect(plan.actions.at(-1)).toMatchObject({ value: true });
+  });
+
   it("rejects uncertain answers", () => {
     expect(() =>
       buildAnswerExecutionPlan(question, { ...answer, status: "uncertain" }, locatorMap, "supervised"),

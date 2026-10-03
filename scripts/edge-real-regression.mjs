@@ -1,6 +1,8 @@
 const base = `http://127.0.0.1:${process.argv[3] ?? 9341}`;
 const site = process.argv[2];
 const sampleQuestions = Number(process.argv[5] ?? 0);
+const extensionIdHint = process.env.VV_EXTENSION_ID ?? "denncmmiepljpbohhclcjcdjondnfgco";
+const genericComplete = site === "generic" && process.argv[7] === "complete";
 if (!["frontend", "quizzy", "w3c", "generic", "separation", "separation_controls", "inspect", "quizzyprobe", "w3probe", "reload", "models"].includes(site)) throw new Error("Unknown regression target");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -83,7 +85,7 @@ if (site === "w3probe") {
   const page = new Cdp(target.webSocketDebuggerUrl);
   await page.send("Runtime.enable");
   console.log(await page.evaluate(`({url:location.href,title:document.title,text:document.body?.innerText.slice(-1800),controls:[...document.querySelectorAll('input,button,form')].slice(-24).map(e=>({tag:e.tagName,type:e.type,name:e.name,text:e.textContent?.trim().slice(0,80)}))})`));
-  const extensionTarget = (await get("/json/list")).find((item) => item.url.includes("chrome-extension://denncmmiepljpbohhclcjcdjondnfgco/"));
+  const extensionTarget = (await get("/json/list")).find((item) => item.url.includes(`chrome-extension://${extensionIdHint}/`));
   if (extensionTarget) {
     const extension = new Cdp(extensionTarget.webSocketDebuggerUrl);
     await extension.send("Runtime.enable");
@@ -95,7 +97,7 @@ if (site === "w3probe") {
 }
 
 if (site === "reload") {
-  const target = (await get("/json/list")).find((item) => item.url.includes("chrome-extension://denncmmiepljpbohhclcjcdjondnfgco/"));
+  const target = (await get("/json/list")).find((item) => item.url.includes(`chrome-extension://${extensionIdHint}/`));
   if (!target) throw new Error("VV extension target missing");
   const page = new Cdp(target.webSocketDebuggerUrl);
   await page.send("Runtime.enable");
@@ -104,8 +106,8 @@ if (site === "reload") {
   process.exit(0);
 }
 
-const extensionTarget = (await get("/json/list")).find((target) => target.url.includes("chrome-extension://denncmmiepljpbohhclcjcdjondnfgco/"))
-  ?? await get(`/json/new?${encodeURIComponent("chrome-extension://denncmmiepljpbohhclcjcdjondnfgco/options.html")}`, { method: "PUT" });
+const extensionTarget = (await get("/json/list")).find((target) => target.url.includes(`chrome-extension://${extensionIdHint}/`))
+  ?? await get(`/json/new?${encodeURIComponent(`chrome-extension://${extensionIdHint}/options.html`)}`, { method: "PUT" });
 if (!extensionTarget) throw new Error("VV extension target missing");
 const extensionId = new URL(extensionTarget.url).host;
 const controlTarget = await get(`/json/new?${encodeURIComponent(`chrome-extension://${extensionId}/options.html`)}`, { method: "PUT" });
@@ -134,9 +136,12 @@ if (!provider.models.includes(modelId)) throw new Error(`Configured model is mis
 async function createTab(url) {
   return extEval(`
     if(${sampleQuestions > 0}){const tab=await chrome.tabs.create({url:${JSON.stringify(url)},active:false});return {id:tab.id,url:tab.url};}
-    const existing=(await chrome.tabs.query({})).find((candidate)=>candidate.url?.startsWith(${JSON.stringify(url)}));
+    const visible=${process.env.VV_VISIBLE_TEST === "1"};
+    const matches=(await chrome.tabs.query({})).filter((candidate)=>candidate.url?.startsWith(${JSON.stringify(url)}));
+    const existing=visible ? matches.find((candidate)=>candidate.active)??matches[0] : matches[0];
+    if(existing&&visible&&!existing.active)await chrome.tabs.update(existing.id,{active:true});
     if(existing)return {id:existing.id,url:existing.url};
-    const tab=await chrome.tabs.create({url:${JSON.stringify(url)},active:false});
+    const tab=await chrome.tabs.create({url:${JSON.stringify(url)},active:visible});
     return {id:tab.id,url:tab.url};
   `);
 }
@@ -240,7 +245,7 @@ if (site === "frontend") {
   if (!targetUrl) throw new Error("Generic target URL missing");
   const origin = `${new URL(targetUrl).origin}/*`;
   const permission = await control.send("Runtime.evaluate", {
-    expression: `Promise.race([chrome.permissions.request({origins:[${JSON.stringify(origin)}]}),new Promise(resolve=>setTimeout(()=>resolve(false),8000))])`,
+    expression: `(async()=>await chrome.permissions.contains({origins:[${JSON.stringify(origin)}]}) || await Promise.race([chrome.permissions.request({origins:[${JSON.stringify(origin)}]}),new Promise(resolve=>setTimeout(()=>resolve(false),8000))]))()`,
     awaitPromise: true,
     returnByValue: true,
     userGesture: true,
@@ -249,7 +254,7 @@ if (site === "frontend") {
   tab = await createTab(targetUrl);
   await sleep(2_000);
   minimumAnswered = 1;
-  requireComplete = false;
+  requireComplete = genericComplete;
 } else {
   tab = await createTab("https://www.w3schools.com/quiztest/quiztest.php?qtest=C");
   let ready = false;

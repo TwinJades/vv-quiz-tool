@@ -42,8 +42,10 @@ interface MediaSource {
 const QUESTION_ROOT_SELECTORS = [
   "[data-vv-question]",
   "[data-question]",
+  "[data-question-id]",
   ".quiz-question",
   ".question",
+  ".question-card",
   "fieldset",
   "form",
   "[role='radiogroup']",
@@ -65,7 +67,7 @@ const SUPPORTED_CONTROL_SELECTOR = [
 
 const SUBMIT_PATTERN = /^(?:submit(?:\s+\d+\s+answers?)?|finish(?:\s+quiz)?|check|confirm|提交|确认|交卷|检查答案|完成)$/i;
 const SESSION_SUBMIT_PATTERN = /^(?:submit(?:\s+(?:(?:the\s+)?(?:test|quiz|interview)|\d+\s+answers?|answers?))|finish(?:\s+(?:(?:the\s+)?(?:test|quiz|interview)))|提交试卷|完成测试|结束测验)$/i;
-const NEXT_PATTERN = /^(next|continue|下一题|继续|下一步)\s*(?:→|›|»|❯|>)?$/i;
+const NEXT_PATTERN = /^(next(?:\s+question)?|continue|下一题|继续|下一步)\s*(?:→|›|»|❯|>)?$/i;
 const RETRY_PATTERN = /^(retry|try again|重试|再试一次|重新作答)$/i;
 
 function randomId(prefix: string): string {
@@ -77,16 +79,48 @@ function supportedInput(element: Element): boolean {
   if ("disabled" in element && (element as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement).disabled) {
     return false;
   }
-  if (!(element instanceof HTMLInputElement)) return true;
-  return !["password", "file", "hidden", "submit", "button", "reset"].includes(element.type);
+  if (element.tagName !== "INPUT") return true;
+  return !["password", "file", "hidden", "submit", "button", "reset"].includes((element as HTMLInputElement).type);
+}
+
+function hasVisibleQuestionSetGrade(root: HTMLElement): boolean {
+  return root.matches('.h5p-question') && Boolean(root.closest('.questionset')) &&
+    Array.from(root.querySelectorAll('.h5p-question-feedback.h5p-question-visible, .h5p-question-scorebar.h5p-question-visible'))
+      .some(feedback=>!isExplicitlyHidden(feedback));
+}
+
+function choiceControls(root: HTMLElement, role: 'radio' | 'checkbox'): HTMLElement[] {
+  // H5P MultiChoice removes roles after grading but leaves the same labelled
+  // alternatives in its radio/check container. Recover observation semantics
+  // only; aria-disabled still prevents executing answer actions on these nodes.
+  const gradedSelector = hasVisibleQuestionSetGrade(root) && root.matches('.h5p-multichoice')
+    ? `, .h5p-question-content.${role === 'radio' ? 'h5p-radio' : 'h5p-check'} .h5p-answer`
+    : '';
+  return Array.from(root.querySelectorAll<HTMLElement>(`input[type='${role}'], [role='${role}']${gradedSelector}`))
+    .filter(element=>!isExplicitlyHidden(element));
+}
+
+function selectedChoice(element: HTMLElement): boolean {
+  if (element.tagName === "INPUT" && ["radio", "checkbox"].includes((element as HTMLInputElement).type)) {
+    return (element as HTMLInputElement).checked;
+  }
+  return element.getAttribute("aria-checked") === "true" ||
+    element.getAttribute("aria-selected") === "true" ||
+    ((element.getAttribute("role") === "radio" || element.getAttribute("role") === "checkbox") &&
+      element.classList.contains("h5p-sc-selected"));
 }
 
 function optionLabel(document: Document, control: HTMLElement): string {
+  if (control.matches('.h5p-answer')) {
+    const alternative = control.querySelector('.h5p-alternative-inner');
+    if (alternative) return elementText(alternative);
+  }
   const labelElement = control.closest("label") ??
     (control.id ? document.querySelector<HTMLElement>(`label[for='${CSS.escape(control.id)}']`) : null) ??
     control;
   const clone = labelElement.cloneNode(true) as HTMLElement;
-  clone.querySelectorAll("input, textarea, select, button").forEach((element) => element.remove());
+  clone.querySelectorAll("input, textarea, select, button, .h5p-true-false-answer .aria-label")
+    .forEach((element) => element.remove());
   const spacedText = Array.from(clone.childNodes)
     .map((node) => normalizedText(node.textContent?.replace(/\u00a0/g, " ")))
     .filter(Boolean)
@@ -129,12 +163,28 @@ function queryAllDeep<T extends Element>(document: Document, selector: string): 
 }
 
 function candidateRoots(document: Document): HTMLElement[] {
+  const h5pQuestions = queryAllDeep<HTMLElement>(document, ".h5p-question")
+    .filter((element) => !isExplicitlyHidden(element))
+    .filter((element) => {
+      // Graded H5P choices can be disabled until a newly created Retry button
+      // resets them. They still describe the same question for re-observation.
+      const graded=hasVisibleQuestionSetGrade(element);
+      if (graded && element.matches('.h5p-multichoice') &&
+        choiceControls(element, 'radio').length + choiceControls(element, 'checkbox').length > 0) return true;
+      return Array.from(element.querySelectorAll(SUPPORTED_CONTROL_SELECTOR))
+        .some(control=>!isExplicitlyHidden(control)&&(supportedInput(control)||graded));
+    });
+  if (h5pQuestions.length > 0) return h5pQuestions;
   const explicit = queryAllDeep<HTMLElement>(document, QUESTION_ROOT_SELECTORS.join(","))
     .filter((element) => !isExplicitlyHidden(element))
     .filter((element) => Array.from(element.querySelectorAll(SUPPORTED_CONTROL_SELECTOR)).some(supportedInput));
   if (explicit.length > 0) {
     const leaves = explicit.filter((candidate) => !explicit.some((other) => other !== candidate && candidate.contains(other)));
     const candidates = leaves.length > 0 ? leaves : explicit;
+    if (candidates.length === 1) {
+      const grouped = nativeRadioQuestionRoots(candidates[0]!);
+      if (grouped) return grouped;
+    }
     const scored = candidates
       .map((element) => ({ element, score: questionRootScore(element) }))
       .sort((left, right) => right.score - left.score);
@@ -150,6 +200,35 @@ function candidateRoots(document: Document): HTMLElement[] {
   return [firstControl.closest<HTMLElement>("form") ?? firstControl.parentElement ?? document.body];
 }
 
+function nativeRadioQuestionRoots(root: HTMLElement): HTMLElement[] | null {
+  const controls = Array.from(root.querySelectorAll<HTMLElement>(SUPPORTED_CONTROL_SELECTOR))
+    .filter(control => !isExplicitlyHidden(control) && supportedInput(control));
+  if (controls.some(control => !control.matches("input[type='radio'][name]"))) return null;
+  const groups = new Map<string, HTMLInputElement[]>();
+  for (const control of controls as HTMLInputElement[]) {
+    if (!control.name) return null;
+    const group = groups.get(control.name) ?? [];
+    group.push(control); groups.set(control.name, group);
+  }
+  if (groups.size < 2) return null;
+  const regions: HTMLElement[] = [];
+  for (const group of groups.values()) {
+    if (group.length < 2) return null;
+    let region = group[0]!.parentElement;
+    while (region && region !== root && !group.every(control => region!.contains(control))) region = region.parentElement;
+    if (!region || region === root) return null;
+    // Widen only within this group, so its visible stem/images are included.
+    while (region.parentElement && region.parentElement !== root &&
+      controls.filter(control => region!.parentElement!.contains(control)).length === group.length) region = region.parentElement;
+    if (controls.filter(control => region!.contains(control)).length !== group.length ||
+      !region.querySelector("p,h1,h2,h3,h4,h5,h6,legend,[data-question-stem],.question-text,.question-title") ||
+      !questionStem(root.ownerDocument, region)) return null;
+    regions.push(region);
+  }
+  if (new Set(regions).size !== groups.size || regions.some(left => regions.some(right => left !== right && left.contains(right)))) return null;
+  return regions;
+}
+
 function questionRootScore(root: HTMLElement): number {
   if (root.closest("header, nav, aside, [role='search']")) return -1_000;
   const choiceControls = root.querySelectorAll(
@@ -159,7 +238,7 @@ function questionRootScore(root: HTMLElement): number {
   const textControls = root.querySelectorAll(
     "input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']",
   ).length;
-  const questionMarker = root.matches("[data-vv-question], [data-question], .quiz-question, .question, fieldset") ? 30 : 0;
+  const questionMarker = root.matches("[data-vv-question], [data-question], [data-question-id], .quiz-question, .question, .question-card, fieldset") ? 30 : 0;
   const submitControl = root.querySelector("button[type='submit'], input[type='submit']") ? 10 : 0;
   const nearbyText = [root.previousElementSibling, root.previousElementSibling?.previousElementSibling, root.parentElement]
     .map((element) => elementText(element ?? null))
@@ -219,7 +298,7 @@ function questionStem(document: Document, root: HTMLElement): string {
   }
 
   const progressOnly = (text: string) => /^(?:question|题目)\s*\d+\s*(?:of|\/|共)\s*\d+\s*[:：]?$/i.test(text);
-  const semantic = root.querySelector<HTMLElement>("[data-question-stem], .question-text, .stem");
+  const semantic = root.querySelector<HTMLElement>("[data-question-stem], .question-text, .question-title, .stem");
   const semanticText = elementText(semantic);
   if (semanticText && !progressOnly(semanticText)) return semanticText;
 
@@ -288,6 +367,26 @@ function semanticStem(document: Document, root: HTMLElement): { text: string; ha
   };
 }
 
+function blankQuestionStem(root: HTMLElement, controls: HTMLElement[], heading: string): string {
+  const placeholders = new Map<Node, string>(controls.map((control, index) => [control, `[blank_${index + 1}]`]));
+  const walk = (node: Node): string => {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+    if (node.nodeType !== Node.ELEMENT_NODE) return "";
+    const element = node as Element;
+    if (isExplicitlyHidden(element) || element.matches(
+      "button, a, script, style, noscript, template, .h5p-question-feedback, .h5p-question-scorebar, .h5p-solution, .h5p-question .hidden-but-read, [role='alert'], [role='status'], [aria-live]:not([aria-live='off'])",
+    )) return "";
+    const placeholder = placeholders.get(node);
+    if (placeholder) return ` ${placeholder} `;
+    if (element.matches("input, textarea, select, [contenteditable='true']")) return "";
+    const content = Array.from(node.childNodes).map(walk).join("");
+    return /^(?:P|DIV|SECTION|ARTICLE|LI|BR|H[1-6])$/.test(element.tagName) ? `\n${content}\n` : content;
+  };
+  const context = normalizedText(walk(root)).slice(0, 4_000);
+  if (!context) return heading;
+  return heading && !context.includes(heading) ? `${heading}\n${context}`.slice(0, 4_000) : context;
+}
+
 function imageMedia(
   image: HTMLImageElement,
   mediaSources: Map<string, MediaSource>,
@@ -320,10 +419,23 @@ export class DomWebAdapter implements PlatformAdapter {
   #currentLocator: LocatorMap | undefined;
   #separationTrial: SeparationTrial;
   #calibratedRoot: HTMLElement | null = null;
+  #pageQuestions: Array<{ adapter: DomWebAdapter; prefix: string; parsed: PlatformObservation["questions"][number] }> = [];
 
-  constructor(document: Document) {
+  constructor(document: Document, private readonly rootOverride?: HTMLElement, private readonly courseScope?: HTMLElement) {
     this.#document = document;
     this.#separationTrial = new SeparationTrial(document);
+  }
+
+  /** Release only our temporary references; the website's answers stay intact. */
+  release(): void {
+    for (const item of this.#pageQuestions) item.adapter.release();
+    this.#pageQuestions = [];
+    this.#targets.clear();
+    this.#mediaSources.clear();
+    this.#currentObservation = undefined;
+    this.#currentLocator = undefined;
+    this.#calibratedRoot = null;
+    this.#separationTrial = new SeparationTrial(this.#document);
   }
 
   captureSeparation(): { snapshot: SeparationSnapshot; suggested: boolean } {
@@ -333,6 +445,17 @@ export class DomWebAdapter implements PlatformAdapter {
       stem.length >= 8 && /[?？]|question|题/i.test(stem) && !currentStem.includes(stem),
     );
     return { snapshot, suggested };
+  }
+
+  isQuizInteractionTarget(target: EventTarget | null): boolean {
+    const ElementClass = this.#document.defaultView?.Element;
+    if (!ElementClass || !(target instanceof ElementClass)) return false;
+    if (target.closest("header,nav,aside,footer,[role='search']")) return false;
+    if (this.#pageQuestions.some(entry => entry.adapter.isQuizInteractionTarget(target))) return true;
+    const roots = [this.#activeRoot(), ...candidateRoots(this.#document)];
+    if (roots.some(root => root?.contains(target))) return true;
+    if (target.closest("canvas")) return true;
+    return [...this.#targets.values()].some(item => item.identity.role !== "candidate" && (item.element === target || item.element.contains(target)));
   }
 
   applySeparation(roles: SeparationRoles): LocalStructure | null {
@@ -350,19 +473,20 @@ export class DomWebAdapter implements PlatformAdapter {
   }
 
   #activeRoot(): HTMLElement | undefined {
+    if (this.rootOverride) return this.rootOverride.isConnected && !isExplicitlyHidden(this.rootOverride) ? this.rootOverride : undefined;
     if (this.#calibratedRoot?.isConnected && !isExplicitlyHidden(this.#calibratedRoot)) return this.#calibratedRoot;
     if (this.#separationTrial.structure()) {
       this.#calibratedRoot = this.#separationTrial.reuse();
       if (this.#calibratedRoot) return this.#calibratedRoot;
       return undefined;
     }
-    return candidateRoots(this.#document)[0];
+    return candidateRoots(this.#document).filter(root => !this.courseScope || this.courseScope.contains(root))[0];
   }
 
   capabilities(): PlatformCapabilities {
     return {
       question_types: ["single_choice", "multiple_choice", "fill_blank"],
-      multi_question_page: false,
+      multi_question_page: true,
       text_input: true,
       image_input: true,
       semantic_targeting: true,
@@ -382,7 +506,8 @@ export class DomWebAdapter implements PlatformAdapter {
       if (signal.aborted) return { ready: false, reason: "cancelled" };
       const blocker = this.detectHardBlocker();
       if (blocker) return { ready: false, reason: blocker };
-      const roots = this.#calibratedRoot?.isConnected ? [this.#calibratedRoot] : candidateRoots(this.#document);
+      const roots = (this.#calibratedRoot?.isConnected ? [this.#calibratedRoot] : candidateRoots(this.#document))
+        .filter(root=>!this.courseScope||this.courseScope.contains(root));
       const activeRoot = roots[0];
       if (activeRoot && Array.from(activeRoot.querySelectorAll("textarea, [contenteditable='true']"))
         .some((element) => !isExplicitlyHidden(element) && supportedInput(element))) {
@@ -419,8 +544,10 @@ export class DomWebAdapter implements PlatformAdapter {
     const blocker = this.detectHardBlocker();
     if (blocker) throw new Error(`HARD_BLOCKER:${blocker}`);
     const activeRoot = this.#activeRoot();
-    const roots = this.#separationTrial.structure() ? (activeRoot ? [activeRoot] : []) : candidateRoots(this.#document);
+    const roots = this.rootOverride || this.#separationTrial.structure() ? (activeRoot ? [activeRoot] : []) : candidateRoots(this.#document).filter(root => !this.courseScope || this.courseScope.contains(root));
     if (roots.length === 0) throw new Error("No supported question was found.");
+    if (roots.length > 1 && !this.rootOverride) return this.#observePage(roots, sessionId, signal, mode);
+    this.#pageQuestions = [];
     const root = roots[0]!;
     if (Array.from(root.querySelectorAll("textarea, [contenteditable='true']"))
       .some((element) => !isExplicitlyHidden(element) && supportedInput(element))) {
@@ -428,9 +555,11 @@ export class DomWebAdapter implements PlatformAdapter {
     }
     const radioNames = new Set(
       Array.from(root.querySelectorAll<HTMLInputElement>("input[type='radio'][name]"))
+        .filter(input => !isExplicitlyHidden(input) && supportedInput(input))
         .map((input) => input.name)
         .filter(Boolean),
     );
+    if (radioNames.size > 1) throw new Error("HARD_BLOCKER:ambiguous_native_question_groups");
     const multiQuestionPage = roots.length > 1 || radioNames.size > 1;
     const observationId = randomId("observation");
     this.#targets = new Map();
@@ -461,6 +590,12 @@ export class DomWebAdapter implements PlatformAdapter {
 
   async execute(plan: ExecutionPlan, locatorMap: LocatorMap, signal: AbortSignal): Promise<ActionResult[]> {
     if (signal.aborted) throw new DOMException("Execution cancelled.", "AbortError");
+    if (this.#pageQuestions.length) {
+      const entry = this.#pageQuestions.find(item => `${item.prefix}${item.parsed.question.question_id}` === plan.question_id);
+      if (!entry || !this.#currentObservation || plan.session_id !== this.#currentObservation.session_id || locatorMap.session_id !== plan.session_id || locatorMap.question_id !== plan.question_id || plan.observation_id !== this.#currentObservation.observation_id || locatorMap.observation_id !== plan.observation_id || locatorMap.question_fingerprint !== entry.parsed.locator_map.question_fingerprint) throw new Error("PAGE_CHANGED multi-question execution context mismatch");
+      if (plan.actions.some(action => !action.target_id.startsWith(entry.prefix) || !entry.parsed.locator_map.targets[action.target_id.slice(entry.prefix.length)])) throw new Error("TARGET_UNAVAILABLE action belongs to another question");
+      return entry.adapter.execute({ ...plan, question_id: entry.parsed.question.question_id, observation_id: entry.parsed.question.observation_id, actions: plan.actions.map(action => ({ ...action, target_id: action.target_id.slice(entry.prefix.length) })) }, entry.parsed.locator_map, signal);
+    }
     if (!this.#currentObservation || !this.#currentLocator) {
       const currentFingerprint = this.#fingerprintCurrentQuestion();
       if (
@@ -494,6 +629,7 @@ export class DomWebAdapter implements PlatformAdapter {
 
     const results: ActionResult[] = [];
     for (const action of plan.actions) {
+      if (signal.aborted) throw new DOMException("Execution cancelled.", "AbortError");
       const storedTarget = this.#targets.get(action.target_id);
       const resolution = storedTarget
         ? this.#resolveLiveTarget(action.target_id, storedTarget)
@@ -529,8 +665,28 @@ export class DomWebAdapter implements PlatformAdapter {
     return results;
   }
 
+  async readTimer(signal: AbortSignal): Promise<number | null> {
+    signal.throwIfAborted();
+    return this.#readTimer();
+  }
+
   async readState(signal: AbortSignal): Promise<PlatformState> {
     if (signal.aborted) throw new DOMException("State read cancelled.", "AbortError");
+    if (this.#pageQuestions.length) {
+      const states = await Promise.all(this.#pageQuestions.map(entry => entry.adapter.readState(signal)));
+      const first = states[0]!;
+      return {
+        ...first,
+        timer_remaining_seconds: this.#readTimer(),
+        observation_id: this.#currentObservation!.observation_id,
+        fingerprint: fnv1a(JSON.stringify(states.map(state => state.fingerprint))),
+        selected_target_ids: states.flatMap((state, index) => state.selected_target_ids.map(id => `${this.#pageQuestions[index]!.prefix}${id}`)),
+        field_values: Object.fromEntries(states.flatMap((state, index) => Object.entries(state.field_values).map(([id, value]) => [`${this.#pageQuestions[index]!.prefix}${id}`, value]))),
+        completed: states.every(state => state.completed),
+        has_next: false,
+        has_session_submit: states.some(state => state.has_session_submit),
+      };
+    }
     const selectedTargetIds: string[] = [];
     const fieldValues: Record<string, string> = {};
     for (const [targetId, storedTarget] of this.#targets) {
@@ -539,59 +695,98 @@ export class DomWebAdapter implements PlatformAdapter {
       this.#targets.set(targetId, target);
       if (target.kind === "select_option") {
         if (target.element.value === target.value) selectedTargetIds.push(targetId);
-      } else if (target.element instanceof HTMLInputElement) {
-        if (["radio", "checkbox"].includes(target.element.type) && target.element.checked) {
+      } else if (target.element.tagName === "INPUT") {
+        const input = target.element as HTMLInputElement;
+        if (["radio", "checkbox"].includes(input.type) && input.checked) {
           selectedTargetIds.push(targetId);
-        } else if (!["radio", "checkbox"].includes(target.element.type)) {
-          fieldValues[targetId] = target.element.value;
+        } else if (!["radio", "checkbox"].includes(input.type)) {
+          fieldValues[targetId] = input.value;
         }
-      } else if (target.element instanceof HTMLTextAreaElement) {
-        fieldValues[targetId] = target.element.value;
+      } else if (target.element.tagName === "TEXTAREA") {
+        fieldValues[targetId] = (target.element as HTMLTextAreaElement).value;
       } else if (target.element.isContentEditable) {
         fieldValues[targetId] = target.element.textContent ?? "";
       } else {
-        const checked = target.element.getAttribute("aria-checked");
-        if (checked === "true") selectedTargetIds.push(targetId);
+        if (selectedChoice(target.element)) selectedTargetIds.push(targetId);
       }
     }
 
-    const pageText = normalizedText(this.#document.body?.innerText || this.#document.body?.textContent).slice(-4_000);
+    const pageText = normalizedText(this.courseScope ? this.courseScope.textContent : collectContexts(this.#document).map((context) =>
+      context.nodeType === Node.DOCUMENT_NODE
+        ? (context as Document).body?.innerText || (context as Document).body?.textContent
+        : context.textContent,
+    ).join(" ")).slice(-4_000);
     const feedbackText = queryAllDeep<HTMLElement>(
       this.#document,
       "[role='alert'], [aria-live], .feedback, .answer-feedback, .result, [data-feedback]",
     )
+      .filter(element => !this.courseScope || this.courseScope.contains(element))
       .map(elementText)
       .join(" ");
     const strongPageFeedback = pageText.match(
       /(?:your answer is (?:correct|incorrect)|回答(?:正确|错误)|答(?:对|错)了?)/i,
     )?.[0] ?? "";
-    const feedbackEvidence = `${feedbackText} ${strongPageFeedback}`;
-    const feedback = /\bcorrect\b|回答正确|答对/i.test(feedbackEvidence)
+    // H5P replaces Check after grading and disables the answer controls. The
+    // detached Check node cannot supply its old parent; Next still binds this
+    // visible question, rather than an unrelated editable form on the page.
+    const boundH5pRoot = ['control_submit', 'control_next', 'control_submit_session']
+      .map(id=>this.#targets.get(id)?.element.closest<HTMLElement>('.h5p-question'))
+      .find(root=>root?.isConnected && !isExplicitlyHidden(root));
+    const feedbackRoot = boundH5pRoot ?? this.#activeRoot();
+    const localGrading = feedbackRoot && !isExplicitlyHidden(feedbackRoot)
+      ? Array.from(feedbackRoot.querySelectorAll<HTMLElement>('.h5p-question-feedback.h5p-question-visible, .h5p-question-scorebar.h5p-question-visible'))
+          .filter(element=>!isExplicitlyHidden(element))
+          .map(element=>elementText(element.querySelector('.h5p-joubelui-score-bar-progress') ?? element)).join(' ')
+      : '';
+    // H5P announces the new grade immediately, while its animated scorebar can
+    // still display the previous attempt. Only use the current question's live
+    // grade while grading is visible; unrelated page announcements are excluded.
+    const liveGrading = localGrading && feedbackRoot
+      ? Array.from(feedbackRoot.querySelectorAll<HTMLElement>('.h5p-hidden-read[aria-live]'))
+          .filter(element=>!isExplicitlyHidden(element)).map(elementText).join(' ')
+      : '';
+    const pointsPattern = /\byou got\s+(\d+)\s+(?:out\s+)?of\s+(\d+)\s+points?\b/i;
+    const points = liveGrading.match(pointsPattern) ?? localGrading.match(pointsPattern);
+    const pointFeedback: PlatformState['feedback'] = points && Number(points[2])>0 && Number(points[1])<=Number(points[2])
+      ? Number(points[1])===Number(points[2]) ? 'correct' : Number(points[1])===0 ? 'incorrect' : 'partial'
+      : null;
+    const feedbackEvidence = `${feedbackText} ${strongPageFeedback} ${localGrading}`;
+    const feedback = pointFeedback ?? (/\bcorrect\b|回答正确|答对/i.test(feedbackEvidence)
       ? "correct"
       : /\bincorrect\b|\bwrong\b|回答错误|答错/i.test(feedbackEvidence)
         ? "incorrect"
-        : null;
+        : null);
     const editableAnswerTarget = [...this.#targets.entries()].some(([targetId, target]) => {
       if (targetId.startsWith("control_")) return false;
-      if (target.kind === "select_option") return !target.element.disabled;
-      return !("disabled" in target.element) || !(target.element as HTMLInputElement).disabled;
+      if (target.kind === "select_option") return !isExplicitlyHidden(target.element) && !target.element.disabled;
+      return !isExplicitlyHidden(target.element) &&
+        (!("disabled" in target.element) || !(target.element as HTMLInputElement).disabled);
     });
     const pathname = this.#document.location?.pathname ?? "";
     const completedPath = /\/(?:completed?|results?)\/?$/i.test(pathname);
     const scoredMatches = [...pageText.matchAll(/you got\s+(\d+)\s+out of\s+(\d+)\s+points?/gi)];
-    const scoredResult = scoredMatches.length > 0 && this.#fingerprintCurrentQuestion() === "missing";
+    const resultScore = pageText.match(/\bresult\s*:\s*(\d+)\s+of\s+(\d+)\s+(\d+(?:\.\d+)?)\s*%/i);
+    const validResultScore = resultScore && Number(resultScore[2]) > 0 &&
+      Number(resultScore[1]) <= Number(resultScore[2]) && Number(resultScore[3]) <= 100 &&
+      Math.abs(Number(resultScore[3]) - 100 * Number(resultScore[1]) / Number(resultScore[2])) <= 1;
+    const gradedQuestionSet = queryAllDeep<HTMLElement>(this.#document, '.questionset')
+      .some(element => !isExplicitlyHidden(element));
+    const scoredResult = !gradedQuestionSet && (scoredMatches.length > 0 || Boolean(validResultScore)) && this.#fingerprintCurrentQuestion() === "missing";
     const finalScore = scoredMatches.at(-1);
-    const visibleScore = this.#readVisibleScore() ?? (finalScore ? `${finalScore[1]}/${finalScore[2]}` : null);
+    const visibleScore = this.#readVisibleScore() ??
+      (validResultScore ? `${resultScore[1]}/${resultScore[2]}` : finalScore ? `${finalScore[1]}/${finalScore[2]}` : null);
     const position = this.#readQuestionPosition();
     const sessionSubmit = this.#findButton(SESSION_SUBMIT_PATTERN);
+    const personalSessionScore = this.#readPersonalSessionScore();
     return {
       observation_id: this.#currentObservation?.observation_id ?? "none",
+      timer_remaining_seconds: this.#readTimer(),
       fingerprint: this.#fingerprintCurrentQuestion(),
       selected_target_ids: selectedTargetIds,
       field_values: fieldValues,
       feedback,
       ...(feedbackEvidence.trim() ? { feedback_text: feedbackEvidence.trim() } : {}),
-      ...(visibleScore ? { visible_score: visibleScore } : {}),
+      ...(personalSessionScore || visibleScore ? { visible_score: personalSessionScore ?? visibleScore! } : {}),
       can_retry:
         this.#findButton(RETRY_PATTERN) !== null ||
         (feedback === "incorrect" && editableAnswerTarget),
@@ -599,14 +794,48 @@ export class DomWebAdapter implements PlatformAdapter {
       has_session_submit: sessionSubmit !== null,
       at_last_question: position !== null && position.current >= position.total,
       completed:
-        completedPath ||
+        (!this.courseScope && completedPath) ||
+        personalSessionScore !== null ||
         scoredResult ||
-        /quiz complete|test complete|interview complete|completed|your results?|测验完成|测试完成|答题完成|已交卷/i.test(pageText),
+        (!gradedQuestionSet && /quiz complete|test complete|interview complete|your results?|测验完成|测试完成|答题完成|已交卷/i.test(pageText)),
     };
   }
 
   resolveMediaSource(temporaryHandle: string): MediaSource | undefined {
-    return this.#mediaSources.get(temporaryHandle);
+    return this.#mediaSources.get(temporaryHandle) ?? this.#pageQuestions.map(entry => entry.adapter.resolveMediaSource(temporaryHandle)).find(Boolean);
+  }
+
+  async #observePage(roots: HTMLElement[], sessionId: string, signal: AbortSignal, mode: ObservationInputMode): Promise<PlatformObservation> {
+    const observationId = randomId("observation");
+    const children = await Promise.all(roots.map(async (root, index) => {
+      const adapter = new DomWebAdapter(this.#document, root, this.courseScope);
+      const observation = await adapter.observeSession(sessionId, signal, mode);
+      if (observation.layout !== "sequential") throw new Error("Question groups cannot be separated reliably.");
+      return { adapter, observation, parsed: observation.questions[0]!, prefix: `page_${index + 1}_` };
+    }));
+    this.#pageQuestions = children;
+    const globalSubmit = queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
+      .filter(element => !isExplicitlyHidden(element) && supportedInput(element) && !roots.some(root => root.contains(element)))
+      .filter(element => SESSION_SUBMIT_PATTERN.test(targetText(this.#document, element)) || SUBMIT_PATTERN.test(targetText(this.#document, element)));
+    if (globalSubmit.length === 1) {
+      const first = children[0]!;
+      first.parsed.locator_map.targets.control_submit_session = { kind: "semantic", local_ref: randomId("node"), role: "button" };
+      first.adapter.#targets.set("control_submit_session", { kind: "element", element: globalSubmit[0]!, identity: { ...targetIdentity(this.#document, globalSubmit[0]!, "session_submit"), question_fingerprint: first.parsed.locator_map.question_fingerprint } });
+    }
+    const questions = children.map(({ parsed, prefix }) => ({
+      question: { ...parsed.question, question_id: `${prefix}${parsed.question.question_id}`, observation_id: observationId, options: parsed.question.options.map(option => ({ ...option, id: `${prefix}${option.id}` })), blanks: parsed.question.blanks.map(blank => ({ ...blank, id: `${prefix}${blank.id}` })) },
+      locator_map: { ...parsed.locator_map, question_id: `${prefix}${parsed.question.question_id}`, observation_id: observationId, targets: Object.fromEntries(Object.entries(parsed.locator_map.targets).map(([id, target]) => [`${prefix}${id}`, target])) },
+    }));
+    const first = children[0]!.observation;
+    const observation: PlatformObservation = {
+      ...first, observation_id: observationId, layout: "multi_question_page", questions, question_total: questions.length,
+      fingerprint: fnv1a(JSON.stringify(children.map(child => child.observation.fingerprint))),
+      local_control_candidates: [],
+      ...(first.page_context ? { page_context: { ...first.page_context, controls: children.flatMap(child => child.observation.page_context?.controls.map(control => ({ ...control, semantic_id: `${child.prefix}${control.semantic_id}` })) ?? []).slice(0, 256) } } : {}),
+    };
+    this.#currentObservation = observation;
+    this.#currentLocator = questions[0]!.locator_map;
+    return observation;
   }
 
   detectHardBlocker(): string | null {
@@ -706,15 +935,15 @@ export class DomWebAdapter implements PlatformAdapter {
         ]
       : targetId === "control_submit_session"
         ? queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
-            .filter((element) => SESSION_SUBMIT_PATTERN.test(targetText(this.#document, element)))
+            .filter((element) => element.matches("button.h5p-question-finish") || SESSION_SUBMIT_PATTERN.test(targetText(this.#document, element)))
         : targetId === "control_next"
-          ? queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
+          ? queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button'], a.h5p-question-next")
               .filter((element) => NEXT_PATTERN.test(targetText(this.#document, element)))
           : targetId === "control_retry"
             ? queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
                 .filter((element) => RETRY_PATTERN.test(targetText(this.#document, element)))
             : [];
-    return choose([...new Set(candidates)].filter((element) => !isExplicitlyHidden(element) && supportedInput(element)));
+    return choose([...new Set(candidates)].filter((element) => (!this.courseScope || this.courseScope.contains(element)) && !isExplicitlyHidden(element) && supportedInput(element)));
   }
 
   #registerCandidateControls(locatorMap: LocatorMap): NonNullable<PlatformObservation["local_control_candidates"]> {
@@ -723,7 +952,7 @@ export class DomWebAdapter implements PlatformAdapter {
     const candidates = queryAllDeep<HTMLElement>(
       this.#document,
       "button, input[type='submit'], input[type='button'], [role='button'], a[href]",
-    ).filter((element) => !isExplicitlyHidden(element) && supportedInput(element));
+    ).filter((element) => (!this.courseScope || this.courseScope.contains(element)) && !isExplicitlyHidden(element) && supportedInput(element));
 
     let candidateIndex = 0;
     const localCandidates: NonNullable<PlatformObservation["local_control_candidates"]> = [];
@@ -756,9 +985,7 @@ export class DomWebAdapter implements PlatformAdapter {
   ): NonNullable<PlatformObservation["page_context"]> {
     const controls = [...this.#targets.entries()].slice(0, 256).map(([semanticId, target]) => {
       const element = target.element;
-      const selected = element instanceof HTMLInputElement
-        ? element.checked
-        : element.getAttribute("aria-checked") === "true" || element.getAttribute("aria-selected") === "true";
+      const selected = selectedChoice(element);
       const disabled = element.getAttribute("aria-disabled") === "true" ||
         ("disabled" in element && Boolean((element as HTMLInputElement | HTMLButtonElement | HTMLSelectElement).disabled));
       return {
@@ -772,7 +999,7 @@ export class DomWebAdapter implements PlatformAdapter {
       };
     });
 
-    const body = this.#document.body;
+    const body = this.courseScope ?? this.#document.body;
     let visibleText = normalizedText(body?.innerText).slice(0, 20_000);
     if (!visibleText && body) {
       const clone = body.cloneNode(true) as HTMLElement;
@@ -787,15 +1014,12 @@ export class DomWebAdapter implements PlatformAdapter {
   #parseQuestion(root: HTMLElement, sessionId: string, observationId: string) {
     const ownerDocument = root.ownerDocument;
     const stem = semanticStem(ownerDocument, root);
-    const stemText = stem.text;
-    const radioControls = Array.from(root.querySelectorAll<HTMLElement>("input[type='radio'], [role='radio']"))
-      .filter((element) => !isExplicitlyHidden(element));
-    const checkboxControls = Array.from(root.querySelectorAll<HTMLElement>("input[type='checkbox'], [role='checkbox']"))
-      .filter((element) => !isExplicitlyHidden(element));
+    const radioControls = choiceControls(root, 'radio');
+    const checkboxControls = choiceControls(root, 'checkbox');
     const select = root.querySelector<HTMLSelectElement>("select:not([multiple])");
     const textControls = Array.from(
       root.querySelectorAll<HTMLElement>("input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']"),
-    ).filter((element) => !isExplicitlyHidden(element) && supportedInput(element));
+    ).filter((element) => !isExplicitlyHidden(element) && (supportedInput(element) || hasVisibleQuestionSetGrade(root)));
 
     const optionControls = radioControls.length > 0 ? radioControls : checkboxControls;
     const type: QuestionFrame["type"] =
@@ -804,6 +1028,7 @@ export class DomWebAdapter implements PlatformAdapter {
         : checkboxControls.length > 0
           ? "multiple_choice"
           : "fill_blank";
+    const stemText = type === "fill_blank" ? blankQuestionStem(root, textControls, stem.text) : stem.text;
     const options: QuestionFrame["options"] = [];
     const blanks: QuestionFrame["blanks"] = [];
     const targets: LocatorMap["targets"] = {};
@@ -863,9 +1088,21 @@ export class DomWebAdapter implements PlatformAdapter {
     const nativeSubmit = Array.from(
       root.querySelectorAll<HTMLElement>("button[type='submit'], input[type='submit']"),
     ).find((element) => !isExplicitlyHidden(element) && supportedInput(element));
-    const submit = nativeSubmit && !NEXT_PATTERN.test(targetText(ownerDocument, nativeSubmit))
+    let submit = nativeSubmit && !NEXT_PATTERN.test(targetText(ownerDocument, nativeSubmit))
       ? nativeSubmit
       : this.#findButton(SUBMIT_PATTERN, root);
+    // A newly visible H5P Finish is a session control even after Check disappears.
+    if (submit?.matches('button.h5p-question-finish')) submit = null;
+    if (!submit && !this.rootOverride && !this.courseScope && candidateRoots(this.#document).length === 1) {
+      const container = root.closest("form, main, [role='main'], [data-vv-quiz], .quiz") ?? root.parentElement;
+      const questionForm = root.closest("form");
+      const external = queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
+        .filter(element => container?.contains(element) && !root.contains(element) &&
+          !element.closest("header, nav, aside, footer, [role='search']") && element.closest("form") === questionForm &&
+          !isExplicitlyHidden(element) && supportedInput(element) &&
+          SUBMIT_PATTERN.test(targetText(ownerDocument, element)));
+      if (external.length === 1) submit = external[0]!;
+    }
     if (submit) {
       const localRef = randomId("node");
       targets.control_submit = { kind: "semantic", local_ref: localRef, role: "button" };
@@ -877,14 +1114,16 @@ export class DomWebAdapter implements PlatformAdapter {
       targets.control_next = { kind: "semantic", local_ref: localRef, role: "button" };
       this.#targets.set("control_next", { kind: "element", element: next, identity: targetIdentity(ownerDocument, next, "next") });
     }
-    const retry = this.#findButton(RETRY_PATTERN, root) ?? this.#findButton(RETRY_PATTERN);
+    const retry = this.#findButton(RETRY_PATTERN, root) ??
+      root.querySelector<HTMLElement>("button.h5p-question-try-again") ??
+      this.#findButton(RETRY_PATTERN);
     if (retry) {
       const localRef = randomId("node");
       targets.control_retry = { kind: "semantic", local_ref: localRef, role: "button" };
       this.#targets.set("control_retry", { kind: "element", element: retry, identity: targetIdentity(ownerDocument, retry, "retry") });
     }
     const sessionSubmit = this.#findButton(SESSION_SUBMIT_PATTERN, this.#document, true);
-    if (sessionSubmit && !root.contains(sessionSubmit) && sessionSubmit !== submit) {
+    if (sessionSubmit && (this.courseScope || !root.contains(sessionSubmit) || sessionSubmit.matches("button.h5p-question-finish")) && sessionSubmit !== submit) {
       const localRef = randomId("node");
       targets.control_submit_session = { kind: "semantic", local_ref: localRef, role: "button" };
       this.#targets.set("control_submit_session", {
@@ -935,6 +1174,7 @@ export class DomWebAdapter implements PlatformAdapter {
   }
 
   #setSelected(target: DomTarget, value: boolean): void {
+    if (!supportedInput(target.element)) throw new Error("Target is disabled.");
     if (target.kind === "select_option") {
       if (value && target.element.value !== target.value) {
         target.element.value = target.value;
@@ -943,23 +1183,25 @@ export class DomWebAdapter implements PlatformAdapter {
       return;
     }
     const element = target.element;
-    if (element instanceof HTMLInputElement && ["radio", "checkbox"].includes(element.type)) {
-      if (element.disabled) throw new Error("Target is disabled.");
-      if (element.checked !== value) element.click();
+    if (element.tagName === "INPUT" && ["radio", "checkbox"].includes((element as HTMLInputElement).type)) {
+      const input = element as HTMLInputElement;
+      if (input.disabled) throw new Error("Target is disabled.");
+      if (input.checked !== value) input.click();
       return;
     }
-    const current = element.getAttribute("aria-checked") === "true";
+    const current = selectedChoice(element);
     if (current !== value) element.click();
   }
 
   #setValue(target: DomTarget, value: string): void {
     if (target.kind !== "element") throw new Error("Text target is invalid.");
     const element = target.element;
-    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-      if (element.disabled || element.readOnly) throw new Error("Target is not editable.");
-      element.focus();
-      element.value = value;
-      dispatchValueEvents(element);
+    if (element.tagName === "INPUT" || element.tagName === "TEXTAREA") {
+      const input = element as HTMLInputElement | HTMLTextAreaElement;
+      if (input.disabled || input.readOnly) throw new Error("Target is not editable.");
+      input.focus();
+      input.value = value;
+      dispatchValueEvents(input);
     } else if (element.isContentEditable) {
       element.focus();
       element.textContent = value;
@@ -972,58 +1214,91 @@ export class DomWebAdapter implements PlatformAdapter {
   #findButton(pattern: RegExp, within: ParentNode = this.#document, includeDisabled = false): HTMLElement | null {
     const candidates =
       within === this.#document
-        ? queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
-        : Array.from(within.querySelectorAll<HTMLElement>("button, input[type='submit'], input[type='button'], [role='button']"));
+        ? queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button'], a.h5p-question-next")
+        : Array.from(within.querySelectorAll<HTMLElement>("button, input[type='submit'], input[type='button'], [role='button'], a.h5p-question-next"));
     return (
       candidates
-        .filter((element) => !isExplicitlyHidden(element) && (includeDisabled || supportedInput(element)))
-        .find((element) => pattern.test(normalizedText(
-          element instanceof HTMLInputElement ? element.value : element.getAttribute("aria-label") || element.textContent,
-        ))) ?? null
+        .filter((element) => (!this.courseScope || this.courseScope.contains(element)) && !isExplicitlyHidden(element) && (includeDisabled || supportedInput(element)))
+        .find((element) =>
+          (pattern === SUBMIT_PATTERN && element.matches("button.h5p-question-check-answer")) ||
+          (pattern === SESSION_SUBMIT_PATTERN && element.matches("button.h5p-question-finish")) ||
+          (pattern === RETRY_PATTERN && element.matches("button.h5p-question-try-again")) ||
+          pattern.test(normalizedText(
+            element.tagName === "INPUT" ? (element as HTMLInputElement).value : element.getAttribute("aria-label") || element.textContent,
+          )),
+        ) ?? null
     );
   }
 
   #fingerprintCurrentQuestion(): string {
     const root = this.#activeRoot();
-    if (!root) return "missing";
-    const stem = semanticStem(root.ownerDocument, root).text;
-    const radioControls = Array.from(root.querySelectorAll<HTMLElement>("input[type='radio'], [role='radio']"))
-      .filter((element) => !isExplicitlyHidden(element));
-    const checkboxControls = Array.from(root.querySelectorAll<HTMLElement>("input[type='checkbox'], [role='checkbox']"))
-      .filter((element) => !isExplicitlyHidden(element));
+    if (!root) {
+      const next = this.#targets.get("control_next") ?? this.#targets.get("control_submit_session");
+      const current = next?.element.closest<HTMLElement>(".h5p-question");
+      const graded = current?.querySelector<HTMLElement>(
+        ".h5p-question-feedback.h5p-question-visible, .h5p-question-scorebar.h5p-question-visible",
+      );
+      if (
+        next?.kind === "element" && next.element.matches("a.h5p-question-next, button.h5p-question-finish") &&
+        current && graded && !isExplicitlyHidden(current) && !isExplicitlyHidden(graded) &&
+        !isExplicitlyHidden(next.element) && this.#currentLocator?.question_fingerprint
+      ) {
+        return this.#currentLocator.question_fingerprint;
+      }
+      return "missing";
+    }
+    const baseStem = semanticStem(root.ownerDocument, root).text;
+    const radioControls = choiceControls(root, 'radio');
+    const checkboxControls = choiceControls(root, 'checkbox');
     const select = root.querySelector<HTMLSelectElement>("select:not([multiple])");
     const type = radioControls.length > 0 || select
       ? "single_choice"
       : checkboxControls.length > 0
         ? "multiple_choice"
         : "fill_blank";
+    const textControls = type === "fill_blank"
+      ? Array.from(root.querySelectorAll<HTMLElement>("input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']"))
+          .filter((element) => !isExplicitlyHidden(element) && (supportedInput(element) || hasVisibleQuestionSetGrade(root)))
+      : [];
+    const stem = type === "fill_blank" ? blankQuestionStem(root, textControls, baseStem) : baseStem;
     const options = select
       ? Array.from(select.options)
           .filter((option) => !option.disabled && option.value !== "")
           .map((option) => normalizedText(option.text))
       : (radioControls.length > 0 ? radioControls : checkboxControls)
           .map((element, index) => optionLabel(root.ownerDocument, element) || `Option ${index + 1}`);
-    const blanks = type === "fill_blank"
-      ? Array.from(root.querySelectorAll<HTMLElement>("input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']"))
-          .filter((element) => !isExplicitlyHidden(element) && supportedInput(element)).length
-      : 0;
+    const blanks = textControls.length;
     return fnv1a(JSON.stringify({ type, stemText: stem, options, blanks }));
   }
 
   #readTimer(): number | null {
-    const timer = queryAllDeep<HTMLElement>(
+    const timers = queryAllDeep<HTMLElement>(
       this.#document,
       "[data-remaining-seconds], [role='timer'], .timer, .countdown",
-    )[0];
-    if (!timer) return null;
-    const explicit = timer.getAttribute("data-remaining-seconds");
-    if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
-    const match = elementText(timer).match(/(?:(\d+):)?(\d{1,2}):(\d{2})/);
-    if (!match) return null;
-    return Number(match[1] ?? 0) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+    );
+    for (const timer of timers) {
+      if (this.courseScope && !this.courseScope.contains(timer)) continue;
+      if (isExplicitlyHidden(timer)) continue;
+      if (timer.getAttribute('data-timer-scope') === 'question' || timer.getAttribute('data-timer-scope') === 'page') continue;
+      const explicit = timer.getAttribute("data-remaining-seconds");
+      if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
+      const text = elementText(timer);
+      const meaning = [text, timer.getAttribute('aria-label'), timer.getAttribute('title')].filter(Boolean).join(' ');
+      // A timer role or generic class can also describe elapsed time. Unknown
+      // clocks must not trigger the session deadline or submission.
+      if (/elapsed|time\s+(?:spent|taken)|已用|已耗|用时/i.test(meaning)) continue;
+      if (!timer.classList.contains('countdown') && !/remaining|time\s+(?:left|to\s+(?:finish|complete))|countdown|剩余|倒计时/i.test(meaning)) continue;
+      if (/(?:question|page)\s+(?:time|countdown)|time\s+left\s+(?:for|on)\s+(?:this\s+)?(?:question|page)|本题|每题|本页/i.test(meaning)) continue;
+      const match = text.match(/(?:(\d+):)?(\d{1,2}):(\d{2})/);
+      if (!match || Number(match[3]) >= 60 || (match[1] && Number(match[2]) >= 60)) continue;
+      return Number(match[1] ?? 0) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+    }
+    return null;
   }
 
   #readQuestionTotal(): number | null {
+    const h5pProgress = this.#readH5pProgress();
+    if (h5pProgress) return h5pProgress.total;
     const explicit = queryAllDeep<HTMLElement>(this.#document, "[data-total-questions]")[0]
       ?.getAttribute("data-total-questions");
     if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
@@ -1041,6 +1316,8 @@ export class DomWebAdapter implements PlatformAdapter {
   }
 
   #readQuestionPosition(): { current: number; total: number } | null {
+    const h5pProgress = this.#readH5pProgress();
+    if (h5pProgress) return h5pProgress;
     const root = this.#activeRoot();
     const sources = [
       root ? elementText(root) : "",
@@ -1054,10 +1331,53 @@ export class DomWebAdapter implements PlatformAdapter {
     return null;
   }
 
+  #readH5pProgress(): { current: number; total: number } | null {
+    const dots = queryAllDeep<HTMLElement>(this.#document, '.questionset .progress-dot, .questionset .h5p-progress-dot')
+      .filter(element => !isExplicitlyHidden(element));
+    const current = dots.filter(element => element.classList.contains('current'));
+    if (current.length !== 1) return null;
+    const parse = (element: HTMLElement) => element.getAttribute('aria-label')?.match(/^(?:Question|题目)\s*(\d+)\s*(?:of|\/|共)\s*(\d+)(?:\s*[,，]|$)/i);
+    const active = parse(current[0]!);
+    if (!active) return null;
+    const total=Number(active[2]), position=Number(active[1]);
+    const labels=dots.map(parse);
+    if(total!==dots.length || position<1 || position>total || labels.some(label=>!label || Number(label[2])!==total) ||
+      new Set(labels.map(label=>Number(label![1]))).size!==total || labels.some(label=>Number(label![1])<1 || Number(label![1])>total)) return null;
+    return { current:position,total };
+  }
+
   #readVisibleScore(): string | null {
     const score = queryAllDeep<HTMLElement>(this.#document, "[data-score], .score, .quiz-score, .grade")
+      .filter(element => (!this.courseScope || this.courseScope.contains(element)) && !isExplicitlyHidden(element))
       .map((element) => element.getAttribute("data-score") || elementText(element))
       .find(Boolean);
     return score ? normalizedText(score) : null;
+  }
+
+  #readPersonalSessionScore(): string | null {
+    if (this.courseScope) return null;
+    // A review page may retain every question. Require a local, visible personal
+    // score and a closed answering surface, rather than a page-wide number match.
+    if (this.#findButton(SESSION_SUBMIT_PATTERN) || this.#findButton(NEXT_PATTERN) ||
+      queryAllDeep<HTMLElement>(this.#document, SUPPORTED_CONTROL_SELECTOR)
+        .some(element => !isExplicitlyHidden(element) && supportedInput(element))) return null;
+    const captions = queryAllDeep<HTMLElement>(this.#document, "p, span, div, h1, h2, h3, h4, dt, figcaption")
+      .filter(element => !isExplicitlyHidden(element) &&
+        /^your (?:final )?score(?: for (?:today['’]s|this|the) (?:quiz|test|assessment))?\s*:?$/i.test(elementText(element)));
+    for (const caption of captions) {
+      let region = caption.parentElement;
+      for (let depth = 0; region && depth < 3; depth++, region = region.parentElement) {
+        if (elementText(region).length > 300) break;
+        const scores = Array.from(region.querySelectorAll<HTMLElement>("div, span, p, strong, b, output, dd, h1, h2, h3"))
+          .filter(element => !isExplicitlyHidden(element))
+          .map(element => elementText(element).match(/^(\d+)\s*\/\s*(\d+)$/))
+          .filter(match => match && Number(match[2]) > 0 && Number(match[1]) <= Number(match[2]))
+          .map(match => `${match![1]}/${match![2]}`);
+        const unique = [...new Set(scores)];
+        if (unique.length === 1) return unique[0]!;
+        if (unique.length > 1) break;
+      }
+    }
+    return null;
   }
 }

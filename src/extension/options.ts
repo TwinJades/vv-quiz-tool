@@ -1,4 +1,6 @@
-import { SCHEMA_VERSION, providerProfileSchema } from "../core";
+import { SCHEMA_VERSION, providerProfileSchema, modelBatchLimitsSchema } from "../core";
+import { DEFAULT_BATCH_LIMITS } from "../core/batch-planner";
+import type { BatchLimits } from "../core/batch-planner";
 import type { ProviderProfile } from "../core";
 import { listProviderModels } from "../provider/model-catalog";
 import { ProviderManager } from "../provider/provider-manager";
@@ -8,6 +10,8 @@ const manager = new ProviderManager(new ChromeLocalStore());
 const form = document.querySelector<HTMLFormElement>("#provider-form")!;
 const profileId = document.querySelector<HTMLInputElement>("#profile-id")!;
 const displayName = document.querySelector<HTMLInputElement>("#display-name")!;
+const providerType = document.querySelector<HTMLSelectElement>("#provider-type")!;
+const searchModels = document.querySelector<HTMLTextAreaElement>("#search-models")!;
 const baseUrl = document.querySelector<HTMLInputElement>("#base-url")!;
 const apiKey = document.querySelector<HTMLInputElement>("#api-key")!;
 const models = document.querySelector<HTMLTextAreaElement>("#models")!;
@@ -15,6 +19,57 @@ const imageInput = document.querySelector<HTMLInputElement>("#image-input")!;
 const imageAuthorization = document.querySelector<HTMLInputElement>("#image-authorization")!;
 const status = document.querySelector<HTMLElement>("#status")!;
 const profileList = document.querySelector<HTMLElement>("#profile-list")!;
+const batchModel = document.querySelector<HTMLSelectElement>("#batch-model")!;
+const batchCustom = document.querySelector<HTMLInputElement>("#batch-custom")!;
+const batchQuestions = document.querySelector<HTMLInputElement>("#batch-questions")!;
+const batchTokens = document.querySelector<HTMLInputElement>("#batch-tokens")!;
+const batchImages = document.querySelector<HTMLInputElement>("#batch-images")!;
+let batchDraft: Record<string, BatchLimits> = Object.create(null);
+let batchEditingId = "";
+
+function storeBatchDraft(): void {
+  if (!batchEditingId) return;
+  if (batchCustom.checked) batchDraft[batchEditingId] = modelBatchLimitsSchema.parse({
+    max_questions: Number(batchQuestions.value), max_estimated_tokens: Number(batchTokens.value), max_images: Number(batchImages.value),
+  });
+  else delete batchDraft[batchEditingId];
+}
+
+function showBatchLimits(id: string): void {
+  batchEditingId = id;
+  const limits = batchDraft[id] ?? DEFAULT_BATCH_LIMITS;
+  batchCustom.checked = Boolean(batchDraft[id]);
+  batchCustom.disabled = !id;
+  batchQuestions.value = String(limits.max_questions);
+  batchTokens.value = String(limits.max_estimated_tokens);
+  batchImages.value = String(limits.max_images);
+  for (const input of [batchQuestions, batchTokens, batchImages]) input.disabled = !id || !batchCustom.checked;
+}
+
+function refreshBatchModels(): void {
+  const ids = [...new Set([...manualModels(), ...Object.keys(batchDraft)])];
+  batchModel.replaceChildren();
+  for (const id of ids.length ? ids : [""]) {
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = id || "先填写或读取模型列表";
+    batchModel.append(option);
+  }
+  batchModel.value = ids.includes(batchEditingId) ? batchEditingId : ids[0] ?? "";
+  showBatchLimits(batchModel.value);
+}
+
+batchCustom.addEventListener("change", () => {
+  for (const input of [batchQuestions, batchTokens, batchImages]) input.disabled = !batchCustom.checked;
+});
+batchModel.addEventListener("change", () => {
+  try { storeBatchDraft(); showBatchLimits(batchModel.value); }
+  catch { batchModel.value = batchEditingId; setStatus("分批限制需填写范围内的整数，修改后再切换模型。", true); }
+});
+models.addEventListener("change", () => {
+  try { storeBatchDraft(); refreshBatchModels(); }
+  catch { setStatus("请先修正模型分批限制。", true); }
+});
 
 function setStatus(message: string, error = false): void {
   status.textContent = message;
@@ -38,14 +93,24 @@ function resetForm(): void {
   form.reset();
   profileId.value = "";
   imageAuthorization.checked = false;
+  searchModels.disabled = true;
+  batchDraft = Object.create(null);
+  batchEditingId = "";
+  refreshBatchModels();
   setStatus("");
 }
 
 function loadIntoForm(profile: ProviderProfile): void {
   profileId.value = profile.provider_profile_id;
   displayName.value = profile.display_name;
+  providerType.value = profile.provider_type;
+  searchModels.value = (profile.native_web_search_model_ids ?? []).join("\n");
+  searchModels.disabled = profile.provider_type !== "anthropic";
   baseUrl.value = profile.base_url;
   models.value = profile.model_catalog.models.join("\n");
+  batchDraft = Object.assign(Object.create(null), structuredClone(profile.model_batch_limits ?? {}));
+  batchEditingId = Object.keys(batchDraft)[0] ?? "";
+  refreshBatchModels();
   imageInput.checked = profile.capabilities.image_input;
   imageAuthorization.checked = profile.image_upload_authorized;
   apiKey.value = "";
@@ -92,6 +157,7 @@ async function renderProfiles(): Promise<void> {
             source: result.source,
             models: result.models,
             refreshed_at: result.refreshed_at,
+            ...(result.input_token_limits ? { input_token_limits: result.input_token_limits } : {}),
           },
         } satisfies ProviderProfile;
         await manager.save({ profile: updated });
@@ -129,6 +195,7 @@ async function renderProfiles(): Promise<void> {
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
+    storeBatchDraft();
     const normalizedBaseUrl = baseUrl.value.trim().replace(/\/$/, "");
     const configuredModels = manualModels();
     const granted = await requestProviderPermission(normalizedBaseUrl);
@@ -139,16 +206,21 @@ form.addEventListener("submit", async (event) => {
       schema_version: SCHEMA_VERSION,
       provider_profile_id: id,
       display_name: displayName.value.trim(),
-      provider_type: "openai_compatible",
+      provider_type: providerType.value,
       base_url: normalizedBaseUrl,
       secret_ref: existing?.secret_ref ?? `secret_${crypto.randomUUID()}`,
-      model_catalog: { source: "manual", models: configuredModels, refreshed_at: null },
+      model_catalog: { source: "manual", models: [...new Set([...configuredModels,
+        ...(providerType.value === "anthropic" ? searchModels.value.split(/[\n,]/).map(id => id.trim()).filter(Boolean) : [])])], refreshed_at: null,
+        ...(existing?.provider_type === providerType.value && existing?.base_url === normalizedBaseUrl && existing?.model_catalog.input_token_limits
+          ? { input_token_limits: existing.model_catalog.input_token_limits } : {}) },
       capabilities: {
         image_input: imageInput.checked,
         structured_output: true,
-        native_web_search: false,
+        native_web_search: providerType.value === "anthropic" && searchModels.value.trim().length > 0,
       },
       image_upload_authorized: imageAuthorization.checked,
+      model_batch_limits: batchDraft,
+      ...(providerType.value === "anthropic" ? { native_web_search_model_ids: [...new Set(searchModels.value.split(/[\n,]/).map(id => id.trim()).filter(Boolean))] } : {}),
     });
     const effectiveApiKey = apiKey.value || (existing ? await manager.getApiKey(existing) : undefined);
     const catalog = await listProviderModels(draftProfile, effectiveApiKey);
@@ -161,6 +233,7 @@ form.addEventListener("submit", async (event) => {
         source: catalog.source,
         models: catalog.source === "provider_api" ? catalog.models : configuredModels,
         refreshed_at: catalog.refreshed_at,
+        ...(catalog.input_token_limits ? { input_token_limits: catalog.input_token_limits } : {}),
       },
     });
     await manager.save({ profile, ...(apiKey.value ? { apiKey: apiKey.value } : {}) });
@@ -178,5 +251,12 @@ form.addEventListener("submit", async (event) => {
 });
 
 document.querySelector("#new-profile")?.addEventListener("click", resetForm);
+providerType.addEventListener("change", () => {
+  searchModels.disabled = providerType.value !== "anthropic";
+  searchModels.value = "";
+  if (!profileId.value) baseUrl.value = providerType.value === "google"
+    ? "https://generativelanguage.googleapis.com/v1beta" : providerType.value === "anthropic"
+      ? "https://api.anthropic.com/v1" : "";
+});
 
 void renderProfiles();

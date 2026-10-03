@@ -1,4 +1,5 @@
-const version = await fetch("http://127.0.0.1:9341/json/version").then((response) => response.json());
+const port = process.argv[2] ?? "9341";
+const version = await fetch(`http://127.0.0.1:${port}/json/version`).then((response) => response.json());
 const socket = new WebSocket(version.webSocketDebuggerUrl);
 await new Promise((resolve, reject) => {
   socket.addEventListener("open", resolve, { once: true });

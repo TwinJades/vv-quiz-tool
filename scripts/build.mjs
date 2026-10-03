@@ -6,7 +6,7 @@ import { build } from "esbuild";
 import { generateIcons } from "./generate-icons.mjs";
 
 const root = resolve(import.meta.dirname, "..");
-const outputDirectory = resolve(root, "dist");
+const outputDirectory = resolve(root, process.env.VV_BUILD_DIR || "dist");
 await mkdir(outputDirectory, { recursive: true });
 await generateIcons(resolve(root, "static"));
 
@@ -43,12 +43,14 @@ await Promise.all([
     outfile: resolve(outputDirectory, "options.js"),
     format: "iife",
   }),
+  build({ ...common, entryPoints: [resolve(root, "src/extension/tasks.ts")], outfile: resolve(outputDirectory, "tasks.js"), format: "iife" }),
 ]);
 
 for (const file of [
   "manifest.json",
   "popup.html",
   "options.html",
+  "tasks.html",
   "ui.css",
   "icon.svg",
   "icon16.png",
