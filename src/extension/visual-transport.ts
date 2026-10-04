@@ -1,6 +1,15 @@
 import { assertVisualFreshness, fingerprintVisualTiles, insideRect } from "../core/visual";
 import type { VisualCapture, VisualFrame, VisualGeometry } from "../core/visual";
 import type { InteractionBinding, NativeInputTicket } from "./interaction-guard";
+import { requireCurrentWebsite } from './website-access';
+
+export interface NormalHoverTarget {
+  point: { x: number; y: number };
+  captured_at: number;
+  geometry: VisualGeometry;
+  session_id: string;
+  interaction_epoch: string;
+}
 let captureTail: Promise<void> = Promise.resolve();
 const connectionTails = new Map<number, Promise<void>>();
 function serializedConnection<T>(tabId: number, operation: () => Promise<T>): Promise<T> {
@@ -35,6 +44,7 @@ export class VisualTransport {
   #closed = false;
   #closing: Promise<void> | null = null;
   #captures = 0;
+  #viewportContextSent = false;
   #streaming = false;
   #listening = false;
   readonly #frameListener = (source: chrome.debugger.Debuggee, method: string, params?: object) => {
@@ -129,20 +139,20 @@ export class VisualTransport {
   async #capture(sessionId: string, observationId: string, signal: AbortSignal): Promise<VisualCapture> {
     this.#captures++;
     signal.throwIfAborted();
-    const geometry = await this.geometry();
-    const frames = await chrome.webNavigation.getAllFrames({ tabId: this.tabId });
+    const geometry = await bounded(this.geometry(), signal, "visual geometry");
+    const frames = await bounded(chrome.webNavigation.getAllFrames({ tabId: this.tabId }), signal, "visual frames");
     const origins = [...new Set([geometry.url, ...(frames ?? []).map(frame => frame.url)].filter(url => /^https?:/.test(url)).map(url => `${new URL(url).origin}/*`))];
-    if (!await chrome.permissions.contains({ origins })) throw new Error("VISUAL_UNAVAILABLE: website/frame permission was revoked or is missing.");
+    if (!await bounded(chrome.permissions.contains({ origins }), signal, "visual website permission")) throw new Error("VISUAL_UNAVAILABLE: website/frame permission was revoked or is missing.");
     if (geometry.blocker) throw new Error(`HARD_BLOCKER: ${geometry.blocker}`);
     if (!/^https?:/.test(geometry.url) || geometry.viewport.scale !== 1 || geometry.region.width <= 0 || geometry.region.height <= 0) throw new Error("VISUAL_UNAVAILABLE: unsupported viewport or document.");
-    const zoom = await chrome.tabs.getZoom(this.tabId);
+    const zoom = await bounded(chrome.tabs.getZoom(this.tabId), signal, "visual zoom");
     // A CDP clip temporarily changes device emulation/view size. Capture the
     // target's viewport without changing layout, then crop locally before upload.
     const image=await this.#withFrames(()=>this.#send<{ data: string }>("Page.captureScreenshot", {
         format: "png", fromSurface: true, captureBeyondViewport: false,
       },signal),signal);
-    const after = await this.geometry();
-    if (JSON.stringify(after) !== JSON.stringify(geometry) || await chrome.tabs.getZoom(this.tabId) !== zoom) throw new Error("PAGE_CHANGED: document changed during screenshot capture.");
+    const after = await bounded(this.geometry(), signal, "visual geometry verification");
+    if (JSON.stringify(after) !== JSON.stringify(geometry) || await bounded(chrome.tabs.getZoom(this.tabId), signal, "visual zoom verification") !== zoom) throw new Error("PAGE_CHANGED: document changed during screenshot capture.");
     const raw = Uint8Array.from(atob(image.data), char => char.charCodeAt(0));
     const bitmap = await createImageBitmap(new Blob([raw], { type: "image/png" }));
     try {
@@ -162,9 +172,14 @@ export class VisualTransport {
       const pixel_tiles = await fingerprintVisualTiles(pixels, width, height);
       const data = new Uint8Array(await (await canvas.convertToBlob({ type: "image/png" })).arrayBuffer());
       signal.throwIfAborted();
+      const viewport_context = !this.#viewportContextSent && geometry.isolated_canvas &&
+        (left !== 0 || top !== 0 || width !== bitmap.width || height !== bitmap.height)
+        ? { data: raw, width: bitmap.width, height: bitmap.height } : undefined;
+      this.#viewportContextSent = true;
       return { frame: { visual_frame_id: crypto.randomUUID(), session_id: sessionId, observation_id: observationId,
         surface_id: `tab_${this.tabId}`, captured_at: Date.now(), geometry, zoom, width, height, ...(pixel_tiles ? {pixel_tiles} : {}),
-        fingerprint: Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join(""), temporary_handle: `visual_${crypto.randomUUID()}` }, data };
+        fingerprint: Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join(""), temporary_handle: `visual_${crypto.randomUUID()}` }, data,
+        ...(viewport_context ? { viewport_context } : {}) };
     } finally { bitmap.close(); }
   }
 
@@ -232,6 +247,39 @@ export class VisualTransport {
       { method: "Input.dispatchMouseEvent", params: { type: "mousePressed", button: "left", clickCount: 1, ...point } },
       { method: "Input.dispatchMouseEvent", params: { type: "mouseReleased", button: "left", clickCount: 1, ...point } },
     ], signal, expectedFrame);
+  }
+
+  /** A locally resolved normal control can require CSS :hover. This separate
+   * path never clicks, captures/uploads pixels, emulates focus, produces frames
+   * or changes page visibility. No model-provided CDP commands are accepted. */
+  hoverNormalControl(target: NormalHoverTarget, signal: AbortSignal): Promise<void> {
+    target = structuredClone(target);
+    const assertBinding = () => {
+      signal.throwIfAborted();
+      const binding = this.binding();
+      if (!binding?.enabled || binding.session_id !== target.session_id || binding.epoch !== target.interaction_epoch)
+        throw new Error('USER_INTERACTION: normal hover belongs to an inactive session.');
+      if (!Number.isFinite(target.captured_at) || Date.now() < target.captured_at || Date.now() - target.captured_at > 5000)
+        throw new Error('TARGET_UNAVAILABLE: normal hover observation expired.');
+    };
+    return serializedOperation(async () => {
+      assertBinding();
+      await requireCurrentWebsite(this.tabId); assertBinding();
+      if (!await chrome.permissions.contains({ permissions: ['debugger'] })) throw new Error('正常倍速菜单悬停需要已授权的debugger网页控制权限。');
+      assertBinding();
+      await this.#attach(signal); assertBinding();
+      await requireCurrentWebsite(this.tabId); assertBinding();
+      const current = await this.geometry(); assertBinding();
+      if (current.blocker || current.url !== target.geometry.url || current.time_origin !== target.geometry.time_origin ||
+        JSON.stringify(current.viewport) !== JSON.stringify(target.geometry.viewport) ||
+        JSON.stringify(current.scroll) !== JSON.stringify(target.geometry.scroll) ||
+        JSON.stringify(current.region) !== JSON.stringify(target.geometry.region) ||
+        !Number.isFinite(target.point.x) || !Number.isFinite(target.point.y) || !insideRect(target.point, current.region) ||
+        target.point.x < 0 || target.point.y < 0 || target.point.x >= current.viewport.width || target.point.y >= current.viewport.height)
+        throw new Error('TARGET_UNAVAILABLE: normal hover page or control geometry changed.');
+      await this.#send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: target.point.x, y: target.point.y }, signal);
+      assertBinding();
+    });
   }
 
   async replaceText(value: string, signal: AbortSignal, expectedFrame: VisualFrame): Promise<void> {

@@ -61,7 +61,7 @@ async function refresh(): Promise<void> {
       card.append(text("p", `${snapshot.state}${queuedPosition >= 0 ? ` · 排队第 ${queuedPosition + 1} 场` : ""}`, "state"));
       if (!terminal && snapshot.timer_remaining_seconds !== null && snapshot.timer_remaining_seconds !== undefined) card.append(text("p", `剩余约 ${snapshot.timer_remaining_seconds} 秒${snapshot.timer_remaining_seconds <= 60 ? " · 优先收尾" : ""}`, "muted"));
       card.append(text("p", `${snapshot.strategy === "supervised" ? "监督自动" : "无人值守"} · ${task.provider_name} · ${snapshot.model_id}`));
-      card.append(text("p", `已答 ${snapshot.progress.answered}/${snapshot.progress.total} · 猜答 ${snapshot.progress.guessed} · 重试 ${snapshot.progress.retried} · 跳过 ${snapshot.progress.skipped} · 失败 ${snapshot.progress.failed} · 调用 ${snapshot.model_calls.used}/${snapshot.model_calls.limit}`));
+      card.append(text("p", snapshot.practice?`新提交练习 ${snapshot.progress.answered}/${snapshot.progress.total} · 已有记录/无练习 ${snapshot.progress.skipped} · 调用 ${snapshot.model_calls.used}/${snapshot.model_calls.limit}`:`已答 ${snapshot.progress.answered}/${snapshot.progress.total} · 猜答 ${snapshot.progress.guessed} · 重试 ${snapshot.progress.retried} · 跳过 ${snapshot.progress.skipped} · 失败 ${snapshot.progress.failed} · 调用 ${snapshot.model_calls.used}/${snapshot.model_calls.limit}`));
       if (snapshot.notice) card.append(text("p", snapshot.notice, "notice"));
       if(snapshot.course){
         const course=snapshot.course;
@@ -69,6 +69,11 @@ async function refresh(): Promise<void> {
         card.append(text('p',`预计剩余播放时间：${course.estimate_seconds===null?'暂无法估计':course.estimate_seconds+'秒'}${course.estimate_frozen?'（冻结）':''}；不含未知缓冲、答题与平台同步。`,'muted'));
         card.append(text('p',`视频结束 ${course.video.ended?'已确认':'未确认'} · 平台记录 ${course.video.progress_recorded?'已确认':'未确认'}`));
         for(const item of course.results)card.append(text('p',`${item.kind==='video_popup'?'弹题':'课时/章节测验'} · ${item.result.status} · 提交 ${item.result.submission_confirmed?'已确认':'未确认'} · 得分 ${item.result.visible_score??'未提供'}`));
+      }
+      if(snapshot.practice){
+        card.append(text('p',`${snapshot.practice.title} · ${snapshot.practice.phase} · 仅选定知识点练习`));
+        card.append(text('p','视频、PPT、独立作业与期末考试未纳入；答对数不等于掌握度或及格。','muted'));
+        for(const item of snapshot.practice.results)card.append(text('p',`${item.title} · ${item.status==='submitted'?'新提交已确认':item.status==='existing_record'?'保留已有作答记录':'页面明确无练习'}${item.score?' · '+item.score:''}`));
       }
       if (snapshot.summary) card.append(text("p", `本场总结：${snapshot.summary.status} · 得分 ${snapshot.summary.visible_score || "网站未提供"} · ${snapshot.summary.stop_reason || "测验结束"}`));
       const visual = snapshot.summary?.visual_metrics ?? snapshot.visual_metrics;

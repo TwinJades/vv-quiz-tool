@@ -23,7 +23,7 @@ const task:LearningTask={id:'v',lesson_id:'l',chapter_id:'c',title:'fixture',kin
 const boundary:QuizBoundary={id:'popup',course_id:'course',task_id:'v',kind:'video_popup',rules:{scored:false,retry_allowed:true,remaining_attempts:3,requires_pass:false,requires_rewatch:false}};
 const profile:ProviderProfile={schema_version:'1.0',provider_profile_id:'p',display_name:'Fixture',provider_type:'openai_compatible',base_url:'https://fixture.invalid/v1',secret_ref:'unused',model_catalog:{source:'manual',models:['gemini-3.1-pro','other-model','gemini-3.8-flash','gemini-3.7-flash'],refreshed_at:null},capabilities:{image_input:false,structured_output:true,native_web_search:false},image_upload_authorized:false};
 function setup(limit=10){
-  const state={completed:false,feedback:null,visible_score:null};
+  const state:{completed:boolean;feedback:'correct'|'incorrect'|null;visible_score:string|null}={completed:false,feedback:null,visible_score:null};
   const parent={quizRequest:vi.fn(async()=>state),rewatch:vi.fn(async()=>true)};
   const budget=new ModelCallBudget(limit);
   return {parent,state,budget,service:new CourseQuizService(parent as unknown as CourseTabPlatform,profile,undefined,budget,[task])};
@@ -37,10 +37,25 @@ describe('course quiz reconciliation, retries and authorized model fallback',()=
   });
   it('falls back through only configured authorized models while preserving one budget',async()=>{
     const f=setup();fakes.outcomes=['Provider is temporarily unavailable. HTTP 503.','The configured model is unavailable.','COMPLETE'];
+    f.parent.quizRequest.mockResolvedValueOnce({...f.state}).mockResolvedValue({...f.state,completed:true});
     const notice=vi.fn();f.service.onModelChange(notice);
     expect(await f.service.run(boundary,'unattended',new AbortController().signal)).toMatchObject({status:'completed'});
     expect(fakes.models).toEqual(['gemini-3.8-flash','gemini-3.7-flash','gemini-3.1-pro']);
     expect(fakes.budgets.every(b=>b===f.budget)).toBe(true);expect(f.budget.used).toBe(3);expect(notice).toHaveBeenCalledTimes(2);
+  });
+  it('keeps an unconfirmed submission pending and reconciles it without another model',async()=>{
+    const f=setup();fakes.outcomes=['COMPLETE'];
+    expect(await f.service.run(boundary,'unattended',new AbortController().signal)).toMatchObject({status:'paused',submission_confirmed:false});
+    expect(fakes.models).toHaveLength(1);expect(f.budget.used).toBe(1);
+    f.state.completed=true;
+    expect(await f.service.run(boundary,'unattended',new AbortController().signal)).toMatchObject({status:'completed',submission_confirmed:true});
+    expect(fakes.models).toHaveLength(1);expect(f.budget.used).toBe(1);
+  });
+  it('does not report rewatching when the platform cannot confirm the rewind',async()=>{
+    const f=setup();f.state.feedback='incorrect';
+    f.parent.rewatch.mockResolvedValue(false);
+    await expect(f.service.run({...boundary,rules:{...boundary.rules,requires_rewatch:true}},'unattended',new AbortController().signal)).rejects.toThrow(/尚未确认/);
+    expect(fakes.models).toEqual([]);expect(f.budget.used).toBe(0);
   });
   it.each(['Provider is temporarily unavailable. HTTP 429.','Provider rejected the local configuration.','permission denied','invalid structured answer'])('does not switch models for %s',async reason=>{
     const f=setup();fakes.outcomes=[reason];expect(await f.service.run(boundary,'supervised',new AbortController().signal)).toMatchObject({status:'paused'});

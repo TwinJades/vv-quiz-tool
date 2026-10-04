@@ -2,9 +2,13 @@ import { DomWebAdapter } from "../web/dom-adapter";
 import type { ContentRequest, ContentResponse } from "./messages";
 import { InteractionGuard } from "./interaction-guard";
 import { captureVisualGeometry } from "../web/visual-geometry";
-import { CoursePageAdapter, coursePlatform } from '../web/course-adapter';
+import { CoursePageAdapter, CoursePageLease, coursePlatform } from '../web/course-adapter';
 import type { PlatformState } from '../core';
 import { inspectCoursePage } from '../web/course-inspection';
+import { isExplicitlyHidden, normalizedText } from '../web/dom-utils';
+import { isObservedCourseInteraction } from '../web/course-interaction';
+import { readZhidaoResult } from '../web/zhidao-result';
+import {KnowledgePracticePage} from '../web/knowledge-practice-page';
 
 declare global {
   interface Window {
@@ -12,14 +16,22 @@ declare global {
   }
 }
 
+function courseAttemptsExhausted(root: HTMLElement): boolean {
+  const remaining = root.dataset.remainingAttempts?.trim();
+  return remaining !== undefined && /^\d+$/.test(remaining) && Number(remaining) === 0;
+}
+
 if (!window.__vvContentInstalled) {
   window.__vvContentInstalled = true;
   const adapter = new DomWebAdapter(document);
+  const knowledgePage=new KnowledgePracticePage(document);
   let coursePage: CoursePageAdapter | null = null;
+  const courseLease=new CoursePageLease(document);
   let scopedQuiz: { root: HTMLElement; adapter: DomWebAdapter } | null = null;
   let courseSubmit: {parentId:string;boundaryId:string;taskId:string;state:PlatformState;videoId:string|null}|null=null;
   const interaction = new InteractionGuard(document, target => adapter.isQuizInteractionTarget(target) ||
-    Boolean(coursePage && target instanceof Element && target.closest('[data-course-catalog]')), binding => {
+    Boolean(coursePage && target instanceof Element && target.closest('[data-course-catalog]')) ||
+      isObservedCourseInteraction(document,target), binding => {
     void chrome.runtime.sendMessage({ type: "VV_USER_INTERACTION", session_id: binding.session_id, epoch: binding.epoch }).catch(() => {
       // Execution stays blocked locally even if the worker is unavailable.
     });
@@ -30,10 +42,17 @@ if (!window.__vvContentInstalled) {
       void (async () => {
         try {
           if(request.type==='VV_INSPECT_COURSE_PAGE'){sendResponse({ok:true,result:inspectCoursePage(document)});return;}
+          if(request.type==='VV_KNOWLEDGE_PAGE'){
+            const blocker=adapter.detectHardBlocker();if(blocker)throw new Error(blocker);
+            const preview=request.request.operation==='catalog'&&!request.session_id;
+            const pause=request.request.operation==='pause'&&request.session_id&&request.interaction_epoch&&interaction.matches(request.session_id,request.interaction_epoch);
+            const signal=preview||pause?new AbortController().signal:interaction.signal(request.session_id,request.interaction_epoch);
+            signal.throwIfAborted();const result=await interaction.runAutomation(()=>knowledgePage.execute(request.request,signal));
+            signal.throwIfAborted();sendResponse({ok:true,result});return;
+          }
           if (request.type === 'VV_COURSE' || request.type === 'VV_COURSE_QUIZ') {
             const platform = coursePlatform(location.href);
             if (!platform) throw new Error('当前网站不是知到或学习通课程页面。');
-            coursePage ??= new CoursePageAdapter(document, platform);
             const blocker = adapter.detectHardBlocker(); if (blocker) throw new Error(blocker);
             if (request.type === 'VV_COURSE') {
               const operation = request.request.operation;
@@ -42,27 +61,35 @@ if (!window.__vvContentInstalled) {
               const signal = preview ? new AbortController().signal : pause && request.session_id && request.interaction_epoch && interaction.matches(request.session_id,request.interaction_epoch)
                 ? new AbortController().signal : interaction.signal(request.session_id,request.interaction_epoch);
               signal.throwIfAborted();
-              const result = await interaction.runAutomation(() => coursePage!.execute(request.request));
+              const page=preview?courseLease.preview(platform):(coursePage=courseLease.forSession(platform,request.session_id!));
+              const result = await interaction.runAutomation(() => page.execute(request.request,signal));
               signal.throwIfAborted();sendResponse({ok:true,result});return;
             }
             const signal = interaction.signal(request.parent_session_id,request.interaction_epoch);
+            signal.throwIfAborted();coursePage=courseLease.forSession(platform,request.parent_session_id);
             let root:HTMLElement;
-            try { root=coursePage.quizRoot(request.course_id,request.task,request.boundary.kind); }
+            try { root=coursePage.assertBoundary(request.course_id,request.task,request.boundary); }
             catch(error){
               if(request.request.type==='VV_READ_STATE'&&request.boundary.kind==='video_popup'&&courseSubmit?.parentId===request.parent_session_id&&courseSubmit.boundaryId===request.boundary.id&&courseSubmit.taskId===request.task.id){
                 const video=coursePage.video(request.course_id,request.task);
                 if(video.video_id!==courseSubmit.videoId||video.popup)throw error;
-                sendResponse({ok:true,result:{...courseSubmit.state,completed:!video.paused&&!video.buffering&&!video.seeking,feedback:null,can_retry:false,has_next:false,has_session_submit:false}});return;
+                sendResponse({ok:true,result:{...courseSubmit.state,completed:!video.paused&&!video.buffering&&!video.seeking,session_passed:null,feedback:null,can_retry:false,has_next:false,has_session_submit:false}});return;
               }
               throw error;
             }
             if(root.dataset.quizId !== request.boundary.id || request.boundary.task_id !== request.task.id)throw new Error('弹题/测验身份改变。');
             if(!scopedQuiz || scopedQuiz.root !== root){scopedQuiz?.adapter.release();scopedQuiz={root,adapter:new DomWebAdapter(document,undefined,root)};}
             const quiz=scopedQuiz.adapter;const inner=request.request;
-            if(inner.type==='VV_WAIT_READY'){sendResponse({ok:true,result:await quiz.waitUntilReady(signal)});return;}
-            if(inner.type==='VV_OBSERVE'){sendResponse({ok:true,result:await quiz.observeSession(inner.session_id,signal,'structured')});return;}
+            if(inner.type==='VV_WAIT_READY'){
+              if(courseAttemptsExhausted(root)&&root.dataset.submissionConfirmed!=='true'){sendResponse({ok:true,result:{ready:false,reason:'平台剩余作答次数已耗尽。'}});return;}
+              sendResponse({ok:true,result:await quiz.waitUntilReady(signal)});return;
+            }
+            if(inner.type==='VV_OBSERVE'){
+              if(courseAttemptsExhausted(root)&&root.dataset.submissionConfirmed!=='true')throw new Error('平台剩余作答次数已耗尽，停止新的模型请求。');
+              sendResponse({ok:true,result:await quiz.observeSession(inner.session_id,signal,'structured')});return;
+            }
             if(inner.type==='VV_EXECUTE'){
-              if(root.dataset.submissionConfirmed==='true'||root.dataset.remainingAttempts==='0'||root.dataset.requiresRewatch==='true' && root.dataset.feedback==='incorrect')throw new Error('测验已提交、次数耗尽或要求回看，禁止重复作答。');
+              if(root.dataset.submissionConfirmed==='true'||courseAttemptsExhausted(root)||root.dataset.requiresRewatch==='true' && root.dataset.feedback==='incorrect')throw new Error('测验已提交、次数耗尽或要求回看，禁止重复作答。');
               if(inner.plan.actions.some(a=>a.kind==='retry_question')&&root.dataset.retryAllowed!=='true')throw new Error('网站当前不允许重答。');
               const before=await quiz.readState(signal);
               const videoId=request.boundary.kind==='video_popup'?coursePage.video(request.course_id,request.task).video_id:null;
@@ -73,7 +100,11 @@ if (!window.__vvContentInstalled) {
             if(inner.type==='VV_READ_STATE'){
               const result:PlatformState=await quiz.readState(signal);
               result.completed=root.dataset.submissionConfirmed==='true' && (request.boundary.kind!=='video_popup'||root.dataset.popupResolved==='true');
-              result.can_retry=result.can_retry&&request.boundary.rules.retry_allowed===true&&request.boundary.rules.requires_rewatch===false;
+              result.session_passed=root.dataset.passed==='true'?true:root.dataset.passed==='false'?false:null;
+              const scores=Array.from(root.querySelectorAll<HTMLElement>('[data-visible-score]')).filter(e=>!isExplicitlyHidden(e));
+              delete result.visible_score;
+              if(scores.length===1&&normalizedText(scores[0]!.textContent))result.visible_score=normalizedText(scores[0]!.textContent);
+              result.can_retry=result.can_retry&&!courseAttemptsExhausted(root)&&request.boundary.rules.retry_allowed===true&&request.boundary.rules.requires_rewatch===false;
               sendResponse({ok:true,result});return;
             }
             if(inner.type==='VV_READ_TIMER'){sendResponse({ok:true,result:request.boundary.kind==='video_popup'?null:await quiz.readTimer(signal)});return;}
@@ -94,8 +125,13 @@ if (!window.__vvContentInstalled) {
           }
           const signal = interaction.signal(request.type === "VV_EXECUTE" ? request.plan.session_id : undefined,
             request.type === "VV_EXECUTE" ? request.interaction_epoch : undefined);
-          if (request.type === "VV_VISUAL_GEOMETRY") {
+          if (request.type === "VV_CAPTURE_INITIAL_SEMANTIC" || request.type === "VV_APPLY_INITIAL_SEMANTIC") {
+            interaction.signal(request.binding.session_id, request.binding.epoch).throwIfAborted();
+            sendResponse({ ok: true, result: request.type === "VV_CAPTURE_INITIAL_SEMANTIC"
+              ? adapter.captureInitialSemantic() : adapter.applyInitialSemantic(request.reading) });
+          } else if (request.type === "VV_VISUAL_GEOMETRY") {
             const geometry = captureVisualGeometry(document, adapter.detectHardBlocker());
+            if (request.full_viewport) geometry.region = { x: 0, y: 0, width: geometry.viewport.width, height: geometry.viewport.height };
             if (request.binding) interaction.protectVisualScope(request.binding, geometry);
             sendResponse({ ok: true, result: geometry });
           } else if (request.type === "VV_WAIT_READY") {
@@ -104,6 +140,9 @@ if (!window.__vvContentInstalled) {
             sendResponse({ ok: true, result: await adapter.observeSession(request.session_id, signal, request.mode) });
           } else if (request.type === "VV_READ_STATE") {
             sendResponse({ ok: true, result: await adapter.readState(signal) });
+          } else if (request.type === 'VV_READ_ZHIDAO_RESULT') {
+            signal.throwIfAborted();
+            sendResponse({ok:true,result:readZhidaoResult(document)});
           } else if (request.type === "VV_READ_TIMER") {
             sendResponse({ ok: true, result: await adapter.readTimer(signal) });
           } else if (request.type === "VV_EXECUTE") {

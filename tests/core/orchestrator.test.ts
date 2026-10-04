@@ -435,6 +435,34 @@ describe("QuizOrchestrator", () => {
     expect(orchestrator.snapshot()).toMatchObject({ state: "COMPLETE", progress: { retried: 1, answered: 1 } });
   });
 
+  it.each(['unique','disabled','ambiguous','unmapped','wrong_role'] as const)(
+    'resets a locked graded question only through a unique enabled local retry candidate (%s)',async mode=>{
+      const platform=new FakePlatform();platform.failFirstSubmission=true;
+      const observe=platform.observeSession.bind(platform),execute=platform.execute.bind(platform);
+      platform.observeSession=async()=>{
+        const observation=await observe();
+        if(platform.state.feedback!=='incorrect')return observation;
+        const ids=mode==='ambiguous'?['candidate_control_7','candidate_control_8']:['candidate_control_7'];
+        return {...observation,local_control_candidates:ids.map(semantic_id=>({semantic_id,text:'Retry',disabled:mode==='disabled'})),
+          questions:[{question,locator_map:{...locatorMap,targets:{...locatorMap.targets,...Object.fromEntries(mode==='unmapped'?[]:ids.map(id=>[id,{kind:'semantic' as const,local_ref:id,role:mode==='wrong_role'?'textbox':'button_candidate'}]))}}}]};
+      };
+      platform.execute=async plan=>{
+        if(platform.state.feedback==='incorrect'&&plan.actions.some(a=>a.kind==='set_selected'))
+          return plan.actions.map(a=>({action_id:a.action_id,status:'failed' as const,message:'Graded answer is locked'}));
+        return execute(plan);
+      };
+      let calls=0;
+      const solver={solve:async(batch:QuestionBatch)=>{
+        if(++calls>1&&mode==='unique')expect(platform.state.feedback).toBeNull();
+        return result(batch,[calls===1?'a':'b']);
+      }};
+      const orchestrator=new QuizOrchestrator(platform,solver,new WebVerifier(),options('supervised'));
+      await orchestrator.run();
+      expect(platform.retryClicked).toBe(mode==='unique');
+      expect(orchestrator.snapshot().state).toBe(mode==='unique'?'COMPLETE':'PAUSED');
+      expect(calls).toBe(2);
+    });
+
   it.each(['failed','unknown'] as const)('does not solve again after a retry action returns %s',async status=>{
     const platform=new FakePlatform();platform.failFirstSubmission=true;platform.retryBeforeObserve=true;
     const execute=platform.execute.bind(platform);

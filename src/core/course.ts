@@ -111,16 +111,26 @@ export interface CourseRuntime {
 export class VideoEstimate {
   seconds: number | null = null;
   frozen = true;
+  #last: Pick<VideoSnapshot, 'course_id' | 'task_id' | 'video_id' | 'duration' | 'position' | 'rate'> | null = null;
   observe(video: VideoSnapshot, now: number): void {
     const valid = now - video.observed_at >= 0 && now - video.observed_at <= 5000 &&
       video.duration !== null && Number.isFinite(video.duration) && video.duration > 0 &&
       video.position !== null && Number.isFinite(video.position) && video.position >= 0 && video.position <= video.duration &&
       video.rate !== null && Number.isFinite(video.rate) && video.rate > 0;
     this.frozen = !valid || video.paused || video.buffering || video.seeking || video.popup !== null;
-    if (!valid) { this.seconds = null; return; }
-    if (!this.frozen || this.seconds === null || video.ended) {
+    if (!valid) { this.seconds = null; this.#last = null; return; }
+    const previous = this.#last;
+    const sameVideo = previous?.course_id === video.course_id && previous.task_id === video.task_id && previous.video_id === video.video_id;
+    // A settled normal rewind or a speed/duration change invalidates the old
+    // estimate even while paused. Seeking positions are intermediate; forward
+    // drift during buffering, pause or a popup must not decrement the estimate.
+    const changedBasis = sameVideo && !video.seeking && video.popup === null &&
+      (video.position! < previous!.position! || video.rate !== previous!.rate || video.duration !== previous!.duration);
+    if (!this.frozen || this.seconds === null || video.ended || !sameVideo || changedBasis) {
       this.seconds = Math.ceil(Math.max(0, video.duration! - video.position!) / video.rate!);
     }
+    if (!video.seeking && video.popup === null) this.#last = { course_id:video.course_id, task_id:video.task_id, video_id:video.video_id,
+      duration:video.duration, position:video.position, rate:video.rate };
   }
   freeze(): void { this.frozen = true; }
 }
@@ -141,7 +151,7 @@ export function nextCourseTask(catalog: CourseCatalog, scope: string[]): Learnin
   if (!remaining.length) return null;
   const startedLessons = new Set(catalog.tasks.filter(t => scope.includes(t.id) && (t.status === 'in_progress' || t.status === 'completed')).map(t => t.lesson_id));
   const ready = remaining.filter(t => t.status !== 'locked' && t.prerequisites.every(id => catalog.tasks.find(p => p.id === id)?.status === 'completed'));
-  const task = ready.find(t => t.status === 'in_progress') ?? ready.find(t => startedLessons.has(t.lesson_id)) ?? ready[0];
+  const task = ready.find(t => startedLessons.has(t.lesson_id)) ?? ready[0];
   if (!task) throw new Error('范围内任务锁定或前置任务未完成；不会扩张范围。');
   return task;
 }
@@ -238,9 +248,13 @@ export class CourseOrchestrator {
     }
     this.#runtime.tasks=catalog.tasks;
   }
-  async #quiz(boundary:QuizBoundary,signal:AbortSignal):Promise<void> {
+  #validateQuizBoundary(boundary:QuizBoundary):void {
     if(boundary.course_id!==this.options.catalog.course_id||boundary.task_id!==this.#current?.id)throw new Error('测验不属于当前课时。');
-    if(boundary.rules.retry_allowed===null||boundary.rules.requires_rewatch===null||boundary.rules.requires_pass===null)throw new Error('测验重试、回看或及格规则未知，请先确认页面材料。');
+    if(boundary.kind==='video_popup' ? this.#current.kind!=='video' : boundary.kind!==this.#current.kind)throw new Error('弹题与课时/章节测验类型不匹配。');
+    if(boundary.rules.scored===null||boundary.rules.retry_allowed===null||boundary.rules.requires_rewatch===null||boundary.rules.requires_pass===null)throw new Error('测验计分、重试、回看或及格规则未知，请先确认页面材料。');
+  }
+  async #quiz(boundary:QuizBoundary,signal:AbortSignal):Promise<void> {
+    this.#validateQuizBoundary(boundary);
     this.#pendingQuiz=boundary;this.#phase(boundary.kind==='video_popup'?'POPUP':'QUIZ','SOLVE');
     const result=await this.quizzes.run(boundary,this.options.strategy,signal);signal.throwIfAborted();
     const resultId=`${boundary.task_id}:${boundary.kind}:${boundary.id}`;
@@ -261,7 +275,7 @@ export class CourseOrchestrator {
       if(video.course_id!==catalog.course_id||video.task_id!==task.id||!video.video_id||videoId!==null&&videoId!==video.video_id||this.#now()-video.observed_at>5000||this.#now()<video.observed_at)throw new Error('视频身份或观察失效，暂停。');
       videoId=video.video_id;
       if(catalog.rules.visibility_required===null)throw new Error('课程页面可见性规则未知。');
-      if(catalog.rules.visibility_required&&!video.visible)throw new Error('本课程要求页面可见，请返回视频页面后继续。');
+      if(catalog.rules.visibility_required&&!video.visible)throw new Error('当前课程模式要求页面可见，请返回视频页面后继续；未保证后台播放。');
       this.#estimate.observe(video,this.#now());this.#emit();
       if(video.popup){
         if(video.popup.id===lastPopup)throw new Error('弹题仍未解除或要求回看，停止重复提交。');
@@ -272,7 +286,7 @@ export class CourseOrchestrator {
       if(video.position!==null&&video.position!==lastPosition){lastPosition=video.position;lastProgress=this.#now();}
       if(shouldPlay&&video.paused&&!video.buffering&&!video.seeking){await this.adapter.play(task,signal);signal.throwIfAborted();shouldPlay=false;}
       if(this.#now()-lastProgress>=120000)throw new Error('视频连续两分钟没有有效播放进展，请检查网络或播放器。');
-      this.#phase(video.buffering?'BUFFERING':video.seeking?'REWATCHING':'PLAYING');await this.#wait(1000,signal);
+      this.#phase(video.buffering?'BUFFERING':video.seeking?'REWATCHING':video.paused?'PLAYBACK_PAUSED':'PLAYING');await this.#wait(1000,signal);
     }
   }
   async #progress(task:LearningTask,signal:AbortSignal):Promise<void> {
@@ -282,27 +296,42 @@ export class CourseOrchestrator {
       if(result.task_id!==task.id)throw new Error('平台进度不属于当前任务。');
       this.#runtime.video.progress_recorded=result.progress_recorded;this.#emit();
       if(result.progress_recorded&&result.completed)return;
-      if(!returned&&this.#now()-start>=60000){await this.adapter.returnToCatalog(signal);signal.throwIfAborted();returned=true;}
+      if(!returned&&this.#now()-start>=60000){
+        await this.adapter.returnToCatalog(signal);signal.throwIfAborted();returned=true;
+        // A knowledge directory can show an aggregate including documents;
+        // re-enter the exact video to read its own fresh record. Normal site
+        // navigation can autoplay, so immediately verify normal pause again.
+        await this.adapter.enter(task,signal);signal.throwIfAborted();
+        if(!await this.adapter.pauseVideo(task,signal))throw new Error('重新核对平台记录时视频暂停未确认。');
+        signal.throwIfAborted();
+      }
       await this.#wait(2000,signal);
     }
     throw new Error('视频已结束，平台任务完成记录仍未确认；不会进入下一课时。');
   }
   async #loop(signal:AbortSignal):Promise<void> {
     this.#phase('OBSERVE_COURSE');
-    // Reconcile any possibly submitted child before navigating or requesting another answer.
-    if(this.#pendingQuiz){await this.#quiz(this.#pendingQuiz,signal);}
     for(;;){
       signal.throwIfAborted();const catalog=await this.adapter.catalog(signal);signal.throwIfAborted();this.#identity(catalog);
+      // Resume must validate the live course before reconciling a possibly
+      // submitted child. Re-read the catalog after it updates any task status.
+      if(this.#pendingQuiz){await this.#quiz(this.#pendingQuiz,signal);continue;}
       const task=nextCourseTask(catalog,this.options.scope);
-      if(!task){this.#state='COMPLETE';this.#runtime.phase='RANGE_COMPLETE';this.#notice='本次选定的视频与关联测验范围已完成；讨论、作业、见面课、签到和期末考试未纳入。';this.#finish('completed',null);return;}
+      if(!task){this.#state='COMPLETE';this.#runtime.phase='RANGE_COMPLETE';this.#notice='本次选定的任务范围已完成；范围外的视频、测验、文档、讨论、作业、见面课、签到和期末考试未纳入。';this.#finish('completed',null);return;}
       this.#current=task;this.#runtime.current_task_id=task.id;this.#runtime.video={ended:false,progress_recorded:false};this.#estimate=new VideoEstimate();this.#phase('ENTER_TASK');
       await this.adapter.enter(task,signal);signal.throwIfAborted();
       if(task.kind==='video'){await this.#watch(task,catalog,signal);await this.#progress(task,signal);}
       else{
+        const boundary=await this.adapter.quiz(task,signal);signal.throwIfAborted();this.#validateQuizBoundary(boundary);
         const result=await this.adapter.verify(task,signal);signal.throwIfAborted();
-        if(!result.submission_confirmed){await this.#quiz(await this.adapter.quiz(task,signal),signal);}
+        if(result.task_id!==task.id)throw new Error('测验提交记录不属于当前任务。');
+        if(!result.submission_confirmed){await this.#quiz(boundary,signal);}
+        this.#pendingQuiz=boundary;
         const after=await this.adapter.verify(task,signal);signal.throwIfAborted();
+        if(after.task_id!==task.id)throw new Error('测验结果不属于当前任务。');
         if(!after.submission_confirmed||!after.completed)throw new Error('测验已提交或待批阅，但任务完成尚未确认。');
+        if(boundary.rules.requires_pass&&after.passed!==true)throw new Error('测验提交已确认，但平台及格条件尚未确认。');
+        this.#pendingQuiz=null;
       }
       this.#phase('RECONCILE','VERIFY');await this.adapter.returnToCatalog(signal);signal.throwIfAborted();
       const fresh=await this.adapter.catalog(signal);signal.throwIfAborted();this.#identity(fresh);

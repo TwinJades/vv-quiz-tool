@@ -35,8 +35,8 @@ function regionStem(element: HTMLElement): string {
   return normalizedText(copy.textContent);
 }
 
-function cleanedVisibleText(document: Document): string {
-  if (!document.body) return "";
+export function cleanedVisibleText(document: Document, root = document.body, limit = 8_000): string {
+  if (!root) return "";
   const parts: string[] = [];
   let length = 0;
   const hidden = new WeakMap<Element, boolean>();
@@ -44,20 +44,20 @@ function cleanedVisibleText(document: Document): string {
     if (!element) return false;
     const cached = hidden.get(element);
     if (cached !== undefined) return cached;
-    const value = element.matches("script, style, noscript, template, nav, header, aside, input[type='password']") ||
+    const value = element.matches("script, style, noscript, template, nav, header, aside, video, input[type='password']") ||
       isExplicitlyHidden(element) || excluded(element.parentElement);
     hidden.set(element, value);
     return value;
   };
-  const walker = document.createTreeWalker(document.body, 4);
-  for (let node = walker.nextNode(); node && length < 8_000; node = walker.nextNode()) {
+  const walker = document.createTreeWalker(root, 4);
+  for (let node = walker.nextNode(); node && length < limit; node = walker.nextNode()) {
     if (!excluded(node.parentElement)) {
       const text = node.textContent ?? "";
       parts.push(text);
       length += text.length + 1;
     }
   }
-  return normalizedText(parts.join(" ")).slice(0, 8_000);
+  return normalizedText(parts.join(" ")).slice(0, limit);
 }
 
 export interface LocalStructure {

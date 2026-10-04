@@ -26,6 +26,7 @@ export interface VisualGeometry {
   region: VisualRect;
   blocker: string | null;
   canvas_surface?: boolean;
+  isolated_canvas?: boolean;
 }
 export interface VisualFrame {
   visual_frame_id: string;
@@ -42,7 +43,12 @@ export interface VisualFrame {
   pixel_tiles?: { size: number; columns: number; rows: number; hashes: string[] };
   validated_regions?: VisualRect[];
 }
-export interface VisualCapture { frame: VisualFrame; data: Uint8Array }
+export interface VisualCapture {
+  frame: VisualFrame;
+  data: Uint8Array;
+  /** First capture's whole viewport, for context only. Coordinates use data. */
+  viewport_context?: { data: Uint8Array; width: number; height: number };
+}
 const visualItem = z.object({
   text: z.string().trim().min(1),
   point,

@@ -74,7 +74,7 @@ describe('course flow and independent completion checks',()=>{
   it('does not enter a quiz or the next lesson when video completion was not recorded',async()=>{
     const f=fixture();f.adapter.verify=vi.fn(async t=>({task_id:t.id,media_ended:true,progress_recorded:false,submission_confirmed:false,completed:false,passed:null,pending_grading:false,visible_score:null}));
     await f.run.run();expect(f.run.snapshot()).toMatchObject({state:'PAUSED',course:{video:{ended:true,progress_recorded:false}}});
-    expect(f.entered).toEqual(['v1']);expect(f.runner.run).not.toHaveBeenCalled();expect(f.adapter.returnToCatalog).toHaveBeenCalledTimes(1);
+    expect(f.entered).toEqual(['v1','v1']);expect(f.runner.run).not.toHaveBeenCalled();expect(f.adapter.returnToCatalog).toHaveBeenCalledTimes(1);
   });
   it('does not consider estimate zero to be video ended',async()=>{
     const f=fixture();f.adapter.video=vi.fn(async()=>video({observed_at:f.now,position:100,ended:false}));await f.run.run();
@@ -103,6 +103,19 @@ describe('course flow and independent completion checks',()=>{
     await f.run.run();expect(f.run.snapshot().state).toBe('PAUSED');const entries=f.entered.length;
     f.result.status='completed';f.result.submission_confirmed=true;
     await f.run.resume();expect(f.run.snapshot().state).toBe('COMPLETE');expect(f.entered.slice(entries)).toEqual(['v2']);expect(f.runner.run).toHaveBeenCalledTimes(2);
+  });
+  it('checks the course identity before reconciling a pending submission on resume',async()=>{
+    const f=fixture();f.result.status='paused';f.result.reason='submission unknown';f.result.submission_confirmed=false;
+    await f.run.run();expect(f.runner.run).toHaveBeenCalledTimes(1);
+    f.adapter.catalog=vi.fn(async()=>({...structuredClone(f.list),course_id:'different-course'}));
+    f.result.status='completed';f.result.submission_confirmed=true;
+    await f.run.resume();
+    expect(f.run.snapshot().state).toBe('PAUSED');expect(f.runner.run).toHaveBeenCalledTimes(1);
+    expect(f.budget.used).toBe(1);expect(f.entered).toEqual(['v1','q1']);
+  });
+  it('pauses a popup whose scoring rule is unknown without requesting answers',async()=>{
+    const f=fixture();f.adapter.video=vi.fn(async()=>video({observed_at:f.now,popup:{id:'popup',course_id:'course',task_id:'v1',kind:'video_popup',rules:{scored:null,retry_allowed:true,requires_pass:false,requires_rewatch:false,remaining_attempts:3}}}));
+    await f.run.run();expect(f.run.snapshot().state).toBe('PAUSED');expect(f.runner.run).not.toHaveBeenCalled();
   });
   it('stops when visibility is required, rather than simulating focus',async()=>{
     const f=fixture();f.list.rules.visibility_required=true;f.adapter.video=vi.fn(async()=>video({visible:false,observed_at:f.now}));await f.run.run();

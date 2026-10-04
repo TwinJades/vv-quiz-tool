@@ -1,4 +1,4 @@
-import { CourseOrchestrator, QuizOrchestrator, courseModels } from '../core';
+import { CourseOrchestrator, QuizOrchestrator, courseModels, validateCourseScope } from '../core';
 import type { CourseAdapter, CourseCatalog, CourseOptions, CourseQuizResult, CourseQuizRunner, CourseVerification, LearningTask, QuizBoundary, VideoSnapshot } from '../core/course';
 import type { RuntimeMediaPayload, RuntimePlatform, SessionRuntimeSnapshot } from '../core/orchestrator';
 import type { PlatformObservation, PlatformState } from '../core/platform';
@@ -9,7 +9,9 @@ import { WebVerifier } from '../web/verifier';
 import { ensureContentInjected } from './tab-platform';
 import { requireCurrentWebsite, websiteIsAuthorized } from './website-access';
 import type { ContentRequest, ContentResponse } from './messages';
-import type { CoursePageRequest } from '../web/course-adapter';
+import type { CoursePageRequest, CourseSpeedTarget } from '../web/course-adapter';
+import type { VisualGeometry } from '../core/visual';
+import { VisualTransport } from './visual-transport';
 
 async function send<T>(tab:number,frame:number,request:ContentRequest,signal?:AbortSignal):Promise<T> {
   signal?.throwIfAborted();
@@ -21,7 +23,9 @@ export class CourseTabPlatform implements CourseAdapter {
   #frame=0;
   #epoch=crypto.randomUUID();
   #frames:number[]=[];
-  interactionMatches(sessionId:string,epoch:string):boolean{return this.sessionId===sessionId&&this.#epoch===epoch;}
+  #interactionEnabled=false;
+  #hover:VisualTransport|null=null;
+  interactionMatches(sessionId:string,epoch:string):boolean{return this.#interactionEnabled&&this.sessionId===sessionId&&this.#epoch===epoch;}
   constructor(readonly tabId:number,readonly sessionId:string,readonly courseId:string){}
   async preview(signal:AbortSignal):Promise<CourseCatalog> {
     await requireCurrentWebsite(this.tabId);signal.throwIfAborted();
@@ -36,20 +40,53 @@ export class CourseTabPlatform implements CourseAdapter {
     signal.throwIfAborted();if(!frame?.url||!await websiteIsAuthorized(frame.url))throw new Error('课程所在frame未授权。');signal.throwIfAborted();
   }
   async enableInteraction(_sessionId=this.sessionId):Promise<void>{
+    this.#interactionEnabled=false;
     this.#epoch=crypto.randomUUID();this.#frames=await ensureContentInjected(this.tabId);
-    await Promise.all(this.#frames.map(frame=>send(this.tabId,frame,{type:'VV_SET_INTERACTION',binding:{session_id:this.sessionId,epoch:this.#epoch,enabled:true}})));
+    try {
+      const results=await Promise.allSettled(this.#frames.map(frame=>send(this.tabId,frame,{type:'VV_SET_INTERACTION',binding:{session_id:this.sessionId,epoch:this.#epoch,enabled:true}})));
+      const failed=results.find(result=>result.status==='rejected');
+      if(failed?.status==='rejected')throw failed.reason;
+      this.#interactionEnabled=true;
+    } catch(error) {
+      await this.disableInteraction();
+      throw error;
+    }
   }
   async disableInteraction():Promise<void>{
+    this.#interactionEnabled=false;
     await Promise.allSettled(this.#frames.map(frame=>send(this.tabId,frame,{type:'VV_SET_INTERACTION',binding:{session_id:this.sessionId,epoch:this.#epoch,enabled:false}})));
+    await this.#hover?.close();this.#hover=null;
   }
   async #page<T>(request:CoursePageRequest,signal:AbortSignal):Promise<T>{
     await this.#authorize(signal);
     return send<T>(this.tabId,this.#frame,{type:'VV_COURSE',request,session_id:this.sessionId,interaction_epoch:this.#epoch},signal);
   }
   catalog(signal:AbortSignal):Promise<CourseCatalog>{return this.#page({operation:'catalog'},signal);}
-  async enter(task:LearningTask,signal:AbortSignal):Promise<void>{await this.#page({operation:'enter',course_id:this.courseId,task},signal);}
+  async enter(task:LearningTask,signal:AbortSignal):Promise<void>{
+    // A normal platform navigation may autoplay before its player mute control
+    // can be resolved. Mute the chosen tab first; retain normal player checks.
+    const catalog=await this.catalog(signal);signal.throwIfAborted();
+    if(catalog.course_id!==this.courseId)throw new Error('静音前课程身份已改变。');
+    validateCourseScope(catalog,[task.id]);
+    const current=catalog.tasks.find(item=>item.id===task.id)!;
+    if(current.kind!==task.kind||current.lesson_id!==task.lesson_id||current.chapter_id!==task.chapter_id||
+      current.prerequisites.join('|')!==task.prerequisites.join('|'))throw new Error('静音前课时身份或归属已改变。');
+    signal.throwIfAborted();
+    const tab=await chrome.tabs.update(this.tabId,{muted:true});signal.throwIfAborted();
+    if(!tab?.mutedInfo?.muted)throw new Error('课程标签静音未确认，停止进入课时。');
+    await this.#page({operation:'enter',course_id:this.courseId,task},signal);
+  }
   video(task:LearningTask,signal:AbortSignal):Promise<VideoSnapshot>{return this.#page({operation:'video',course_id:this.courseId,task},signal);}
-  async highestAllowedSpeed(task:LearningTask,signal:AbortSignal):Promise<void>{await this.#page({operation:'speed',course_id:this.courseId,task},signal);}
+  async highestAllowedSpeed(task:LearningTask,signal:AbortSignal):Promise<void>{
+    const target=await this.#page<CourseSpeedTarget|null>({operation:'speed_target',course_id:this.courseId,task},signal);
+    if(target){
+      if(this.#frame!==0)throw new Error('当前知到播放器所在frame的正常悬停尚未映射。');
+      this.#hover??=new VisualTransport(this.tabId,()=>send<VisualGeometry>(this.tabId,0,{type:'VV_VISUAL_GEOMETRY',full_viewport:true},signal),
+        ()=>this.#interactionEnabled?{session_id:this.sessionId,epoch:this.#epoch,enabled:true}:null,async()=>{});
+      await this.#hover.hoverNormalControl({...target,session_id:this.sessionId,interaction_epoch:this.#epoch},signal);signal.throwIfAborted();
+    }
+    await this.#page({operation:'speed',course_id:this.courseId,task},signal);
+  }
   async mute(task:LearningTask,signal:AbortSignal):Promise<void>{await this.#page({operation:'mute',course_id:this.courseId,task},signal);}
   async play(task:LearningTask,signal:AbortSignal):Promise<void>{await this.#page({operation:'play',course_id:this.courseId,task},signal);}
   pauseVideo(task:LearningTask,signal:AbortSignal):Promise<boolean>{return this.#page({operation:'pause',course_id:this.courseId,task},signal);}
@@ -103,12 +140,14 @@ export class CourseQuizService implements CourseQuizRunner {
     const platform=child?.platform??new ScopedQuizPlatform(this.parent,boundary,task);
     // A possibly completed submission is reconciled before any new model or action.
     const state=await platform.readState(signal);signal.throwIfAborted();
-    if(state.completed)return {status:'completed',reason:null,submission_confirmed:true,passed:boundary.rules.requires_pass?state.feedback==='correct':null,visible_score:state.visible_score??null,retried:child?.orchestrator.snapshot().progress.retried??0};
+    if(state.completed)return {status:'completed',reason:null,submission_confirmed:true,passed:state.session_passed??null,visible_score:state.visible_score??null,retried:child?.orchestrator.snapshot().progress.retried??0};
     if(boundary.rules.remaining_attempts===0)throw new Error('平台已无剩余作答次数。');
     const rewatch=async():Promise<CourseQuizResult>=>{
       const count=this.#rewatches.get(key)??0;
       if(count>=2||boundary.rules.retry_allowed!==true||boundary.rules.remaining_attempts===0)throw new Error('回看重答次数已耗尽或网站不允许重答。');
-      await this.parent.rewatch(task,signal);signal.throwIfAborted();this.#rewatches.set(key,count+1);
+      const confirmed=await this.parent.rewatch(task,signal);signal.throwIfAborted();
+      if(!confirmed)throw new Error('网站要求回看，但实际回退及弹题解除尚未确认。');
+      this.#rewatches.set(key,count+1);
       return {status:'rewatching',reason:'网站要求回看，实际回退及弹题解除已确认。',submission_confirmed:true,passed:false,visible_score:null,retried:count+1};
     };
     if(boundary.rules.requires_rewatch&&state.feedback==='incorrect')return rewatch();
@@ -127,7 +166,11 @@ export class CourseQuizService implements CourseQuizRunner {
         if(child.orchestrator.snapshot().state==='PAUSED')await child.orchestrator.resume();else await child.orchestrator.run();
         signal.throwIfAborted();const result=child.orchestrator.snapshot();
         if(boundary.rules.requires_rewatch&&(await platform.readState(signal)).feedback==='incorrect')return rewatch();
-        if(result.state==='COMPLETE')return {status:'completed',reason:null,submission_confirmed:true,passed:boundary.rules.requires_pass? (await platform.readState(signal)).feedback==='correct':null,visible_score:result.summary?.visible_score??null,retried:result.progress.retried};
+        if(result.state==='COMPLETE'){
+          const after=await platform.readState(signal);signal.throwIfAborted();
+          if(!after.completed)return {status:'paused',reason:'测验结束后的提交状态已变化，需要重新核对。',submission_confirmed:false,passed:after.session_passed??null,visible_score:after.visible_score??null,retried:result.progress.retried};
+          return {status:'completed',reason:null,submission_confirmed:true,passed:after.session_passed??null,visible_score:after.visible_score??null,retried:result.progress.retried};
+        }
         // The generic provider classifies HTTP 429 as transient; course mode
         // conservatively pauses on it because account quota cannot be excluded.
         const unavailable=!/429|quota|额度|credential|permission|401|403/i.test(result.notice??'')&&/Provider is temporarily unavailable|configured model is unavailable|request timed out|service unavailable|HTTP 5\d\d/i.test(result.notice??'');

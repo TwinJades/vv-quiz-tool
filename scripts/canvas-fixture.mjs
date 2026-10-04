@@ -30,7 +30,7 @@ export function canvasFixtureHtml(kind, closed = false) {
 }
 
 export function readingFromScreenshot(body, metadata) {
-  const imageUrl = body.messages.find(message => message.role === "user").content.find(part => part.type === "image_url").image_url.url;
+  const imageUrl = body.messages.find(message => message.role === "user").content.filter(part => part.type === "image_url").at(-1).image_url.url;
   const png = Buffer.from(imageUrl.split(",")[1], "base64");
   const chunks = [];
   for (let offset = 8; offset < png.length;) {

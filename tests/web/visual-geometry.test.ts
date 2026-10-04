@@ -24,3 +24,17 @@ it('does not activate a hidden, tiny or ambiguous set of canvases',()=>{
   vi.mocked(document.querySelectorAll('canvas')[1]!.getBoundingClientRect).mockReturnValue(rect(20,30,50,50));
   expect(captureVisualGeometry(document,null).canvas_surface).toBe(false);
 });
+it('allows cropping only for a fully visible lone canvas and ignores script text',()=>{
+  document.body.innerHTML='<div><canvas></canvas><script>const hiddenAnswer="never read";</script></div>';
+  const canvas=document.querySelector('canvas')!;
+  vi.spyOn(canvas,'getBoundingClientRect').mockReturnValue(rect(8,8,300,180));
+  expect(captureVisualGeometry(document,null)).toMatchObject({isolated_canvas:true,region:{x:8,y:8,width:300,height:180}});
+  vi.mocked(canvas.getBoundingClientRect).mockReturnValue(rect(-10,8,300,180));
+  expect(captureVisualGeometry(document,null).isolated_canvas).toBe(false);
+});
+it.each(['<output>Time left 0:30</output>','<input aria-label="Submit">','<iframe></iframe>','<img src="question.png">','External instructions'])(
+  'retains whole-page context when outside content exists: %s',outside=>{
+    document.body.innerHTML='<canvas></canvas>'+outside;
+    vi.spyOn(document.querySelector('canvas')!,'getBoundingClientRect').mockReturnValue(rect(8,8,300,180));
+    expect(captureVisualGeometry(document,null)).toMatchObject({canvas_surface:true,isolated_canvas:false});
+  });

@@ -33,6 +33,8 @@ export interface RuntimeMediaPayload {
 export interface RuntimePlatform extends PlatformAdapter {
   resolveMedia(handles: string[], signal: AbortSignal): Promise<RuntimeMediaPayload[]>;
   visualMetrics?(): VisualSessionMetrics;
+  /** An already dispatched final submit must be reconciled before recognition. */
+  hasPendingSubmission?(): boolean;
 }
 
 export interface RuntimeSolver {
@@ -81,6 +83,7 @@ export interface SessionSummary {
 }
 
 export interface SessionRuntimeSnapshot {
+  practice?: import('./knowledge-practice').KnowledgeRuntime;
   course?: import('./course').CourseRuntime;
   session_id: string;
   state: SessionState;
@@ -157,6 +160,18 @@ function answerPayload(answer: AnswerResult): string[] {
   return answer.answer_type === "fill_blank"
     ? answer.blank_answers.map((item) => item.value)
     : answer.selected_option_ids;
+}
+
+function observedRetryTarget(observation: PlatformObservation, locatorMap: LocatorMap): string | undefined {
+  // A retry can appear outside a calibrated answer region only after grading.
+  // Accept a current, unique, enabled local semantic button, never a stale hint,
+  // model-created selector, coordinate or an ambiguous collection of controls.
+  const candidates = (observation.local_control_candidates ?? []).filter(candidate =>
+    !candidate.disabled && /^(retry|try again|重试|再试一次|重新作答)$/i.test(candidate.text.trim()));
+  if (candidates.length !== 1) return undefined;
+  const id = candidates[0]!.semantic_id;
+  const target = locatorMap.targets[id];
+  return target?.kind === 'semantic' && ['button', 'button_candidate'].includes(target.role) ? id : undefined;
 }
 
 function answerApplicationMatches(plan: ExecutionPlan, state: PlatformState): boolean {
@@ -646,8 +661,22 @@ export class QuizOrchestrator {
     try {
       while (!signal.aborted) {
         this.#notice = null;
+        if (this.platform.hasPendingSubmission?.()) {
+          this.#setState("VERIFY");
+          const terminal = await this.#timeStep("read_pending_submission", () => this.#readState(signal));
+          signal.throwIfAborted();
+          if (terminal.completed) {
+            this.#visibleScore = terminal.visible_score ?? null;
+            this.#setState("COMPLETE");
+            this.#finish("completed", null);
+          } else {
+            this.pause("本次提交结果尚未确认；继续时先核对结果，不重复识别、填写或提交。");
+          }
+          return;
+        }
         this.#setState("WAIT_READY");
         const readiness = await this.#timeStep("wait_ready", () => this.platform.waitUntilReady(signal));
+        signal.throwIfAborted();
         if (!readiness.ready) {
           if (readiness.reason === "readiness_timeout" && this.#progress.answered + this.#progress.failed > 0) {
             const terminal = await this.#timeStep("read_terminal_result", () => this.#readState(signal));
@@ -664,6 +693,7 @@ export class QuizOrchestrator {
 
         this.#setState("OBSERVE_SESSION");
         let observation = await this.#timeStep("observe_session", () => this.platform.observeSession(this.options.session_id, signal));
+        signal.throwIfAborted();
         this.#timer.observe(observation.timer_remaining_seconds);
         if (observation.layout === "multi_question_page") {
           await this.#runPage(observation, signal);
@@ -851,7 +881,8 @@ export class QuizOrchestrator {
               question = questionFrameSchema.parse(parsed.question);
               locatorMap = locatorMapSchema.parse(parsed.locator_map);
               const retryTarget = mappedRetryTarget ? undefined :
-                (locatorMap.targets.control_retry ? "control_retry" : this.#controlHints.get("retry"));
+                (locatorMap.targets.control_retry ? "control_retry" : this.#controlHints.get("retry") ??
+                  (!this.options.require_retry_control ? observedRetryTarget(observation, locatorMap) : undefined));
               if (retryTarget) {
                 const retryPlan = controlPlan(locatorMap, this.options.strategy, "retry_question", retryTarget);
                 if (!await this.#executeQuestionRetry(retryPlan, locatorMap, signal)) return;

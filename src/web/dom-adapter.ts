@@ -13,8 +13,10 @@ import {
   type ReadinessResult,
 } from "../core";
 import { dispatchValueEvents, elementText, fnv1a, isExplicitlyHidden, labelText, normalizedText } from "./dom-utils";
-import { SeparationTrial } from "./separation-trial";
+import { SeparationTrial, cleanedVisibleText } from "./separation-trial";
+import type { InitialSemanticSnapshot, InitialSemanticReading } from "./initial-snapshot";
 import type { LocalStructure, SeparationRoles, SeparationSnapshot } from "./separation-trial";
+import { ZHIDAO_CHOICE_SELECTOR, ZHIDAO_NEXT_SELECTOR, isZhidaoChoice, isZhidaoNext, readZhidaoPractice, resolveZhidaoPracticeSubmit, zhidaoRadioRoot, zhidaoPracticeRoot, zhidaoSelected, zhidaoStem } from './zhidao-practice';
 
 interface TargetIdentity {
   role: "option" | "blank" | "submit" | "session_submit" | "next" | "retry" | "candidate";
@@ -50,6 +52,7 @@ const QUESTION_ROOT_SELECTORS = [
   "form",
   "[role='radiogroup']",
   "[role='group']",
+  ".exam-test .questionContent",
 ];
 
 const SUPPORTED_CONTROL_SELECTOR = [
@@ -63,6 +66,7 @@ const SUPPORTED_CONTROL_SELECTOR = [
   "[contenteditable='true']",
   "[role='radio']",
   "[role='checkbox']",
+  ZHIDAO_CHOICE_SELECTOR,
 ].join(",");
 
 const SUBMIT_PATTERN = /^(?:submit(?:\s+\d+\s+answers?)?|finish(?:\s+quiz)?|check|confirm|提交|确认|交卷|检查答案|完成)$/i;
@@ -75,6 +79,8 @@ function randomId(prefix: string): string {
 }
 
 function supportedInput(element: Element): boolean {
+  if (element.matches(ZHIDAO_CHOICE_SELECTOR) && !isZhidaoChoice(element)) return false;
+  if (element.matches(ZHIDAO_NEXT_SELECTOR) && !isZhidaoNext(element)) return false;
   if (element.getAttribute("aria-disabled") === "true") return false;
   if ("disabled" in element && (element as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement).disabled) {
     return false;
@@ -90,6 +96,11 @@ function hasVisibleQuestionSetGrade(root: HTMLElement): boolean {
 }
 
 function choiceControls(root: HTMLElement, role: 'radio' | 'checkbox'): HTMLElement[] {
+  if (zhidaoRadioRoot(root) === root) {
+    // The root is already validated. Resolve its direct choice list locally
+    // rather than asking a descendant query to match ancestors outside it.
+    return role === 'radio' ? Array.from(root.querySelectorAll<HTMLElement>(':scope > ul.radio-view > li.clearfix')).filter(isZhidaoChoice) : [];
+  }
   // H5P MultiChoice removes roles after grading but leaves the same labelled
   // alternatives in its radio/check container. Recover observation semantics
   // only; aria-disabled still prevents executing answer actions on these nodes.
@@ -101,6 +112,7 @@ function choiceControls(root: HTMLElement, role: 'radio' | 'checkbox'): HTMLElem
 }
 
 function selectedChoice(element: HTMLElement): boolean {
+  if (isZhidaoChoice(element)) return zhidaoSelected(element);
   if (element.tagName === "INPUT" && ["radio", "checkbox"].includes((element as HTMLInputElement).type)) {
     return (element as HTMLInputElement).checked;
   }
@@ -111,6 +123,11 @@ function selectedChoice(element: HTMLElement): boolean {
 }
 
 function optionLabel(document: Document, control: HTMLElement): string {
+  if (isZhidaoChoice(control)) return elementText(control.querySelector(':scope > .stem'));
+  const zhidaoRoot = zhidaoPracticeRoot(control);
+  if (zhidaoRoot && control.matches('input.el-checkbox__original[type="checkbox"]')) {
+    return elementText(control.closest('label.el-checkbox')?.querySelector(':scope > .el-checkbox__label > pre.preStyle') ?? null);
+  }
   if (control.matches('.h5p-answer')) {
     const alternative = control.querySelector('.h5p-alternative-inner');
     if (alternative) return elementText(alternative);
@@ -177,7 +194,8 @@ function candidateRoots(document: Document): HTMLElement[] {
   if (h5pQuestions.length > 0) return h5pQuestions;
   const explicit = queryAllDeep<HTMLElement>(document, QUESTION_ROOT_SELECTORS.join(","))
     .filter((element) => !isExplicitlyHidden(element))
-    .filter((element) => Array.from(element.querySelectorAll(SUPPORTED_CONTROL_SELECTOR)).some(supportedInput));
+    .filter((element) => zhidaoPracticeRoot(element) === element ||
+      Array.from(element.querySelectorAll(SUPPORTED_CONTROL_SELECTOR)).some(supportedInput));
   if (explicit.length > 0) {
     const leaves = explicit.filter((candidate) => !explicit.some((other) => other !== candidate && candidate.contains(other)));
     const candidates = leaves.length > 0 ? leaves : explicit;
@@ -231,6 +249,7 @@ function nativeRadioQuestionRoots(root: HTMLElement): HTMLElement[] | null {
 
 function questionRootScore(root: HTMLElement): number {
   if (root.closest("header, nav, aside, [role='search']")) return -1_000;
+  if (zhidaoPracticeRoot(root) === root) return 230;
   const choiceControls = root.querySelectorAll(
     "input[type='radio'], input[type='checkbox'], [role='radio'], [role='checkbox']",
   ).length;
@@ -262,7 +281,7 @@ function elementInputValue(element: HTMLElement): string {
 }
 
 function targetText(document: Document, element: HTMLElement): string {
-  if (element.matches("input[type='radio'], input[type='checkbox'], [role='radio'], [role='checkbox']")) {
+  if (isZhidaoChoice(element) || element.matches("input[type='radio'], input[type='checkbox'], [role='radio'], [role='checkbox']")) {
     return optionLabel(document, element);
   }
   if (element.matches("input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']")) {
@@ -287,6 +306,8 @@ function targetIdentity(
 }
 
 function questionStem(document: Document, root: HTMLElement): string {
+  const practiceStem = zhidaoStem(root);
+  if (practiceStem) return practiceStem;
   const labelledBy = root.getAttribute("aria-labelledby");
   if (labelledBy) {
     const labelled = labelledBy
@@ -419,6 +440,9 @@ export class DomWebAdapter implements PlatformAdapter {
   #currentLocator: LocatorMap | undefined;
   #separationTrial: SeparationTrial;
   #calibratedRoot: HTMLElement | null = null;
+  #initialCandidates = new Map<string, { root: HTMLElement; fingerprint: string }>();
+  #initialRoots: HTMLElement[] = [];
+  #initialDocumentIdentity: string | null = null;
   #pageQuestions: Array<{ adapter: DomWebAdapter; prefix: string; parsed: PlatformObservation["questions"][number] }> = [];
 
   constructor(document: Document, private readonly rootOverride?: HTMLElement, private readonly courseScope?: HTMLElement) {
@@ -435,6 +459,9 @@ export class DomWebAdapter implements PlatformAdapter {
     this.#currentObservation = undefined;
     this.#currentLocator = undefined;
     this.#calibratedRoot = null;
+    this.#initialCandidates.clear();
+    this.#initialRoots = [];
+    this.#initialDocumentIdentity = null;
     this.#separationTrial = new SeparationTrial(this.#document);
   }
 
@@ -445,6 +472,55 @@ export class DomWebAdapter implements PlatformAdapter {
       stem.length >= 8 && /[?？]|question|题/i.test(stem) && !currentStem.includes(stem),
     );
     return { snapshot, suggested };
+  }
+
+  captureInitialSemantic(): InitialSemanticSnapshot {
+    const blocker = this.detectHardBlocker();
+    if (blocker) throw new Error(`HARD_BLOCKER:${blocker}`);
+    this.#initialCandidates.clear();
+    this.#initialDocumentIdentity = this.#documentIdentity();
+    const regions = candidateRoots(this.#document).filter(root => root.ownerDocument === this.#document).slice(0, 64).map(root => {
+      const region_id = randomId("initial_region");
+      this.#initialCandidates.set(region_id, { root, fingerprint: this.#initialFingerprint(root) });
+      return { region_id, text: cleanedVisibleText(root.ownerDocument, root, 4_000),
+        controls: Array.from(root.querySelectorAll<HTMLElement>(SUPPORTED_CONTROL_SELECTOR)).filter(e => !isExplicitlyHidden(e)).slice(0, 64)
+          .map(e => ({ role: isZhidaoChoice(e) ? 'radio' : e.getAttribute("role") || (e.tagName === "INPUT" ? (e as HTMLInputElement).type : e.tagName.toLowerCase()),
+            text: (isZhidaoChoice(e) ? optionLabel(root.ownerDocument, e) : labelText(root.ownerDocument, e)).slice(0, 300), disabled: !supportedInput(e) })) };
+    });
+    // Empty candidates still go to the model; discovery is not a readiness gate.
+    return { visible_text: cleanedVisibleText(this.#document, this.#document.body, 20_000), regions };
+  }
+
+  #initialFingerprint(root: HTMLElement): string {
+    return fnv1a(JSON.stringify([elementText(root), Array.from(root.querySelectorAll<HTMLElement>(SUPPORTED_CONTROL_SELECTOR))
+      .map(e => [e.tagName, e.getAttribute("role"), elementInputName(e), elementInputValue(e), supportedInput(e), isExplicitlyHidden(e)])]));
+  }
+
+  #documentIdentity(): string {
+    return JSON.stringify([this.#document.location.href, this.#document.defaultView?.performance.timeOrigin]);
+  }
+
+  applyInitialSemantic(reading: InitialSemanticReading): boolean {
+    const blocker = this.detectHardBlocker();
+    if (blocker) throw new Error(`HARD_BLOCKER:${blocker}`);
+    if (this.#initialDocumentIdentity !== this.#documentIdentity() || !reading.region_ids.length ||
+      new Set(reading.region_ids).size !== reading.region_ids.length) return false;
+    const chosen = reading.region_ids.map(id => this.#initialCandidates.get(id));
+    if (chosen.some(item => !item || !item.root.isConnected || isExplicitlyHidden(item.root) ||
+      item.fingerprint !== this.#initialFingerprint(item.root))) return false;
+    const roots = chosen.map(item => item!.root);
+    if (roots.some(root => roots.some(other => root !== other && root.contains(other)))) return false;
+    if (roots.some((root, index) => index > 0 &&
+      !(roots[index - 1]!.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING))) return false;
+    this.#initialRoots = roots;
+    this.#initialCandidates.clear();
+    this.#initialDocumentIdentity = null;
+    return true;
+  }
+
+  #liveInitialRoots(): HTMLElement[] {
+    if (this.#initialRoots.some(root => !root.isConnected || isExplicitlyHidden(root))) this.#initialRoots = [];
+    return this.#initialRoots;
   }
 
   isQuizInteractionTarget(target: EventTarget | null): boolean {
@@ -461,11 +537,13 @@ export class DomWebAdapter implements PlatformAdapter {
   applySeparation(roles: SeparationRoles): LocalStructure | null {
     const separated = this.#separationTrial.separate(roles);
     if (!separated || !this.#separationTrial.remember(roles)) return null;
+    this.#initialRoots = [];
     this.#calibratedRoot = this.#separationTrial.validate(roles);
     return this.#separationTrial.structure();
   }
 
   reuseSeparation(structure: LocalStructure): boolean {
+    this.#initialRoots = [];
     this.#separationTrial = new SeparationTrial(this.#document, structure);
     this.#calibratedRoot = this.#separationTrial.reuse();
     if (!this.#calibratedRoot) this.#separationTrial = new SeparationTrial(this.#document);
@@ -474,6 +552,7 @@ export class DomWebAdapter implements PlatformAdapter {
 
   #activeRoot(): HTMLElement | undefined {
     if (this.rootOverride) return this.rootOverride.isConnected && !isExplicitlyHidden(this.rootOverride) ? this.rootOverride : undefined;
+    if (this.#liveInitialRoots().length) return this.#initialRoots[0];
     if (this.#calibratedRoot?.isConnected && !isExplicitlyHidden(this.#calibratedRoot)) return this.#calibratedRoot;
     if (this.#separationTrial.structure()) {
       this.#calibratedRoot = this.#separationTrial.reuse();
@@ -506,7 +585,7 @@ export class DomWebAdapter implements PlatformAdapter {
       if (signal.aborted) return { ready: false, reason: "cancelled" };
       const blocker = this.detectHardBlocker();
       if (blocker) return { ready: false, reason: blocker };
-      const roots = (this.#calibratedRoot?.isConnected ? [this.#calibratedRoot] : candidateRoots(this.#document))
+      const roots = (this.#liveInitialRoots().length ? this.#initialRoots : this.#calibratedRoot?.isConnected ? [this.#calibratedRoot] : candidateRoots(this.#document))
         .filter(root=>!this.courseScope||this.courseScope.contains(root));
       const activeRoot = roots[0];
       if (activeRoot && Array.from(activeRoot.querySelectorAll("textarea, [contenteditable='true']"))
@@ -544,7 +623,7 @@ export class DomWebAdapter implements PlatformAdapter {
     const blocker = this.detectHardBlocker();
     if (blocker) throw new Error(`HARD_BLOCKER:${blocker}`);
     const activeRoot = this.#activeRoot();
-    const roots = this.rootOverride || this.#separationTrial.structure() ? (activeRoot ? [activeRoot] : []) : candidateRoots(this.#document).filter(root => !this.courseScope || this.courseScope.contains(root));
+    const roots = this.#liveInitialRoots().length ? this.#initialRoots : this.rootOverride || this.#separationTrial.structure() ? (activeRoot ? [activeRoot] : []) : candidateRoots(this.#document).filter(root => !this.courseScope || this.courseScope.contains(root));
     if (roots.length === 0) throw new Error("No supported question was found.");
     if (roots.length > 1 && !this.rootOverride) return this.#observePage(roots, sessionId, signal, mode);
     this.#pageQuestions = [];
@@ -758,9 +837,7 @@ export class DomWebAdapter implements PlatformAdapter {
         : null);
     const editableAnswerTarget = [...this.#targets.entries()].some(([targetId, target]) => {
       if (targetId.startsWith("control_")) return false;
-      if (target.kind === "select_option") return !isExplicitlyHidden(target.element) && !target.element.disabled;
-      return !isExplicitlyHidden(target.element) &&
-        (!("disabled" in target.element) || !(target.element as HTMLInputElement).disabled);
+      return !isExplicitlyHidden(target.element) && supportedInput(target.element);
     });
     const pathname = this.#document.location?.pathname ?? "";
     const completedPath = /\/(?:completed?|results?)\/?$/i.test(pathname);
@@ -777,6 +854,16 @@ export class DomWebAdapter implements PlatformAdapter {
       (validResultScore ? `${resultScore[1]}/${resultScore[2]}` : finalScore ? `${finalScore[1]}/${finalScore[2]}` : null);
     const position = this.#readQuestionPosition();
     const sessionSubmit = this.#findButton(SESSION_SUBMIT_PATTERN);
+    // A standalone H5P result retains its question and ARIA choices after
+    // grading. A calibrated root therefore need not disappear. Require a
+    // visible local grade and a closed answer surface; QuestionSet navigation
+    // and course surfaces keep their existing completion rules.
+    const standaloneH5pResult = !this.courseScope && !gradedQuestionSet &&
+      Boolean(feedbackRoot?.matches('.h5p-question')) && pointFeedback !== null &&
+      !sessionSubmit && !this.#findButton(NEXT_PATTERN) &&
+      !this.#findButton(SUBMIT_PATTERN) && !this.#findButton(RETRY_PATTERN) &&
+      !Array.from(feedbackRoot!.querySelectorAll(SUPPORTED_CONTROL_SELECTOR))
+        .some(element => !isExplicitlyHidden(element) && supportedInput(element));
     const personalSessionScore = this.#readPersonalSessionScore();
     return {
       observation_id: this.#currentObservation?.observation_id ?? "none",
@@ -796,6 +883,7 @@ export class DomWebAdapter implements PlatformAdapter {
       completed:
         (!this.courseScope && completedPath) ||
         personalSessionScore !== null ||
+        standaloneH5pResult ||
         scoredResult ||
         (!gradedQuestionSet && /quiz complete|test complete|interview complete|your results?|测验完成|测试完成|答题完成|已交卷/i.test(pageText)),
     };
@@ -915,9 +1003,8 @@ export class DomWebAdapter implements PlatformAdapter {
     }
 
     if (targetId.startsWith("opt_")) {
-      return choose(Array.from(root.querySelectorAll<HTMLElement>(
-        "input[type='radio'], input[type='checkbox'], [role='radio'], [role='checkbox']",
-      )).filter((element) => !isExplicitlyHidden(element) && supportedInput(element)));
+      return choose([...choiceControls(root, 'radio'), ...choiceControls(root, 'checkbox')]
+        .filter((element) => !isExplicitlyHidden(element) && supportedInput(element)));
     }
     if (targetId.startsWith("blank_")) {
       return choose(Array.from(root.querySelectorAll<HTMLElement>(
@@ -934,10 +1021,11 @@ export class DomWebAdapter implements PlatformAdapter {
             .filter((element) => SUBMIT_PATTERN.test(targetText(this.#document, element))),
         ]
       : targetId === "control_submit_session"
-        ? queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
-            .filter((element) => element.matches("button.h5p-question-finish") || SESSION_SUBMIT_PATTERN.test(targetText(this.#document, element)))
+        ? [...queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
+            .filter((element) => element.matches("button.h5p-question-finish") || SESSION_SUBMIT_PATTERN.test(targetText(this.#document, element))),
+          ...[resolveZhidaoPracticeSubmit(this.#document)].filter((e): e is HTMLElement=>e!==null)]
         : targetId === "control_next"
-          ? queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button'], a.h5p-question-next")
+          ? queryAllDeep<HTMLElement>(this.#document, `button, input[type='submit'], input[type='button'], [role='button'], a.h5p-question-next, ${ZHIDAO_NEXT_SELECTOR}`)
               .filter((element) => NEXT_PATTERN.test(targetText(this.#document, element)))
           : targetId === "control_retry"
             ? queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
@@ -1183,6 +1271,12 @@ export class DomWebAdapter implements PlatformAdapter {
       return;
     }
     const element = target.element;
+    if (isZhidaoChoice(element)) {
+      // This is a radio widget: selecting the desired option clears its peer.
+      // Do not click an already selected peer to "clear" it before that click.
+      if (value && !zhidaoSelected(element)) element.click();
+      return;
+    }
     if (element.tagName === "INPUT" && ["radio", "checkbox"].includes((element as HTMLInputElement).type)) {
       const input = element as HTMLInputElement;
       if (input.disabled) throw new Error("Target is disabled.");
@@ -1212,10 +1306,17 @@ export class DomWebAdapter implements PlatformAdapter {
   }
 
   #findButton(pattern: RegExp, within: ParentNode = this.#document, includeDisabled = false): HTMLElement | null {
+    if(pattern===SESSION_SUBMIT_PATTERN){
+      const practiceSubmit=resolveZhidaoPracticeSubmit(this.#document);
+      if(practiceSubmit && (within===this.#document || within.contains(practiceSubmit)) &&
+        (!this.courseScope || this.courseScope.contains(practiceSubmit)))return practiceSubmit;
+    }
+    const selector = "button, input[type='submit'], input[type='button'], [role='button'], a.h5p-question-next" +
+      (pattern === NEXT_PATTERN ? `, ${ZHIDAO_NEXT_SELECTOR}` : '');
     const candidates =
       within === this.#document
-        ? queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button'], a.h5p-question-next")
-        : Array.from(within.querySelectorAll<HTMLElement>("button, input[type='submit'], input[type='button'], [role='button'], a.h5p-question-next"));
+        ? queryAllDeep<HTMLElement>(this.#document, selector)
+        : Array.from(within.querySelectorAll<HTMLElement>(selector));
     return (
       candidates
         .filter((element) => (!this.courseScope || this.courseScope.contains(element)) && !isExplicitlyHidden(element) && (includeDisabled || supportedInput(element)))
@@ -1297,6 +1398,8 @@ export class DomWebAdapter implements PlatformAdapter {
   }
 
   #readQuestionTotal(): number | null {
+    const zhidaoProgress = readZhidaoPractice(this.#document);
+    if (zhidaoProgress) return zhidaoProgress.total;
     const h5pProgress = this.#readH5pProgress();
     if (h5pProgress) return h5pProgress.total;
     const explicit = queryAllDeep<HTMLElement>(this.#document, "[data-total-questions]")[0]
@@ -1316,6 +1419,8 @@ export class DomWebAdapter implements PlatformAdapter {
   }
 
   #readQuestionPosition(): { current: number; total: number } | null {
+    const zhidaoProgress = readZhidaoPractice(this.#document);
+    if (zhidaoProgress) return { current: zhidaoProgress.current, total: zhidaoProgress.total };
     const h5pProgress = this.#readH5pProgress();
     if (h5pProgress) return h5pProgress;
     const root = this.#activeRoot();

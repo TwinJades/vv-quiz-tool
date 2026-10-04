@@ -11,10 +11,13 @@ import { requireCurrentWebsite, websiteIsAuthorized } from "./website-access";
 import { SessionAttentionNotifications } from "./attention-notifications";
 import { CourseTabPlatform, createCourseRun } from './course-platform';
 import type { CourseOrchestrator } from '../core/course';
+import type { CourseInspectionBundle } from '../web/course-inspection';
+import {createKnowledgeRun,KnowledgeTabPlatform,previewKnowledge} from './knowledge-practice-platform';
+import type {KnowledgePracticeOrchestrator} from '../core/knowledge-practice';
 
 interface ManagedSession {
-  orchestrator: QuizOrchestrator | CourseOrchestrator;
-  platform: TabPlatformProxy | CourseTabPlatform;
+  orchestrator: QuizOrchestrator | CourseOrchestrator | KnowledgePracticeOrchestrator;
+  platform: TabPlatformProxy | CourseTabPlatform | KnowledgeTabPlatform;
   snapshot: SessionRuntimeSnapshot;
   attention: SessionAttentionNotifications;
 }
@@ -88,7 +91,7 @@ async function visibleSessionSnapshot(tabId: number): Promise<SessionRuntimeSnap
   const recovered: SessionRuntimeSnapshot = {
     ...stored,
     state: "PAUSED",
-    notice: "扩展后台曾被浏览器回收；请清除本次状态后重新启动。",
+    notice: stored.practice?.checkpoint&&!stored.practice.checkpoint.child_active?'扩展后台曾被浏览器回收；可从知识点安全断点继续，先重新核对页面。':"扩展后台曾被浏览器回收；请核对已保存作答和提交结果后再重新启动。",
   };
   await saveSessionSnapshot(tabId, recovered);
   return recovered;
@@ -187,7 +190,7 @@ async function startSession(request: StartSessionRequest): Promise<SessionRuntim
     throw new Error("当前接口或模型未明确支持原生网页搜索，请关闭本场搜索或选择已确认支持的模型。");
   }
   if (
-    !request.course && request.observation_input_mode === "visual_snapshot" &&
+    !request.course && !request.practice_course && request.observation_input_mode === "visual_snapshot" &&
     (!profile.image_upload_authorized || !profile.capabilities.image_input)
   ) {
     throw new Error("截图模式需要当前 Provider 已授权并支持图片输入。");
@@ -196,6 +199,22 @@ async function startSession(request: StartSessionRequest): Promise<SessionRuntim
   await ensureContentInjected(request.tab_id);
 
   const budget = new ModelCallBudget(request.model_call_limit);
+  if(request.practice_course){
+    if(request.course)throw new Error('请分别选择视频课程或知识点练习范围。');
+    const catalog=await previewKnowledge(request.tab_id),expected=request.practice_course.catalog;
+    if(catalog.course_id!==expected.course_id||catalog.context_id!==expected.context_id||catalog.revision!==expected.revision)throw new Error('知识点预览已改变，请重新读取并选择范围。');
+    let managed:ManagedSession;
+    const {orchestrator,platform}=createKnowledgeRun(request.tab_id,profile,await providerManager.getApiKey(profile),budget,
+      {session_id:crypto.randomUUID(),catalog,scope:request.practice_course.scope,strategy:request.strategy,on_update:snapshot=>{
+        managed.snapshot=snapshot;if(sessions.get(request.tab_id)!==managed)return;
+        void saveSessionSnapshot(request.tab_id,snapshot);void updateBadge(request.tab_id,snapshot);void notifyAttention(request.tab_id,managed).catch(()=>{});
+        if(['PAUSED','COMPLETE','FAILED','CANCELLED'].includes(snapshot.state))void platform.disableInteraction().catch(()=>{});
+      }});
+    managed={orchestrator,platform,attention:new SessionAttentionNotifications(),snapshot:{...orchestrator.snapshot(),state:'QUEUED',notice:'等待知识点练习运行名额。'}};
+    sessions.set(request.tab_id,managed);startupFailures.delete(request.tab_id);await saveSessionSnapshot(request.tab_id,managed.snapshot);
+    try{await platform.enableInteraction();}catch(e){orchestrator.stop('知识点人工操作保护安装失败。');sessions.delete(request.tab_id);throw e;}
+    queue.enqueue(request.tab_id,()=>orchestrator.run());return managed.snapshot;
+  }
   if (request.course) {
     const previewPlatform = new CourseTabPlatform(request.tab_id,crypto.randomUUID(),request.course.course_id);
     const catalog = await previewPlatform.preview(new AbortController().signal);
@@ -226,7 +245,12 @@ async function startSession(request: StartSessionRequest): Promise<SessionRuntim
     request.tab_id,
     request.observation_input_mode,
     (snapshot, signal) => solver.calibrateSeparation(snapshot, signal),
-    (capture, signal, context) => solver.recognizeVisual(capture, signal, context),
+    async (capture, signal, context) => {
+      await requireCurrentWebsite(request.tab_id);
+      signal.throwIfAborted();
+      return solver.recognizeVisual(capture, signal, context);
+    },
+    (snapshot, signal) => solver.recognizeInitialSemantic(snapshot, signal),
   );
   const sessionId = crypto.randomUUID();
   let managed: ManagedSession;
@@ -278,7 +302,7 @@ async function taskPanelSnapshot(): Promise<TaskPanelSnapshot> {
     try {
       const tab = await chrome.tabs.get(tabId);
       const snapshot = await visibleSessionSnapshot(tabId);
-      if (snapshot) tasks.push({ tab_id: tabId, title: tab.title || `标签 ${tabId}`, url: tab.url ?? null, provider_name: (await providerManager.get(snapshot.provider_profile_id))?.display_name || "Provider 已移除", snapshot, resumable: sessions.has(tabId) });
+      if (snapshot) tasks.push({ tab_id: tabId, title: tab.title || `标签 ${tabId}`, url: tab.url ?? null, provider_name: (await providerManager.get(snapshot.provider_profile_id))?.display_name || "Provider 已移除", snapshot, resumable: sessions.has(tabId)||snapshot.state==='PAUSED'&&snapshot.practice?.checkpoint?.child_active===false });
     } catch { /* A closed target is not a task. */ }
   }
   return { ...queue.snapshot(), tasks };
@@ -347,12 +371,31 @@ async function handleRequest(
   }
   if(request.type==='VV_INSPECT_COURSE'){
     await requireCurrentWebsite(request.tab_id);
-    const frames=await ensureContentInjected(request.tab_id);
-    return Promise.all(frames.map(async frame=>{
-      const response=await chrome.tabs.sendMessage(request.tab_id,{type:'VV_INSPECT_COURSE_PAGE'},{frameId:frame});
-      if(!response?.ok)throw new Error(response?.error??'页面资料读取失败。');
-      return {frame_id:frame,inspection:response.result};
+    const available=await chrome.webNavigation.getAllFrames({tabId:request.tab_id});
+    if(!available?.length)throw new Error('没有可读取的页面，请回到课程页后重试。');
+    const frames=await Promise.all(available.map(async (frame):Promise<CourseInspectionBundle['frames'][number]>=>{
+      const unavailable=(error:NonNullable<CourseInspectionBundle['frames'][number]['error']>)=>({frame_id:frame.frameId,error});
+      try{
+        if(!await websiteIsAuthorized(frame.url))return unavailable('not_authorized');
+        const target={tabId:request.tab_id,...(frame.documentId?{documentIds:[frame.documentId]}:{frameIds:[frame.frameId]})};
+        await chrome.scripting.executeScript({target,files:['content.js']});
+        await requireCurrentWebsite(request.tab_id);
+        const before=await chrome.webNavigation.getFrame({tabId:request.tab_id,frameId:frame.frameId});
+        if(!before||before.url!==frame.url||before.documentId!==frame.documentId)return unavailable('page_changed');
+        if(!await websiteIsAuthorized(before.url))return unavailable('not_authorized');
+        const response=await chrome.tabs.sendMessage(request.tab_id,{type:'VV_INSPECT_COURSE_PAGE'},
+          frame.documentId?{documentId:frame.documentId}:{frameId:frame.frameId});
+        const after=await chrome.webNavigation.getFrame({tabId:request.tab_id,frameId:frame.frameId});
+        if(!after||after.url!==before.url||after.documentId!==before.documentId)return unavailable('page_changed');
+        if(!await websiteIsAuthorized(after.url))return unavailable('not_authorized');
+        if(!response?.ok)return unavailable('read_failed');
+        return {frame_id:frame.frameId,inspection:response.result};
+      }catch{return unavailable('read_failed');}
     }));
+    await requireCurrentWebsite(request.tab_id);
+    if(!frames.some(frame=>frame.inspection))throw new Error('结构读取失败，请检查页面是否加载完成及网站/frame权限。');
+    const bundle:CourseInspectionBundle={schema_version:1,captured_at:new Date().toISOString(),complete:frames.every(frame=>frame.inspection!==undefined),frames};
+    return bundle;
   }
   if (request.type === "VV_SET_CONCURRENCY") {
     await queueReady;
@@ -374,8 +417,9 @@ async function handleRequest(
     return { cancelled: true };
   }
   if (request.type === "VV_START_SESSION") return scheduleStart(request);
+  if(request.type==='VV_PREVIEW_PRACTICES')return previewKnowledge(request.tab_id);
 
-  const session = sessions.get(request.tab_id);
+  let session = sessions.get(request.tab_id);
   if (request.type === "VV_GET_SESSION") return visibleSessionSnapshot(request.tab_id);
   if (request.type === "VV_CLEAR_SESSION" && !session) {
     startupFailures.delete(request.tab_id);
@@ -383,6 +427,21 @@ async function handleRequest(
     await removeSessionSnapshot(request.tab_id);
     await chrome.action.setBadgeText({ tabId: request.tab_id, text: "" });
     return null;
+  }
+  if(request.type==='VV_RESUME_SESSION'&&!session){
+    const snapshot=await visibleSessionSnapshot(request.tab_id),practice=snapshot?.practice,checkpoint=practice?.checkpoint;
+    if(!snapshot||snapshot.state!=='PAUSED'||!checkpoint||checkpoint.child_active)throw new Error('后台恢复缺少安全断点；请先核对已有作答/提交，禁止盲目重做。');
+    await requireCurrentWebsite(request.tab_id);
+    const profile=await providerManager.get(snapshot.provider_profile_id);if(!profile)throw new Error('Provider已移除，不能恢复。');
+    const budget=new ModelCallBudget(snapshot.model_calls.limit);if(snapshot.model_calls.used)budget.reserve(snapshot.model_calls.used).settle(snapshot.model_calls.used);
+    let managed:ManagedSession;
+    const {orchestrator,platform}=createKnowledgeRun(request.tab_id,profile,await providerManager.getApiKey(profile),budget,
+      {session_id:snapshot.session_id,catalog:checkpoint.catalog,scope:practice.scope,strategy:snapshot.strategy,restore:snapshot,on_update:next=>{
+        managed.snapshot=next;if(sessions.get(request.tab_id)!==managed)return;
+        void saveSessionSnapshot(request.tab_id,next);void updateBadge(request.tab_id,next);void notifyAttention(request.tab_id,managed).catch(()=>{});
+        if(['PAUSED','COMPLETE','FAILED','CANCELLED'].includes(next.state))void platform.disableInteraction().catch(()=>{});
+      }});
+    managed={orchestrator,platform,attention:new SessionAttentionNotifications(),snapshot:orchestrator.snapshot()};sessions.set(request.tab_id,managed);session=managed;
   }
   if (!session) throw new Error("No VV session exists for this tab.");
   if (request.type === "VV_PAUSE_SESSION") { queue.cancelQueued(request.tab_id); session.orchestrator.pause(); }

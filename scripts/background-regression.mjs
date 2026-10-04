@@ -8,9 +8,10 @@ import { canvasFixtureHtml } from "./canvas-fixture.mjs";
 import { installTestNotificationRecorder, readTestNotices } from "./record-test-notifications.mjs";
 import { preparePublicCanvas } from "./prepare-public-canvas.mjs";
 import { installTestVisualRecorder, readTestVisualReadings } from "./record-test-visual-readings.mjs";
-import { authorizedTestModel } from './authorized-test-model.mjs';
+import { authorizedTestModel, assertAcceptanceProvider } from './authorized-test-model.mjs';
 import { installTestProviderRecorder } from './record-test-provider-requests.mjs';
 import { installTestDomRecorder } from './record-test-dom-transitions.mjs';
+import { readEasyCpaAcceptanceConfig } from './read-easycpa-acceptance-config.mjs';
 
 const root = resolve(import.meta.dirname, "..");
 const stamp = new Date().toISOString().replaceAll(":", "-");
@@ -40,6 +41,7 @@ let availableSites = [
   { id: "h5p-image-multi", url: "https://h5p.org/h5p/embed/1249570", expected_questions: 1 },
   { id: "h5p-blanks", url: "https://h5p.org/h5p/embed/1039075", expected_questions: 1 },
   { id: "h5p-mixed-text", url: "https://h5pstudio.ecampusontario.ca/content/2360", expected_questions: 8, mixed_text_only: true },
+  { id: "h5p-copyright-image-text", url: "https://h5pstudio.ecampusontario.ca/content/60107", expected_questions: 5, mixed_text_image_two_types: true },
   { id: "daily-whole", url: "https://quizofthedayuk.co.uk/", expected_questions: 10, whole_page: true },
   { id: "wordwall-science", url: "https://wordwall.net/resource/114600206/general-science-quiz", expected_questions: 5, public_canvas: true },
 ];
@@ -181,12 +183,23 @@ async function runSite(site) {
 try {
   await mkdir(runDirectory, { recursive: true });
   console.log("REPORT_DIRECTORY", runDirectory);
+  let configuration;
+  if (process.env.VV_EASYCPA_CONFIG_PATH) {
+    configuration = await readEasyCpaAcceptanceConfig(process.env.VV_EASYCPA_CONFIG_PATH,
+      process.env.VV_EASYCPA_MODELS?.split(',').map(id => id.trim()).filter(Boolean));
+    report.configuration_source = 'existing_easycpa_client_access_config';
+    report.configured_models = configuration.profile.model_catalog.models;
+  } else {
   // Read only the selected existing local CPA profile; never print its secret.
   const sourceTarget = (await cdpJson(sourcePort, "/json/list")).find(target => /^chrome-extension:\/\//.test(target.url) && /\/(?:options\.html|background\.js)$/.test(target.url));
   if (!sourceTarget) throw new Error("Existing configured VV extension context not found");
   source = new CdpClient(sourceTarget.webSocketDebuggerUrl);
-  const configuration = await source.evaluate(`(async()=>{const data=await chrome.storage.local.get(null);const id=data["provider-profile-index"]?.find(id=>data["provider-profile:"+id]?.display_name==="CPA");if(!id)throw new Error("CPA profile missing");const profile=data["provider-profile:"+id];const secretKey="provider-secret:"+profile.secret_ref;return {profile,secretKey,secret:data[secretKey]};})()`);
+  configuration = await source.evaluate(`(async()=>{const data=await chrome.storage.local.get(null);const id=data["provider-profile-index"]?.find(id=>data["provider-profile:"+id]?.display_name==="CPA");if(!id)throw new Error("CPA profile missing");const profile=data["provider-profile:"+id];const secretKey="provider-secret:"+profile.secret_ref;return {profile,secretKey,secret:data[secretKey]};})()`);
   source.close(); source = null;
+  report.configuration_source = 'existing_vv_browser_profile';
+  }
+  assertAcceptanceProvider(configuration.profile);
+  report.provider_base_url = configuration.profile.base_url;
   if ((localCanvas||sites.some(site=>site.public_canvas)) && (!configuration.profile.image_upload_authorized || !configuration.profile.capabilities.image_input)) throw new Error("Configured CPA has no existing image authorization/capability");
   const build = spawnSync(process.execPath, [resolve(root, "scripts/build.mjs")], { cwd: root, env: { ...process.env, VV_BUILD_DIR: extensionDirectory }, stdio: "inherit" });
   if (build.status !== 0) throw new Error("Isolated extension build failed");

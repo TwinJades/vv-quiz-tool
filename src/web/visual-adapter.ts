@@ -92,6 +92,7 @@ export class VisualWebAdapter implements RuntimePlatform {
 
   async #read(observationId: string, signal: AbortSignal): Promise<{ capture: VisualCapture; reading: VisualReading }> {
     const capture = await this.#capture(observationId, signal);
+    signal.throwIfAborted();
     let reading = this.#reading;
     let sameRegions = false;
     if(reading?.status === "questions" && reading.timer_is_countdown !== true && this.#current) {
@@ -121,8 +122,21 @@ export class VisualWebAdapter implements RuntimePlatform {
         const sameQuestions = this.#reading.questions.length===currentQuestions.length &&
           this.#reading.questions.every(previous=>currentQuestions.some(next=>contentIdentity(next)===contentIdentity(previous)));
         if(sameQuestions) for(const previous of this.#reading.controls) {
-          const next=reading.controls.find(control=>control.text===previous.text);
+          const matches=reading.controls.filter(control=>control.text===previous.text);
+          const next=matches.length===1 ? matches[0] : undefined;
           if(next && previous.role!==next.role) throw new Error('VISUAL_UNCERTAIN: control role changed during input without a new question; no further input was sent.');
+          if(next && previous.question_index===next.question_index && previous.confidence>=0.85 &&
+            this.#current?.frame.pixel_tiles && capture.frame.pixel_tiles) {
+            // Answer marks can change while a navigation button stays put.
+            // Reuse its observed point only with exact local pixel evidence,
+            // unchanged geometry and the normal expiry bound. Current model
+            // disabled/confidence states still apply; no state is copied.
+            const protectedRegions=this.#regions({...this.#reading,questions:[],controls:[previous]},this.#current.frame);
+            try {
+              assertVisualFreshness({...this.#current.frame,validated_regions:protectedRegions},capture.frame);
+              next.point={...previous.point};
+            } catch { /* Changed or expired button pixels require the current reading. */ }
+          }
         }
       }
     }

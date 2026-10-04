@@ -16,6 +16,36 @@ afterEach(() => {
 });
 
 describe("DomWebAdapter", () => {
+  it('recognizes a standalone graded H5P image question even when its calibrated root remains', async () => {
+    document.body.innerHTML = `<section class="h5p-question h5p-image-choice">
+      <h2>Which images are correct?</h2><div role="checkbox" aria-checked="true">A</div>
+      <div role="checkbox" aria-checked="false">B</div><button class="h5p-question-check-answer">Check</button>
+      <div class="h5p-question-scorebar" hidden>You got 4 out of 4 points</div></section>`;
+    const root = document.querySelector<HTMLElement>('section')!;
+    const adapter = new DomWebAdapter(document, root);
+    await adapter.observeSession('image-final', abortSignal());
+    expect((await adapter.readState(abortSignal())).completed).toBe(false);
+    root.querySelectorAll('[role=checkbox]').forEach(element => element.setAttribute('aria-disabled', 'true'));
+    root.querySelector('button')!.remove();
+    const score = root.querySelector<HTMLElement>('.h5p-question-scorebar')!;
+    score.hidden = false;
+    score.classList.add('h5p-question-visible');
+    expect(await adapter.readState(abortSignal())).toMatchObject({ completed: true, visible_score: '4/4', can_retry: false });
+  });
+  it('does not finish a graded question with next, finish, retry, editable choices or hidden score', async () => {
+    for (const suffix of ['<a class="h5p-question-next">Next question</a>',
+      '<button class="h5p-question-finish">Finish</button>', '<button>Retry</button>',
+      '<div role="checkbox">Still editable</div>']) {
+      document.body.innerHTML = `<section class="h5p-question"><h2>Select images</h2>
+        <div role="checkbox" aria-disabled="true">A</div><div role="checkbox" aria-disabled="true">B</div>
+        <div class="h5p-question-scorebar h5p-question-visible">You got 4 out of 4 points</div>${suffix}</section>`;
+      const adapter = new DomWebAdapter(document, document.querySelector<HTMLElement>('section')!);
+      expect((await adapter.readState(abortSignal())).completed).toBe(false);
+    }
+    document.body.innerHTML = `<section class="h5p-question"><div role="checkbox" aria-disabled="true">A</div>
+      <div class="h5p-question-scorebar h5p-question-visible" hidden>You got 4 out of 4 points</div></section>`;
+    expect((await new DomWebAdapter(document, document.querySelector<HTMLElement>('section')!).readState(abortSignal())).completed).toBe(false);
+  });
   it.each(['radio','checkbox'] as const)('retains a graded H5P MultiChoice %s question when roles and Check are removed',async role=>{
     document.body.innerHTML=`<div class="questionset"><section class="h5p-question h5p-multichoice"><p>Choose a topic.</p><div class="h5p-question-content ${role==='radio'?'h5p-radio':'h5p-check'}"><ul class="h5p-answers"><li role="${role}" class="h5p-answer"><span class="h5p-alternative-inner">First</span></li><li role="${role}" class="h5p-answer"><span class="h5p-alternative-inner">Second</span></li></ul></div><button class="h5p-question-check-answer">Check</button><div class="h5p-question-scorebar"></div></section></div>`;
     const adapter=new DomWebAdapter(document);

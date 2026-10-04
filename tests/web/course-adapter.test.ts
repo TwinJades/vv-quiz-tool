@@ -73,6 +73,22 @@ describe('course DOM capability boundaries',()=>{
     const result=JSON.stringify(inspectCoursePage(f.document));expect(result).toContain('123');expect(result).not.toMatch(/SECRET_TOKEN|PRIVATE_ID|PASSWORD_SECRET|HIDDEN_ANSWER/);
     expect(result).not.toContain('THIS_IS_AN_OPAQUE_SECRET_PATH_TOKEN_TOO_LONG');
   });
+  it('does not infer quiz submission from a completed directory task alone',()=>{
+    const f=page();const row=f.document.querySelector<HTMLElement>('[data-learning-task-id]')!;
+    row.dataset.taskKind='lesson_quiz';row.dataset.taskStatus='completed';
+    const task=f.adapter.catalog().tasks[0]!;
+    expect(f.adapter.verify('course',task)).toMatchObject({progress_recorded:true,completed:true,submission_confirmed:false});
+    f.document.querySelector('[data-active-task-id]')!.insertAdjacentHTML('beforeend','<section data-quiz-id="q" data-quiz-kind="lesson_quiz" data-submission-confirmed="true"></section>');
+    expect(f.adapter.verify('course',task).submission_confirmed).toBe(true);
+  });
+  it('blocks a stale quiz boundary when scoring or pass rules changed',()=>{
+    const f=page();const task=f.adapter.catalog().tasks[0]!;
+    f.document.querySelector('[data-active-task-id]')!.insertAdjacentHTML('beforeend','<section data-quiz-id="p" data-quiz-kind="video_popup" data-scored="false" data-retry-allowed="true" data-requires-rewatch="false" data-requires-pass="false" data-remaining-attempts="3"></section>');
+    const boundary=f.adapter.boundary('course',task);
+    const root=f.document.querySelector<HTMLElement>('[data-quiz-id]')!;
+    root.dataset.requiresPass='true';
+    expect(()=>f.adapter.assertBoundary('course',task,boundary)).toThrow(/规则/);
+  });
   it('limits question controls, feedback and countdown to the current quiz boundary',async()=>{
     document.body.innerHTML='<div class="feedback">回答错误</div><div data-remaining-seconds="1"></div><button>Finish quiz</button><section id="scope"><fieldset><legend>Choose?</legend><label><input type="radio" name="q" value="a">Alpha</label><label><input type="radio" name="q" value="b">Beta</label><button>Submit</button></fieldset></section><button>Next question</button>';
     const scoped=new DomWebAdapter(document,undefined,document.querySelector<HTMLElement>('#scope')!);

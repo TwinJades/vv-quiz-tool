@@ -15,3 +15,11 @@ export function authorizedTestModel({configured,available,requested,fallbackEvid
   }
   return {id:requested,allowed,fallback};
 }
+
+
+// Acceptance-only route guard. Never rewrites a user's saved configuration.
+export function assertAcceptanceProvider(profile) {
+  if (typeof profile?.base_url !== 'string' || profile.base_url.replace(/\/$/,'') !== 'http://127.0.0.1:8317/v1') {
+    throw new Error('Real acceptance requires the user-selected EasyCPA endpoint http://127.0.0.1:8317/v1; update the existing configuration before continuing.');
+  }
+}

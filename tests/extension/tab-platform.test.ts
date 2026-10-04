@@ -1,14 +1,34 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TabPlatformProxy } from "../../src/extension/tab-platform";
+import type { InitialSemanticSnapshot } from '../../src/web/initial-snapshot';
+
+// Current initial-recognition protocol: authorized website, an active binding,
+// a local inventory and a separately validated region before DOM observations.
+function stubAuthorizedBrowser(sendMessage: (...args: any[]) => unknown) {
+  const snapshot: InitialSemanticSnapshot={visible_text:'Question page',regions:[{region_id:'region_1',text:'Question',controls:[]}]};
+  vi.stubGlobal('chrome',{
+    scripting:{executeScript:vi.fn(async()=>[{frameId:0}])},
+    tabs:{get:vi.fn(async()=>({url:'https://quiz.example'})),sendMessage:vi.fn(async(tab,request,options)=>{
+      if(request.type==='VV_SET_INTERACTION')return {ok:true,result:true};
+      if(request.type==='VV_CAPTURE_INITIAL_SEMANTIC')return {ok:true,result:snapshot};
+      if(request.type==='VV_APPLY_INITIAL_SEMANTIC')return {ok:true,result:request.reading.region_ids.length===1&&request.reading.region_ids[0]==='region_1'};
+      return sendMessage(tab,request,options);
+    })},
+    webNavigation:{getFrame:vi.fn(async()=>({url:'https://quiz.example'}))},
+    permissions:{contains:vi.fn(async()=>true)},
+  });
+}
+const initialReading=async()=>({region_ids:['frame_0:region_1']});
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe("semantic snapshot session input", () => {
   it("prioritizes a standalone Canvas in screenshot mode before reading surrounding settings as questions", async () => {
     const sendMessage=vi.fn(async (_tabId:number,request:{type:string})=>({ok:true,result:request.type==='VV_VISUAL_GEOMETRY'?{canvas_surface:true,blocker:null}:{ready:true}}));
-    vi.stubGlobal('chrome',{scripting:{executeScript:vi.fn(async()=>[{frameId:0}])},tabs:{sendMessage}});
+    stubAuthorizedBrowser(sendMessage);
     const platform=new TabPlatformProxy(1,'visual_snapshot',undefined,vi.fn());
+    await platform.enableInteraction('s1');
     await expect(platform.waitUntilReady(new AbortController().signal)).resolves.toEqual({ready:true});
     expect(sendMessage.mock.calls.map(call=>call[1].type)).toEqual(['VV_VISUAL_GEOMETRY']);
     // Once selected, readiness uses the visual adapter without a DOM question.
@@ -17,8 +37,9 @@ describe("semantic snapshot session input", () => {
 
   it("does not bypass a hard blocker to activate standalone Canvas", async () => {
     const sendMessage=vi.fn(async()=>({ok:true,result:{canvas_surface:true,blocker:'captcha'}}));
-    vi.stubGlobal('chrome',{scripting:{executeScript:vi.fn(async()=>[{frameId:0}])},tabs:{sendMessage}});
+    stubAuthorizedBrowser(sendMessage);
     const platform=new TabPlatformProxy(1,'visual_snapshot',undefined,vi.fn());
+    await platform.enableInteraction('s1');
     await expect(platform.waitUntilReady(new AbortController().signal)).resolves.toEqual({ready:false,reason:'captcha'});
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
@@ -27,12 +48,13 @@ describe("semantic snapshot session input", () => {
     const sendMessage = vi.fn(async (_tabId: number, request: { type: string }) => request.type === "VV_CAPTURE_SEPARATION"
       ? { ok: true, result: { suggested: true, snapshot } }
       : { ok: false, error: "No supported question was found." });
-    vi.stubGlobal("chrome", { tabs: { sendMessage } });
+    stubAuthorizedBrowser(sendMessage);
     let release!: (roles: { region_id: string; option_ids: string[] }) => void;
     let started!: () => void;
     const ready = new Promise<void>(resolve => { started = resolve; });
     const calibrate = vi.fn((_snapshot: unknown, _signal: AbortSignal) => { started(); return new Promise<{ region_id: string; option_ids: string[] }>(resolve => { release = resolve; }); });
-    const platform = new TabPlatformProxy(1, "semantic_snapshot", calibrate);
+    const platform = new TabPlatformProxy(1, "semantic_snapshot", calibrate, undefined, initialReading);
+    await platform.enableInteraction('s1');
     const controller = new AbortController();
     const outcome = platform.observeSession("s1", controller.signal).catch(error => error);
     await ready;
@@ -59,13 +81,13 @@ describe("semantic snapshot session input", () => {
     expect(platform.interactionMatches("s1", firstBinding.epoch)).toBe(false);
   });
 
-  it("does not send an action after the running session was cancelled", () => {
+  it("does not send an action after the running session was cancelled", async () => {
     const sendMessage = vi.fn();
     vi.stubGlobal("chrome", { tabs: { sendMessage } });
     const controller = new AbortController();
     controller.abort();
     const platform = new TabPlatformProxy(1);
-    expect(() => platform.execute({} as never, {} as never, controller.signal)).toThrow();
+    await expect(platform.execute({} as never, {} as never, controller.signal)).rejects.toMatchObject({name:'AbortError'});
     expect(sendMessage).not.toHaveBeenCalled();
   });
   it("retries a temporary image network failure before solving", async () => {
@@ -113,8 +135,9 @@ describe("semantic snapshot session input", () => {
         ...(request.mode === "semantic_snapshot" ? { page_context: { mode: "semantic_snapshot", visible_text: "page", controls: [], media: [] } } : {}),
       } };
     });
-    vi.stubGlobal("chrome", { tabs: { sendMessage } });
-    const platform = new TabPlatformProxy(1, "semantic_snapshot");
+    stubAuthorizedBrowser(sendMessage);
+    const platform = new TabPlatformProxy(1, "semantic_snapshot", undefined, undefined, initialReading);
+    await platform.enableInteraction('s1');
 
     const first = await platform.observeSession("s1", new AbortController().signal);
     const second = await platform.observeSession("s1", new AbortController().signal);
@@ -137,8 +160,9 @@ describe("semantic snapshot session input", () => {
         ...(request.mode === "semantic_snapshot" ? { page_context: { mode: "semantic_snapshot", visible_text: "page", controls: [], media: [] } } : {}),
       } };
     });
-    vi.stubGlobal("chrome", { tabs: { sendMessage } });
-    const platform = new TabPlatformProxy(1, "semantic_snapshot");
+    stubAuthorizedBrowser(sendMessage);
+    const platform = new TabPlatformProxy(1, "semantic_snapshot", undefined, undefined, initialReading);
+    await platform.enableInteraction('s1');
 
     await platform.observeSession("s1", new AbortController().signal);
     await platform.observeSession("s1", new AbortController().signal);
@@ -166,8 +190,9 @@ describe("semantic snapshot session input", () => {
       } };
     });
     const calibrate = vi.fn(async () => ({ region_id: "region_1", option_ids: ["region_1_option_1", "region_1_option_2"] }));
-    vi.stubGlobal("chrome", { tabs: { sendMessage } });
-    const platform = new TabPlatformProxy(1, "semantic_snapshot", calibrate);
+    stubAuthorizedBrowser(sendMessage);
+    const platform = new TabPlatformProxy(1, "semantic_snapshot", calibrate, undefined, initialReading);
+    await platform.enableInteraction('s1');
 
     const observation = await platform.observeSession("s1", new AbortController().signal);
 
@@ -178,14 +203,16 @@ describe("semantic snapshot session input", () => {
     ]);
   });
 
-  it("allows a sole separation candidate past readiness timeout but preserves hard blockers", async () => {
+  it("allows initial semantic recognition before DOM readiness but preserves hard blockers", async () => {
     let blocker = false;
     const sendMessage = vi.fn(async (_tabId: number, request: { type: string }) => {
+      if(request.type==='VV_VISUAL_GEOMETRY')return {ok:true,result:{blocker:blocker?'unsupported_subjective_question':null}};
       if (request.type === "VV_WAIT_READY") return { ok: true, result: { ready: false, reason: blocker ? "unsupported_subjective_question" : "readiness_timeout" } };
       return { ok: true, result: { suggested: true, snapshot: { visible_text: "Question?", candidates: [{ semantic_id: "region_1", kind: "region", text: "Question?" }] } } };
     });
-    vi.stubGlobal("chrome", { scripting: { executeScript: vi.fn(async () => [{ frameId: 0 }]) }, tabs: { sendMessage } });
-    const platform = new TabPlatformProxy(1, "semantic_snapshot", vi.fn());
+    stubAuthorizedBrowser(sendMessage);
+    const platform = new TabPlatformProxy(1, "semantic_snapshot", vi.fn(), undefined, initialReading);
+    await platform.enableInteraction('s1');
 
     await expect(platform.waitUntilReady(new AbortController().signal)).resolves.toEqual({ ready: true });
     blocker = true;

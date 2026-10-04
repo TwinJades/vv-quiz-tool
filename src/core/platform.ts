@@ -68,6 +68,8 @@ export interface PlatformState {
   feedback: "correct" | "incorrect" | "partial" | null;
   feedback_text?: string;
   visible_score?: string;
+  /** Explicit whole-session passing result; single-question feedback is separate. */
+  session_passed?: boolean | null;
   can_retry: boolean;
   has_next: boolean;
   has_session_submit?: boolean;

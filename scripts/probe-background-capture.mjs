@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { CdpClient, cdpJson } from "./cdp-client.mjs";
 import { canvasFixtureHtml } from "./canvas-fixture.mjs";
 import { build } from "esbuild";
+import { canvasScoreInk } from "./check-canvas-score-render.mjs";
 
 // Own headless browsers and local sites only; no user profiles or model calls.
 const root = resolve(import.meta.dirname, "..");
@@ -15,6 +16,8 @@ const holdFocus = process.argv.includes("--hold-focus");
 const historicalInput = process.argv.includes("--historical-input");
 const frameProducer = process.argv.includes("--frame-producer");
 const resultFrames = process.argv.includes("--result-frames");
+const settleResult = process.argv.includes("--settle-result");
+const diagnoseDraw = process.argv.includes("--diagnose-draw");
 const productionFrameProducer = (await readFile(resolve(root,"src/extension/visual-transport.ts"),"utf8")).includes('"Page.startScreencast"');
 const extensionProbe = process.argv.includes("--extension") || transportProbe;
 const extension = resolve(directory, "extension");
@@ -96,11 +99,15 @@ report.transport = transportProbe ? "product_visual_transport_worker" : extensio
 report.focus_held_for_owned_probe = holdFocus;
 report.native_input_timestamp = historicalInput ? "historical_test_build" : "production";
 report.temporary_frame_producer = frameProducer;
+report.passive_result_settle = settleResult;
+report.fixture_draw_diagnostic = diagnoseDraw;
 report.frame_producer_in_product = productionFrameProducer;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const server = createServer((request, response) => {
   response.writeHead(200, { "Content-Type": "text/html" });
-  response.end(canvasFixtureHtml(resultFrames&&request.url.endsWith('/fill')?"fill":"single"));
+  let html=canvasFixtureHtml(resultFrames&&request.url.endsWith('/fill')?"fill":"single");
+  if(diagnoseDraw)html=html.replace("window.canvasBounds=","const originalFillText=ctx.fillText.bind(ctx);window.fixtureDraws=[];ctx.fillText=(...args)=>{fixtureDraws.push({text:args[0],x:args[1],y:args[2],font:ctx.font,fill:ctx.fillStyle,width:ctx.measureText(args[0]).width,at:performance.now()});return originalFillText(...args);};window.canvasBounds=");
+  response.end(html);
 });
 await new Promise(resolveReady => server.listen(0, "127.0.0.1", resolveReady));
 const port = server.address().port;
@@ -184,7 +191,12 @@ async function runBrowser(name, path) {
           step.changed = previous ? previous !== shot.data : null;
           previous = shot.data;
           step.file = resolve(directory, `${name}-${target.index}-${label}.png`);
-          await writeFile(step.file, Buffer.from(shot.data, "base64"));
+          const pixels=Buffer.from(shot.data,"base64");
+          await writeFile(step.file,pixels);
+          if(transportProbe&&resultFrames&&label.startsWith("final")) {
+            step.fixture_score_ink=canvasScoreInk(pixels);
+            if(step.fixture_score_ink<40)step.render_error="Final fixture score has no visible text pixels";
+          }
           step.website = await target.evaluate("({visibility:document.visibilityState,selected:canvasState.selected,events:canvasState.events})");
         } catch (error) { step.error = error.message; }
         finally { if (cycleFocus && !transportProbe) await target.send("Emulation.setFocusEmulationEnabled", { enabled: false }); }
@@ -215,9 +227,11 @@ async function runBrowser(name, path) {
         await screenshot('answered');
         await click(88,Date.now()/1000,148);
         await screenshot('final');
+        if(settleResult){await sleep(11000);await screenshot('final-settled');}
         const bitmap=await target.evaluate("document.querySelector('canvas').toDataURL('image/png')");
         const file=resolve(directory,`${name}-${target.index}-backing-bitmap.png`);
         await writeFile(file,Buffer.from(bitmap.split(',')[1],'base64'));
+        if(diagnoseDraw){result.draw_diagnostics??=[];result.draw_diagnostics.push({site:target.url,state:await target.evaluate("({completed:canvasState.completed,text:canvasState.text,draws:fixtureDraws})")});}
         result.backing_bitmaps??=[];result.backing_bitmaps.push({site:target.url,file,canvas_pixels_modified:false});
         return;
       }
@@ -246,7 +260,7 @@ try {
   server.close();
   report.finished_at = new Date().toISOString();
   report.passed = report.browsers.length === 2 && report.browsers.every(browser =>
-    browser.errors.length === 0 && browser.steps.length === 8 && browser.steps.every(step => !step.error));
+    browser.errors.length === 0 && browser.steps.length === (settleResult&&resultFrames?10:8) && browser.steps.every(step => !step.error && !step.render_error));
   if (!report.passed) process.exitCode = 1;
   await writeFile(resolve(directory, "report.json"), JSON.stringify(report, null, 2));
   console.log("FINAL", JSON.stringify(report));

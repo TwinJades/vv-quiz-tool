@@ -1,5 +1,5 @@
 import {describe,it,expect} from 'vitest';
-import {authorizedTestModel} from '../../scripts/authorized-test-model.mjs';
+import {authorizedTestModel,assertAcceptanceProvider} from '../../scripts/authorized-test-model.mjs';
 const configured=['gemini-3.1-pro-low','gemini-3.7-flash-high','gemini-3.8-flash-high','unapproved-model'];
 const available=[...configured];
 describe('real acceptance model authorization',()=>{
@@ -17,5 +17,24 @@ describe('real acceptance model authorization',()=>{
       {selected_model:'gemini-3.1-pro-low',results:[{snapshot:{state:'PAUSED',notice:'Provider is temporarily unavailable. HTTP 503.'}}]}])expect(()=>authorizedTestModel({configured,available,requested,fallbackEvidence})).toThrow('failure report');
     const fallbackEvidence={selected_model:'gemini-3.8-flash-high',results:[{snapshot:{state:'PAUSED',notice:'Provider is temporarily unavailable. HTTP 503.'}}]};
     expect(authorizedTestModel({configured,available,requested,fallbackEvidence})).toMatchObject({id:requested,fallback:true});
+  });
+});
+
+describe('user-selected EasyCPA route',()=>{
+  it('accepts only the assigned endpoint without changing saved configuration',()=>{
+    for(const base_url of ['http://127.0.0.1:8317/v1','http://127.0.0.1:8317/v1/']){
+      const profile={base_url};expect(()=>assertAcceptanceProvider(profile)).not.toThrow();
+      expect(profile.base_url).toBe(base_url);
+    }
+  });
+  it('rejects historical ports, other services and missing routes',()=>{
+    for(const base_url of [undefined,'http://127.0.0.1:18080/v1','http://127.0.0.1:8317','http://localhost:8317/v1','https://api.openai.com/v1','http://127.0.0.1:8317/v1?route=other','http://127.0.0.1:8317/v1#other']){
+      expect(()=>assertAcceptanceProvider({base_url})).toThrow('user-selected EasyCPA');
+    }
+  });
+  it('does not include a rejected route or embedded secret in errors',()=>{
+    const base_url='http://fixture-secret@127.0.0.1:18080/v1';
+    try{assertAcceptanceProvider({base_url});throw new Error('guard did not reject');}
+    catch(error){expect(error.message).toContain('user-selected EasyCPA');expect(error.message).not.toContain('fixture-secret');expect(error.message).not.toContain('18080');}
   });
 });

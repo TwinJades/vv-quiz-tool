@@ -34,6 +34,33 @@ describe("visual execution and independent verification", () => {
       timer: (countdown: boolean | null, seconds: number) => { current.timer_is_countdown = countdown; current.timer_remaining_seconds = seconds; } };
   }
   const signal = () => new AbortController().signal;
+  it.each([false,true])('reuses a prior control point only when its local pixels are unchanged (button changed=%s)', async (buttonChanged) => {
+    const {platform,driver,recognize}=setup();
+    const captureFrame=driver.capture.getMockImplementation()!;
+    driver.capture.mockImplementation(async (sessionId,observationId)=>{
+      const frame=await captureFrame(sessionId,observationId);
+      // Only the answer region changes; the submit-button tiles remain exact.
+      const hashes=Array.from({length:228},()=> 'a'.repeat(64));
+      const selected=JSON.parse(frame.frame.fingerprint).questions[0]?.options[0]?.selected;
+      hashes[0]=selected ? 'b'.repeat(64) : 'a'.repeat(64);
+      if(selected && buttonChanged)hashes[7*19+13]='b'.repeat(64);
+      frame.frame.pixel_tiles={size:16,columns:19,rows:12,hashes};
+      return frame;
+    });
+    const read=recognize.getMockImplementation()!;
+    recognize.mockImplementation(async (capture,abort,context)=>{
+      const next=await read(capture,abort,context);
+      if(next.questions[0]?.options[0]?.selected)next.controls[0]!.point={x:220,y:170};
+      return next;
+    });
+    const observed=await platform.observeSession('s1',signal()),item=observed.questions[0]!;
+    await platform.execute({schema_version:'1.0',session_id:'s1',question_id:item.question.question_id,
+      observation_id:observed.observation_id,strategy:'unattended',preconditions:[],
+      actions:[{action_id:'select',kind:'set_selected',target_id:item.question.options[0]!.id,value:true},
+        {action_id:'submit',kind:'submit_session',target_id:'control_submit_session'}]},item.locator_map,signal());
+    expect(driver.click).toHaveBeenLastCalledWith(expect.objectContaining({y:buttonChanged?170:120}),expect.anything(),expect.anything());
+    expect((await platform.readState(signal())).completed).toBe(!buttonChanged);
+  });
   it('stops when the same visible control is reclassified during answer verification',async()=>{
     const {platform,driver,controlRole}=setup();
     controlRole('submit');

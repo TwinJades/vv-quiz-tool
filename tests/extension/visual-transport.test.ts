@@ -55,6 +55,24 @@ describe("visual input after waiting for the shared transport queue", () => {
   }
   const signal = () => new AbortController().signal;
 
+  it('retains the original viewport on the first crop and checks the same scope before native input',async()=>{
+    const test=setup();
+    test.geometry.isolated_canvas=true;
+    test.geometry.region={x:8,y:10,width:60,height:50};
+    const first=await test.transport.capture('s','o',signal());
+    expect(first.frame).toMatchObject({width:60,height:50,geometry:{region:{x:8,y:10,width:60,height:50}}});
+    expect(first.viewport_context).toMatchObject({width:100,height:100,data:new Uint8Array([1])});
+    const second=await test.transport.capture('s','o',signal());
+    expect(second.viewport_context).toBeUndefined();
+    await test.transport.click({x:38,y:35},signal(),second.frame);
+    expect(vi.mocked(chrome.debugger.sendCommand).mock.calls.find(call=>call[1]==='Input.dispatchMouseEvent')?.[2]).toMatchObject({x:38,y:35});
+    test.geometry.region={x:0,y:0,width:100,height:100};test.geometry.isolated_canvas=false;
+    const pointers=test.commands.filter(command=>command==='Input.dispatchMouseEvent').length;
+    await expect(test.transport.click({x:38,y:35},signal(),second.frame)).rejects.toThrow('PAGE_CHANGED');
+    expect(test.commands.filter(command=>command==='Input.dispatchMouseEvent')).toHaveLength(pointers);
+    await test.transport.close();
+  });
+
   it("keeps the frame producer through Canvas input and releases it when a render wait is cancelled", async () => {
     const test=setup();test.geometry.canvas_surface=true;
     const frame=(await test.transport.capture("s","o",signal())).frame;
