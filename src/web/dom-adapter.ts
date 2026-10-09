@@ -12,9 +12,11 @@ import {
   type QuestionFrame,
   type ReadinessResult,
 } from "../core";
-import { dispatchValueEvents, elementText, fnv1a, isExplicitlyHidden, labelText, normalizedText } from "./dom-utils";
+import { dispatchValueEvents, elementText, fnv1a, isExplicitlyHidden, labelText, normalizedText, requireClickable, isElementType } from "./dom-utils";
+import {recordTestEvent} from '../extension/test-hooks';
 import { SeparationTrial, cleanedVisibleText } from "./separation-trial";
 import type { InitialSemanticSnapshot, InitialSemanticReading } from "./initial-snapshot";
+import { SemanticDomMapping, semanticRoots, semanticQuestion, semanticOptionType, semanticOptionLabel, semanticSelected } from './semantic-dom-mapping';
 import type { LocalStructure, SeparationRoles, SeparationSnapshot } from "./separation-trial";
 import { ZHIDAO_CHOICE_SELECTOR, ZHIDAO_NEXT_SELECTOR, isZhidaoChoice, isZhidaoNext, readZhidaoPractice, resolveZhidaoPracticeSubmit, zhidaoRadioRoot, zhidaoPracticeRoot, zhidaoSelected, zhidaoStem } from './zhidao-practice';
 
@@ -53,6 +55,7 @@ const QUESTION_ROOT_SELECTORS = [
   "[role='radiogroup']",
   "[role='group']",
   ".exam-test .questionContent",
+  ".TiMu.newTiMu",
 ];
 
 const SUPPORTED_CONTROL_SELECTOR = [
@@ -79,6 +82,7 @@ function randomId(prefix: string): string {
 }
 
 function supportedInput(element: Element): boolean {
+  if (element.classList.contains('disabled') || element.classList.contains('is-disabled')) return false;
   if (element.matches(ZHIDAO_CHOICE_SELECTOR) && !isZhidaoChoice(element)) return false;
   if (element.matches(ZHIDAO_NEXT_SELECTOR) && !isZhidaoNext(element)) return false;
   if (element.getAttribute("aria-disabled") === "true") return false;
@@ -96,6 +100,8 @@ function hasVisibleQuestionSetGrade(root: HTMLElement): boolean {
 }
 
 function choiceControls(root: HTMLElement, role: 'radio' | 'checkbox'): HTMLElement[] {
+  const mapped = semanticQuestion(root);
+  if (mapped) return (mapped.type === 'single_choice' && role === 'radio' || mapped.type === 'multiple_choice' && role === 'checkbox') ? mapped.options : [];
   if (zhidaoRadioRoot(root) === root) {
     // The root is already validated. Resolve its direct choice list locally
     // rather than asking a descendant query to match ancestors outside it.
@@ -112,6 +118,7 @@ function choiceControls(root: HTMLElement, role: 'radio' | 'checkbox'): HTMLElem
 }
 
 function selectedChoice(element: HTMLElement): boolean {
+  if (semanticOptionType(element)) return semanticSelected(element);
   if (isZhidaoChoice(element)) return zhidaoSelected(element);
   if (element.tagName === "INPUT" && ["radio", "checkbox"].includes((element as HTMLInputElement).type)) {
     return (element as HTMLInputElement).checked;
@@ -123,14 +130,16 @@ function selectedChoice(element: HTMLElement): boolean {
 }
 
 function optionLabel(document: Document, control: HTMLElement): string {
+  if (control.matches('.h5p-answer')) {
+    const alternative = control.querySelector('.h5p-alternative-inner');
+    if (alternative) return elementText(alternative);
+  }
+  const mappedLabel = semanticOptionLabel(control);
+  if (mappedLabel) return mappedLabel;
   if (isZhidaoChoice(control)) return elementText(control.querySelector(':scope > .stem'));
   const zhidaoRoot = zhidaoPracticeRoot(control);
   if (zhidaoRoot && control.matches('input.el-checkbox__original[type="checkbox"]')) {
     return elementText(control.closest('label.el-checkbox')?.querySelector(':scope > .el-checkbox__label > pre.preStyle') ?? null);
-  }
-  if (control.matches('.h5p-answer')) {
-    const alternative = control.querySelector('.h5p-alternative-inner');
-    if (alternative) return elementText(alternative);
   }
   const labelElement = control.closest("label") ??
     (control.id ? document.querySelector<HTMLElement>(`label[for='${CSS.escape(control.id)}']`) : null) ??
@@ -147,6 +156,13 @@ function optionLabel(document: Document, control: HTMLElement): string {
     : spacedText || labelText(document, control);
 }
 
+function h5pChoiceIdentity(document: Document, control: HTMLElement, index: number): string {
+  const images = Array.from(control.querySelectorAll<HTMLImageElement>('img'))
+    .map(image => image.currentSrc || image.src).filter(Boolean).sort();
+  const text = optionLabel(document, control) || (images.length ? '' : `Option ${index + 1}`);
+  return JSON.stringify({ text, images });
+}
+
 function collectContexts(document: Document): ParentNode[] {
   const contexts: ParentNode[] = [document];
   const queue: ParentNode[] = [document];
@@ -159,7 +175,7 @@ function collectContexts(document: Document): ParentNode[] {
         contexts.push(element.shadowRoot);
         queue.push(element.shadowRoot);
       }
-      if (element instanceof HTMLIFrameElement) {
+      if (isElementType(element,'iframe')) {
         try {
           if (element.contentDocument) {
             contexts.push(element.contentDocument);
@@ -180,6 +196,8 @@ function queryAllDeep<T extends Element>(document: Document, selector: string): 
 }
 
 function candidateRoots(document: Document): HTMLElement[] {
+  const mapped = semanticRoots(document);
+  if (mapped.length) return mapped;
   const h5pQuestions = queryAllDeep<HTMLElement>(document, ".h5p-question")
     .filter((element) => !isExplicitlyHidden(element))
     .filter((element) => {
@@ -268,26 +286,27 @@ function questionRootScore(root: HTMLElement): number {
 }
 
 function elementInputName(element: HTMLElement): string {
-  return element instanceof HTMLInputElement || element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement
+  return isElementType(element,'input') || isElementType(element,'select') || isElementType(element,'textarea')
     ? normalizedText(element.name)
     : normalizedText(element.getAttribute("name"));
 }
 
 function elementInputValue(element: HTMLElement): string {
-  const value = element instanceof HTMLInputElement || element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement
+  const value = isElementType(element,'input') || isElementType(element,'select') || isElementType(element,'textarea')
     ? normalizedText(element.value)
     : normalizedText(element.getAttribute("value"));
   return value === "on" ? "" : value;
 }
 
 function targetText(document: Document, element: HTMLElement): string {
+  if (semanticOptionType(element)) return optionLabel(document, element);
   if (isZhidaoChoice(element) || element.matches("input[type='radio'], input[type='checkbox'], [role='radio'], [role='checkbox']")) {
     return optionLabel(document, element);
   }
   if (element.matches("input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']")) {
     return labelText(document, element) || normalizedText(element.getAttribute("placeholder") || element.getAttribute("name"));
   }
-  return normalizedText(element instanceof HTMLInputElement ? element.value : element.getAttribute("aria-label") || element.textContent);
+  return normalizedText(isElementType(element,'input') ? element.value : element.getAttribute("aria-label") || element.textContent);
 }
 
 function targetIdentity(
@@ -319,7 +338,7 @@ function questionStem(document: Document, root: HTMLElement): string {
   }
 
   const progressOnly = (text: string) => /^(?:question|题目)\s*\d+\s*(?:of|\/|共)\s*\d+\s*[:：]?$/i.test(text);
-  const semantic = root.querySelector<HTMLElement>("[data-question-stem], .question-text, .question-title, .stem");
+  const semantic = root.querySelector<HTMLElement>("[data-question-stem], .question-text, .question-title, .stem, :scope >.Zy_TItle");
   const semanticText = elementText(semantic);
   if (semanticText && !progressOnly(semanticText)) return semanticText;
 
@@ -343,7 +362,7 @@ function questionStem(document: Document, root: HTMLElement): string {
     .find((text) => text && !progressOnly(text));
   if (paragraphText) return paragraphText;
 
-  if (root instanceof HTMLFormElement) {
+  if (isElementType(root,'form')) {
     let sibling = root.previousElementSibling;
     for (let checked = 0; sibling && checked < 3; checked += 1, sibling = sibling.previousElementSibling) {
       if (sibling.matches("[data-question-stem], .question-text, .stem, h1, h2, h3, h4, h5, h6, p")) {
@@ -376,7 +395,10 @@ function questionStem(document: Document, root: HTMLElement): string {
 }
 
 function semanticStem(document: Document, root: HTMLElement): { text: string; hasMath: boolean } {
-  const base = questionStem(document, root);
+  const mapped = semanticQuestion(root);
+  const base = mapped ? mapped.stems
+    .filter(element => mapped.type !== 'fill_blank' || !mapped.blanks.some(blank => element.contains(blank)))
+    .map(element => cleanedVisibleText(document, element, Number.MAX_SAFE_INTEGER)).join(' ') : questionStem(document, root);
   const mathSources = Array.from(
     root.querySelectorAll<HTMLElement>("annotation[encoding='application/x-tex'], [data-tex]"),
   )
@@ -405,7 +427,7 @@ function blankQuestionStem(root: HTMLElement, controls: HTMLElement[], heading: 
   };
   const context = normalizedText(walk(root)).slice(0, 4_000);
   if (!context) return heading;
-  return heading && !context.includes(heading) ? `${heading}\n${context}`.slice(0, 4_000) : context;
+  return context;
 }
 
 function imageMedia(
@@ -435,6 +457,7 @@ function imageMedia(
 export class DomWebAdapter implements PlatformAdapter {
   readonly #document: Document;
   #targets = new Map<string, DomTarget>();
+  #choiceIds = new WeakMap<HTMLElement, { context: string; ids: Map<string, string> }>();
   #mediaSources = new Map<string, MediaSource>();
   #currentObservation: PlatformObservation | undefined;
   #currentLocator: LocatorMap | undefined;
@@ -442,12 +465,15 @@ export class DomWebAdapter implements PlatformAdapter {
   #calibratedRoot: HTMLElement | null = null;
   #initialCandidates = new Map<string, { root: HTMLElement; fingerprint: string }>();
   #initialRoots: HTMLElement[] = [];
+  #nativeInitialRoots: HTMLElement[] = [];
   #initialDocumentIdentity: string | null = null;
+  readonly #semanticMapping: SemanticDomMapping;
   #pageQuestions: Array<{ adapter: DomWebAdapter; prefix: string; parsed: PlatformObservation["questions"][number] }> = [];
 
   constructor(document: Document, private readonly rootOverride?: HTMLElement, private readonly courseScope?: HTMLElement) {
     this.#document = document;
     this.#separationTrial = new SeparationTrial(document);
+    this.#semanticMapping = new SemanticDomMapping(document);
   }
 
   /** Release only our temporary references; the website's answers stay intact. */
@@ -461,7 +487,9 @@ export class DomWebAdapter implements PlatformAdapter {
     this.#calibratedRoot = null;
     this.#initialCandidates.clear();
     this.#initialRoots = [];
+    this.#nativeInitialRoots = [];
     this.#initialDocumentIdentity = null;
+    this.#semanticMapping.clear();
     this.#separationTrial = new SeparationTrial(this.#document);
   }
 
@@ -479,7 +507,8 @@ export class DomWebAdapter implements PlatformAdapter {
     if (blocker) throw new Error(`HARD_BLOCKER:${blocker}`);
     this.#initialCandidates.clear();
     this.#initialDocumentIdentity = this.#documentIdentity();
-    const regions = candidateRoots(this.#document).filter(root => root.ownerDocument === this.#document).slice(0, 64).map(root => {
+    const scope=this.courseScope??this.rootOverride??this.#document.body;
+    const regions = candidateRoots(this.#document).filter(root => root.ownerDocument === this.#document && scope.contains(root) && !semanticQuestion(root)).slice(0, 64).map(root => {
       const region_id = randomId("initial_region");
       this.#initialCandidates.set(region_id, { root, fingerprint: this.#initialFingerprint(root) });
       return { region_id, text: cleanedVisibleText(root.ownerDocument, root, 4_000),
@@ -488,7 +517,10 @@ export class DomWebAdapter implements PlatformAdapter {
             text: (isZhidaoChoice(e) ? optionLabel(root.ownerDocument, e) : labelText(root.ownerDocument, e)).slice(0, 300), disabled: !supportedInput(e) })) };
     });
     // Empty candidates still go to the model; discovery is not a readiness gate.
-    return { visible_text: cleanedVisibleText(this.#document, this.#document.body, 20_000), regions };
+    const visibleText=cleanedVisibleText(this.#document,scope,100001);
+    if(visibleText.length>100000)throw new Error('SEMANTIC_LIMIT: visible page text exceeds 100000 characters.');
+    return { visible_text: visibleText, regions,rendered_text_required:scope.closest('.font-cxsecret')!==null||Array.from(scope.querySelectorAll('.font-cxsecret')).some(element=>!isExplicitlyHidden(element)),
+      elements: this.#semanticMapping.capture(scope) };
   }
 
   #initialFingerprint(root: HTMLElement): string {
@@ -505,20 +537,36 @@ export class DomWebAdapter implements PlatformAdapter {
     if (blocker) throw new Error(`HARD_BLOCKER:${blocker}`);
     if (this.#initialDocumentIdentity !== this.#documentIdentity() || !reading.region_ids.length ||
       new Set(reading.region_ids).size !== reading.region_ids.length) return false;
-    const chosen = reading.region_ids.map(id => this.#initialCandidates.get(id));
+    const customReadings = reading.questions ?? [];
+    if (customReadings.some(question => !reading.region_ids.includes(question.region_id)) ||
+      new Set(customReadings.map(question => question.region_id)).size !== customReadings.length) return false;
+    const nativeIds = reading.region_ids.filter(id => !customReadings.some(question => question.region_id === id));
+    const chosen = nativeIds.map(id => this.#initialCandidates.get(id));
     if (chosen.some(item => !item || !item.root.isConnected || isExplicitlyHidden(item.root) ||
       item.fingerprint !== this.#initialFingerprint(item.root))) return false;
-    const roots = chosen.map(item => item!.root);
+    const customRoots = customReadings.length ? this.#semanticMapping.apply(customReadings) : [];
+    if (!customRoots) return false;
+    if (!customReadings.length) this.#semanticMapping.clear();
+    const roots = [...new Set(reading.region_ids.map(id => {
+      const index = customReadings.findIndex(question => question.region_id === id);
+      return index >= 0 ? customRoots[index]! : this.#initialCandidates.get(id)!.root;
+    }))];
     if (roots.some(root => roots.some(other => root !== other && root.contains(other)))) return false;
     if (roots.some((root, index) => index > 0 &&
       !(roots[index - 1]!.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING))) return false;
     this.#initialRoots = roots;
+    this.#nativeInitialRoots = chosen.map(item => item!.root);
     this.#initialCandidates.clear();
     this.#initialDocumentIdentity = null;
     return true;
   }
 
   #liveInitialRoots(): HTMLElement[] {
+    if (this.#semanticMapping.hasStructure()) {
+      this.#initialRoots = [...new Set([...this.#nativeInitialRoots.filter(root => root.isConnected && !isExplicitlyHidden(root)), ...this.#semanticMapping.roots()])]
+        .sort((left, right) => left === right ? 0 : left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+      return this.#initialRoots;
+    }
     if (this.#initialRoots.some(root => !root.isConnected || isExplicitlyHidden(root))) this.#initialRoots = [];
     return this.#initialRoots;
   }
@@ -585,10 +633,11 @@ export class DomWebAdapter implements PlatformAdapter {
       if (signal.aborted) return { ready: false, reason: "cancelled" };
       const blocker = this.detectHardBlocker();
       if (blocker) return { ready: false, reason: blocker };
+      if (this.#semanticMapping.needsRecognition()) return { ready: false, reason: 'semantic_structure_changed' };
       const roots = (this.#liveInitialRoots().length ? this.#initialRoots : this.#calibratedRoot?.isConnected ? [this.#calibratedRoot] : candidateRoots(this.#document))
         .filter(root=>!this.courseScope||this.courseScope.contains(root));
       const activeRoot = roots[0];
-      if (activeRoot && Array.from(activeRoot.querySelectorAll("textarea, [contenteditable='true']"))
+      if (activeRoot && !semanticQuestion(activeRoot) && Array.from(activeRoot.querySelectorAll("textarea, [contenteditable='true']"))
         .some((element) => !isExplicitlyHidden(element) && supportedInput(element))) {
         return { ready: false, reason: "unsupported_subjective_question" };
       }
@@ -628,7 +677,7 @@ export class DomWebAdapter implements PlatformAdapter {
     if (roots.length > 1 && !this.rootOverride) return this.#observePage(roots, sessionId, signal, mode);
     this.#pageQuestions = [];
     const root = roots[0]!;
-    if (Array.from(root.querySelectorAll("textarea, [contenteditable='true']"))
+    if (!semanticQuestion(root) && Array.from(root.querySelectorAll("textarea, [contenteditable='true']"))
       .some((element) => !isExplicitlyHidden(element) && supportedInput(element))) {
       throw new Error("HARD_BLOCKER:unsupported_subjective_question");
     }
@@ -724,6 +773,7 @@ export class DomWebAdapter implements PlatformAdapter {
       }
       this.#targets.set(action.target_id, target);
       try {
+        requireClickable(target.element);
         if (action.kind === "set_selected") {
           this.#setSelected(target, action.value);
         } else if (action.kind === "set_value") {
@@ -741,6 +791,7 @@ export class DomWebAdapter implements PlatformAdapter {
         });
       }
     }
+    recordTestEvent('dom-execute',{kind:'execute',actions:plan.actions.map(action=>({kind:action.kind,target:action.target_id})),fingerprint:locatorMap.question_fingerprint,result:results});
     return results;
   }
 
@@ -835,8 +886,8 @@ export class DomWebAdapter implements PlatformAdapter {
       : /\bincorrect\b|\bwrong\b|回答错误|答错/i.test(feedbackEvidence)
         ? "incorrect"
         : null);
-    const editableAnswerTarget = [...this.#targets.entries()].some(([targetId, target]) => {
-      if (targetId.startsWith("control_")) return false;
+    const editableAnswerTarget = [...this.#targets.values()].some(target => {
+      if (target.identity.role !== 'option' && target.identity.role !== 'blank') return false;
       return !isExplicitlyHidden(target.element) && supportedInput(target.element);
     });
     const pathname = this.#document.location?.pathname ?? "";
@@ -865,13 +916,14 @@ export class DomWebAdapter implements PlatformAdapter {
       !Array.from(feedbackRoot!.querySelectorAll(SUPPORTED_CONTROL_SELECTOR))
         .some(element => !isExplicitlyHidden(element) && supportedInput(element));
     const personalSessionScore = this.#readPersonalSessionScore();
-    return {
+    const result:PlatformState = {
       observation_id: this.#currentObservation?.observation_id ?? "none",
       timer_remaining_seconds: this.#readTimer(),
       fingerprint: this.#fingerprintCurrentQuestion(),
       selected_target_ids: selectedTargetIds,
       field_values: fieldValues,
       feedback,
+      question_graded: Boolean(localGrading),
       ...(feedbackEvidence.trim() ? { feedback_text: feedbackEvidence.trim() } : {}),
       ...(personalSessionScore || visibleScore ? { visible_score: personalSessionScore ?? visibleScore! } : {}),
       can_retry:
@@ -881,12 +933,14 @@ export class DomWebAdapter implements PlatformAdapter {
       has_session_submit: sessionSubmit !== null,
       at_last_question: position !== null && position.current >= position.total,
       completed:
-        (!this.courseScope && completedPath) ||
+        (!this.courseScope && completedPath && !editableAnswerTarget && this.#fingerprintCurrentQuestion()==='missing') ||
         personalSessionScore !== null ||
         standaloneH5pResult ||
         scoredResult ||
-        (!gradedQuestionSet && /quiz complete|test complete|interview complete|your results?|测验完成|测试完成|答题完成|已交卷/i.test(pageText)),
+        (!gradedQuestionSet && !editableAnswerTarget && this.#fingerprintCurrentQuestion()==='missing' && /quiz complete|test complete|interview complete|your results?|测验完成|测试完成|答题完成|已交卷/i.test(pageText)),
     };
+    recordTestEvent('dom-state',{kind:'state',fingerprint:result.fingerprint,feedback:result.feedback,feedback_text:result.feedback_text??'',score:result.visible_score??null,can_retry:result.can_retry,has_next:result.has_next,has_session_submit:result.has_session_submit??false,completed:result.completed,field_ids:Object.keys(result.field_values)});
+    return result;
   }
 
   resolveMediaSource(temporaryHandle: string): MediaSource | undefined {
@@ -927,15 +981,11 @@ export class DomWebAdapter implements PlatformAdapter {
   }
 
   detectHardBlocker(): string | null {
-    const text = normalizedText(
-      collectContexts(this.#document)
-        .map((context) =>
-          context.nodeType === Node.DOCUMENT_NODE
-            ? (context as Document).body?.innerText || (context as Document).body?.textContent
-            : context.textContent,
-        )
-        .join(" "),
-    ).slice(0, 8_000);
+    const questionRoots=candidateRoots(this.#document);
+    const text = normalizedText(queryAllDeep<HTMLElement>(this.#document,'[role=dialog],[role=alert],.captcha,.g-recaptcha,.h-captcha,form[action*=login],.login-required,.proctoring')
+      .filter(element=>!isExplicitlyHidden(element)&&!questionRoots.some(root=>root.contains(element)))
+      .map(element=>element.innerText||element.textContent).join(' '));
+    if(queryAllDeep<HTMLElement>(this.#document,'iframe[src*=recaptcha],iframe[src*=hcaptcha]').some(element=>!isExplicitlyHidden(element)))return 'captcha';
     if (/captcha|验证码|人机验证|verify you are human/i.test(text)) return "captcha";
     if (/proctor|监考|screen monitoring|屏幕监控/i.test(text)) return "proctoring";
     if (/sign in to continue|login required|请先登录|登录已失效/i.test(text)) return "authentication";
@@ -1105,7 +1155,7 @@ export class DomWebAdapter implements PlatformAdapter {
     const radioControls = choiceControls(root, 'radio');
     const checkboxControls = choiceControls(root, 'checkbox');
     const select = root.querySelector<HTMLSelectElement>("select:not([multiple])");
-    const textControls = Array.from(
+    const textControls = semanticQuestion(root)?.blanks ?? Array.from(
       root.querySelectorAll<HTMLElement>("input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']"),
     ).filter((element) => !isExplicitlyHidden(element) && (supportedInput(element) || hasVisibleQuestionSetGrade(root)));
 
@@ -1120,6 +1170,17 @@ export class DomWebAdapter implements PlatformAdapter {
     const options: QuestionFrame["options"] = [];
     const blanks: QuestionFrame["blanks"] = [];
     const targets: LocatorMap["targets"] = {};
+    const shuffledChoices = root.matches('.h5p-multichoice') && type !== 'fill_blank';
+    const choiceIdentities = shuffledChoices
+      ? optionControls.map((control, index) => h5pChoiceIdentity(ownerDocument, control, index))
+      : [];
+    const choiceContext = JSON.stringify({ type, stemText, choices: [...choiceIdentities].sort() });
+    let stableChoices = this.#choiceIds.get(root);
+    if (shuffledChoices && stableChoices?.context !== choiceContext) {
+      stableChoices = { context: choiceContext, ids: new Map() };
+      this.#choiceIds.set(root, stableChoices);
+    }
+    const choiceOccurrences = new Map<string, number>();
 
     if (select) {
       Array.from(select.options)
@@ -1144,12 +1205,21 @@ export class DomWebAdapter implements PlatformAdapter {
         });
     } else if (type !== "fill_blank") {
       optionControls.forEach((control, index) => {
-        const id = `opt_${index + 1}`;
+        let id = `opt_${index + 1}`;
+        if (shuffledChoices) {
+          const signature = choiceIdentities[index]!;
+          const occurrence = choiceOccurrences.get(signature) ?? 0;
+          choiceOccurrences.set(signature, occurrence + 1);
+          const key = JSON.stringify([signature, occurrence]);
+          const saved = stableChoices!.ids.get(key);
+          id = saved ?? `opt_${stableChoices!.ids.size + 1}`;
+          if (!saved) stableChoices!.ids.set(key, id);
+        }
         const localRef = randomId("node");
         const label = optionLabel(ownerDocument, control) || `Option ${index + 1}`;
         const labelElement = control.closest("label") ??
           (control.id ? ownerDocument.querySelector(`label[for='${CSS.escape(control.id)}']`) : null);
-        const media = Array.from((labelElement ?? control).querySelectorAll<HTMLImageElement>("img"))
+        const media = [...new Set([...(isElementType(control,'img') ? [control] : []), ...Array.from((labelElement ?? control).querySelectorAll<HTMLImageElement>("img"))])]
           .map((image) => imageMedia(image, this.#mediaSources, "option_image"))
           .filter((item): item is MediaRef => item !== null);
         options.push({ id, text: label, media });
@@ -1164,7 +1234,7 @@ export class DomWebAdapter implements PlatformAdapter {
           id,
           label: labelText(ownerDocument, control),
           required: control.hasAttribute("required") || control.getAttribute("aria-required") === "true",
-          ...(control instanceof HTMLInputElement && control.maxLength > 0
+          ...((isElementType(control,'input')||isElementType(control,'textarea')) && control.maxLength > 0
             ? { max_length: control.maxLength }
             : {}),
         });
@@ -1173,14 +1243,16 @@ export class DomWebAdapter implements PlatformAdapter {
       });
     }
 
-    const nativeSubmit = Array.from(
+    const nativeSubmits = Array.from(
       root.querySelectorAll<HTMLElement>("button[type='submit'], input[type='submit']"),
-    ).find((element) => !isExplicitlyHidden(element) && supportedInput(element));
+    ).filter((element) => !isExplicitlyHidden(element) && supportedInput(element));
+    if(nativeSubmits.length>1)throw new Error('TARGET_UNAVAILABLE: multiple submit controls in one question.');
+    const nativeSubmit=nativeSubmits[0];
     let submit = nativeSubmit && !NEXT_PATTERN.test(targetText(ownerDocument, nativeSubmit))
       ? nativeSubmit
       : this.#findButton(SUBMIT_PATTERN, root);
     // A newly visible H5P Finish is a session control even after Check disappears.
-    if (submit?.matches('button.h5p-question-finish')) submit = null;
+    if (submit?.matches('button.h5p-question-finish') || semanticQuestion(root)?.controls.some(control => control.element === submit && control.role === 'session_submit')) submit = null;
     if (!submit && !this.rootOverride && !this.courseScope && candidateRoots(this.#document).length === 1) {
       const container = root.closest("form, main, [role='main'], [data-vv-quiz], .quiz") ?? root.parentElement;
       const questionForm = root.closest("form");
@@ -1211,7 +1283,8 @@ export class DomWebAdapter implements PlatformAdapter {
       this.#targets.set("control_retry", { kind: "element", element: retry, identity: targetIdentity(ownerDocument, retry, "retry") });
     }
     const sessionSubmit = this.#findButton(SESSION_SUBMIT_PATTERN, this.#document, true);
-    if (sessionSubmit && (this.courseScope || !root.contains(sessionSubmit) || sessionSubmit.matches("button.h5p-question-finish")) && sessionSubmit !== submit) {
+    if (sessionSubmit && (this.courseScope || !root.contains(sessionSubmit) || sessionSubmit.matches("button.h5p-question-finish") ||
+      semanticQuestion(root)?.controls.some(control => control.element === sessionSubmit && control.role === 'session_submit')) && sessionSubmit !== submit) {
       const localRef = randomId("node");
       targets.control_submit_session = { kind: "semantic", local_ref: localRef, role: "button" };
       this.#targets.set("control_submit_session", {
@@ -1225,7 +1298,9 @@ export class DomWebAdapter implements PlatformAdapter {
       .filter((image) => !image.closest("label"))
       .map((image) => imageMedia(image, this.#mediaSources, "question_diagram"))
       .filter((item): item is MediaRef => item !== null);
-    const fingerprintSource = JSON.stringify({ type, stemText, options: options.map((option) => option.text), blanks: blanks.length });
+    const fingerprintSource = JSON.stringify({ type, stemText,
+      options: shuffledChoices ? [...choiceIdentities].sort() : options.map((option) => [option.text,option.media.map(media=>this.#mediaSources.get(media.temporary_handle)?.source_url)]),
+      images:Array.from(root.querySelectorAll<HTMLImageElement>('img')).filter(image=>!isExplicitlyHidden(image)&&!image.closest('label')).map(image=>[image.currentSrc||image.src,image.alt]),blanks: blanks.length });
     const questionFingerprint = fnv1a(fingerprintSource);
     for (const target of this.#targets.values()) target.identity.question_fingerprint = questionFingerprint;
     const questionId = `q_${questionFingerprint}`;
@@ -1284,6 +1359,7 @@ export class DomWebAdapter implements PlatformAdapter {
       return;
     }
     const current = selectedChoice(element);
+    if (semanticOptionType(element) === 'single_choice' && !value) return;
     if (current !== value) element.click();
   }
 
@@ -1294,7 +1370,10 @@ export class DomWebAdapter implements PlatformAdapter {
       const input = element as HTMLInputElement | HTMLTextAreaElement;
       if (input.disabled || input.readOnly) throw new Error("Target is not editable.");
       input.focus();
-      input.value = value;
+      const prototype = input.tagName==='TEXTAREA' ? input.ownerDocument.defaultView!.HTMLTextAreaElement.prototype : input.ownerDocument.defaultView!.HTMLInputElement.prototype;
+      const setter=Object.getOwnPropertyDescriptor(prototype,'value')?.set;
+      if(!setter)throw new Error('TARGET_UNAVAILABLE: native input setter is unavailable.');
+      setter.call(input,value);
       dispatchValueEvents(input);
     } else if (element.isContentEditable) {
       element.focus();
@@ -1306,29 +1385,41 @@ export class DomWebAdapter implements PlatformAdapter {
   }
 
   #findButton(pattern: RegExp, within: ParentNode = this.#document, includeDisabled = false): HTMLElement | null {
+    if(within===this.#document&&pattern!==SESSION_SUBMIT_PATTERN&&(this.courseScope||this.rootOverride))within=this.courseScope??this.rootOverride!;
+    const role = pattern === NEXT_PATTERN ? 'next' : pattern === SUBMIT_PATTERN ? 'submit' :
+      pattern === SESSION_SUBMIT_PATTERN ? 'session_submit' : pattern === RETRY_PATTERN ? 'retry' : null;
+    if (role) {
+      const controls = semanticRoots(this.#document).flatMap(root => semanticQuestion(root)?.controls ?? [])
+        .filter(control => control.role === role && (within === this.#document || within.contains(control.element)) &&
+          !isExplicitlyHidden(control.element) && (includeDisabled || supportedInput(control.element)));
+      if (controls.length === 1) return controls[0]!.element;
+      if (controls.length > 1) throw new Error('TARGET_UNAVAILABLE: multiple mapped controls share one role.');
+    }
     if(pattern===SESSION_SUBMIT_PATTERN){
       const practiceSubmit=resolveZhidaoPracticeSubmit(this.#document);
       if(practiceSubmit && (within===this.#document || within.contains(practiceSubmit)) &&
         (!this.courseScope || this.courseScope.contains(practiceSubmit)))return practiceSubmit;
     }
-    const selector = "button, input[type='submit'], input[type='button'], [role='button'], a.h5p-question-next" +
+    const selector = "button, input[type='submit'], input[type='button'], [role='button'], a" +
       (pattern === NEXT_PATTERN ? `, ${ZHIDAO_NEXT_SELECTOR}` : '');
     const candidates =
       within === this.#document
         ? queryAllDeep<HTMLElement>(this.#document, selector)
         : Array.from(within.querySelectorAll<HTMLElement>(selector));
-    return (
-      candidates
+    const mappedControls = semanticRoots(this.#document).flatMap(root => semanticQuestion(root)?.controls ?? []);
+    const matches = candidates
+        .filter(element => !mappedControls.some(control => control.element === element && control.role !== role))
         .filter((element) => (!this.courseScope || this.courseScope.contains(element)) && !isExplicitlyHidden(element) && (includeDisabled || supportedInput(element)))
-        .find((element) =>
+        .filter((element) =>
           (pattern === SUBMIT_PATTERN && element.matches("button.h5p-question-check-answer")) ||
           (pattern === SESSION_SUBMIT_PATTERN && element.matches("button.h5p-question-finish")) ||
           (pattern === RETRY_PATTERN && element.matches("button.h5p-question-try-again")) ||
           pattern.test(normalizedText(
             element.tagName === "INPUT" ? (element as HTMLInputElement).value : element.getAttribute("aria-label") || element.textContent,
           )),
-        ) ?? null
-    );
+        );
+    if(matches.length>1)throw new Error('TARGET_UNAVAILABLE: multiple controls match the requested action.');
+    return matches[0]??null;
   }
 
   #fingerprintCurrentQuestion(): string {
@@ -1369,7 +1460,11 @@ export class DomWebAdapter implements PlatformAdapter {
       : (radioControls.length > 0 ? radioControls : checkboxControls)
           .map((element, index) => optionLabel(root.ownerDocument, element) || `Option ${index + 1}`);
     const blanks = textControls.length;
-    return fnv1a(JSON.stringify({ type, stemText: stem, options, blanks }));
+    const fingerprintOptions = root.matches('.h5p-multichoice')
+      ? (radioControls.length > 0 ? radioControls : checkboxControls)
+          .map((control, index) => h5pChoiceIdentity(root.ownerDocument, control, index)).sort()
+      : options;
+    return fnv1a(JSON.stringify({ type, stemText: stem, options: fingerprintOptions, blanks }));
   }
 
   #readTimer(): number | null {
@@ -1398,6 +1493,7 @@ export class DomWebAdapter implements PlatformAdapter {
   }
 
   #readQuestionTotal(): number | null {
+    if (this.#semanticMapping.hasStructure()) return this.#readQuestionPosition()?.total ?? null;
     const zhidaoProgress = readZhidaoPractice(this.#document);
     if (zhidaoProgress) return zhidaoProgress.total;
     const h5pProgress = this.#readH5pProgress();
@@ -1423,6 +1519,13 @@ export class DomWebAdapter implements PlatformAdapter {
     if (zhidaoProgress) return { current: zhidaoProgress.current, total: zhidaoProgress.total };
     const h5pProgress = this.#readH5pProgress();
     if (h5pProgress) return h5pProgress;
+    if (this.#semanticMapping.hasStructure()) {
+      const text = cleanedVisibleText(this.#document, this.#document.body, Number.MAX_SAFE_INTEGER);
+      const ratios = [...text.matchAll(/(?:^|\s)(\d+)\s*\/\s*(\d+)(?=\s|$)/g)]
+        .map(match => ({ current: Number(match[1]), total: Number(match[2]) }))
+        .filter(position => position.current >= 1 && position.current <= position.total);
+      if (ratios.length === 1) return ratios[0]!;
+    }
     const root = this.#activeRoot();
     const sources = [
       root ? elementText(root) : "",

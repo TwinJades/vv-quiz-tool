@@ -1,317 +1,56 @@
-# 数据模型与协议
+# 数据结构
 
-## 1. 约定
+数据定义以 `src/core/schema.ts`、`src/core/platform.ts`、`src/core/orchestrator.ts` 和 `src/core/course.ts` 为准。结构化输入输出通过 Zod 校验。核心题目协议的 `schema_version` 为 `1.0`，产品版本为 `1.2.0`。
 
-- 示例使用 JSON 表达；正式实现维护机器可校验 schema。
-- 时间使用 ISO 8601 UTC，时长使用毫秒。
-- `session_id` 标识一场测验，`run_id` 标识一次运行实例，`observation_id` 标识一次平台观察，`question_id` 标识单题。
-- 平台原生节点、DOM Element、UIA Element、Accessibility Node、CSS selector 和 XPath 不得进入 QuestionFrame。
-- 跨模块对象包含 `schema_version`；破坏性协议变更才提升主版本。
+## 题目和答案
 
-## 2. QuizSession
+| 对象 | 内容和约束 |
+| --- | --- |
+| `QuestionFrame` | 会话、题目、观察 ID；单选、多选或填空类型；题干、选项、填空、选择数量限制及内容来源 |
+| `MediaRef` | 图片 ID、用途、来源、尺寸、媒体类型和临时句柄 |
+| `QuestionBatch` | 一次模型求解包含的题目及共享上下文；批次关联以实际题目 ID 校验 |
+| `AnswerResult` | 当前题目的结构化答案；选择项引用已有选项 ID，填空值引用已有填空 ID |
+| `BatchAnswerResult` | 一组按题目 ID 关联的答案；检查重复、缺失、未知题目及题型一致性 |
+| `LocatorMap` | 语义目标与实际网页控件的本地映射；不进入模型请求 |
+| `ExecutionPlan` | 根据有效答案生成的填写、选择、提交、翻页或重答动作 |
+| `ActionResult` | 实际动作结果；结果未知时不能认定提交成功 |
+| `PlatformState` | 选中状态、填写内容、反馈、重试入口、提交入口、完成状态和公开成绩 |
 
-QuizSession 管理整场测验，不保存跨会话历史。
+选项及填空 ID 在当前题目内唯一。单选最多选择一项；填空题使用填空字段。图片句柄绑定当前观察，页面变化或会话结束后需要重新取得内容。
 
-```json
-{
-  "schema_version": "1.0",
-  "session_id": "session_01",
-  "run_id": "run_01",
-  "platform": "web",
-  "layout": "multi_question_page",
-  "strategy": "unattended",
-  "status": "solving",
-  "question_ids": ["q_1", "q_2", "q_3"],
-  "progress": {
-    "total": 3,
-    "answered": 1,
-    "guessed": 0,
-    "skipped": 0,
-    "failed": 0
-  },
-  "provider_profile_id": "provider_1",
-  "model_id": "configured-model",
-  "model_calls": {"used": 2, "limit": 300},
-  "timer": {"remaining_seconds": null, "closing_window_seconds": 60},
-  "created_at": "2026-09-21T12:00:00Z"
-}
-```
+## 会话
 
-`layout`：`sequential`、`multi_question_page`。运行策略：`supervised`、`unattended`。
+`QuizSession` 表示当前测验。`SessionRuntimeSnapshot` 保存会话状态、输入方式、Provider、模型、调用费用、进度、提示和临时总结。
 
-## 3. SessionObservation
+快照中的 `checkpoint` 包含已求解答案、最近题目结果、`submission_pending` 和答案重试计数。这个检查点用于恢复操作，不能作为平台完成证据。提交状态未知时先核对公开结果。
 
-PlatformAdapter 的一次测验级观察：
+运行方式为 `unattended`。输入方式有 `structured`、`semantic_snapshot` 和 `visual_snapshot`。`SessionSummary` 包含已答、猜答、重试、跳过、失败数量、调用次数、公开成绩及停止原因。
 
-```json
-{
-  "schema_version": "1.0",
-  "session_id": "session_01",
-  "observation_id": "obs_01",
-  "captured_at": "2026-09-21T12:00:01Z",
-  "platform": "web",
-  "surface": {
-    "target_id": "tab_23",
-    "origin": "https://example.test",
-    "title": "练习"
-  },
-  "layout": "multi_question_page",
-  "question_candidates": [],
-  "session_controls": [],
-  "timer": null,
-  "stability": {"fingerprint": "session-fingerprint", "stable_for_ms": 600}
-}
-```
+## Provider
 
-原始本地引用只存在于短生命周期 Observation 和 LocatorMap，不进入模型或日志正文。
+`ProviderProfile` 保存接口类型、服务地址、模型目录、能力和每批限制。密钥通过 `secret_ref` 单独存入本地，界面列表不包含密钥值。图片输入授权和原生搜索设置适用于这个 Provider 的模型。
 
-## 4. QuestionFrame
+`ModelCallBudget` 维护独立任务的上限、已用额度和预留额度。请求开始前保存预留费用，能够确认实际费用时结算；费用不明确时保留已经预留的费用。
 
-QuestionFrame 是单题的最小语义对象：
+## 课程和资源
 
-```json
-{
-  "schema_version": "1.0",
-  "session_id": "session_01",
-  "question_id": "q_1",
-  "observation_id": "obs_01",
-  "type": "single_choice",
-  "stem": {
-    "text": "2 + 2 = ?",
-    "format": "plain_text",
-    "media": []
-  },
-  "options": [
-    {"id": "opt_1", "text": "3", "media": []},
-    {"id": "opt_2", "text": "4", "media": []}
-  ],
-  "blanks": [],
-  "constraints": {"min_selections": 1, "max_selections": 1},
-  "provenance": {"text_source": "dom", "untrusted_content": true}
-}
-```
+| 对象 | 当前含义 |
+| --- | --- |
+| `CourseCatalog` | 课程、班级、平台、页面类型、目录版本、完整性、任务列表、规则及加载依据 |
+| `LearningTask` | 任务 ID、实际课时和章节 ID、标题、顺序、前置条件、状态及可取得的资源身份 |
+| `CourseSurfaceSnapshot` | 本次实际 DOM 观察、元素 ID、公开属性、地址及经核验的父框架上下文 |
+| `CourseSurfaceReading` | 模型引用本次元素 ID 识别的目录、资源、控件、结果和规则 |
+| `VideoSnapshot` | 实际媒体身份、位置、时长、倍速、暂停、缓冲、回看、结束及弹题 |
+| `QuizBoundary` | 测验或弹题身份、所属课程与资源、重试、剩余次数及及格规则 |
+| `CourseVerification` | 对应任务的平台记录、提交、完成、及格、待批阅和公开成绩 |
+| `CourseTaskIssue` | 具体任务、所属课时、问题原因及结束复核状态 |
 
-支持类型：`single_choice`、`multiple_choice`、`fill_blank`。其他类型可保留协议枚举，但能力协商必须阻止未实现执行。
+`LearningTask.kind` 为 `lesson`、`video`、`lesson_quiz`、`chapter_quiz` 或 `excluded`。视频、测验和范围外资源必须属于实际课时；资源依赖不能循环，也不能引用未发现资源。
 
-## 5. MediaRef 与 VisualFrame
+目录中的 `coverage` 记录实际加载数量、公开总数及加载是否结束。`resource_discovery` 记录每个课时的资源发现状态和失败原因。规则中的未知值保持 `null`，在相关操作前检查所需条件。
 
-题目图片使用临时引用：
+## 课程恢复
 
-```json
-{
-  "id": "media_1",
-  "kind": "image",
-  "purpose": "question_diagram",
-  "source": "dom_image",
-  "mime_type": "image/png",
-  "width": 640,
-  "height": 480,
-  "temporary_handle": "temp_media_1"
-}
-```
+`CourseRuntime` 保存范围、当前资源、实际视频状态、估算时间、测验结果、范围外任务及待处理原因。检查点另外保存目录、已核验资源、子资源、未确认测验、子测验快照、重答次数及回看次数。
 
-Canvas 或视觉坐标操作使用 VisualFrame：
-
-```json
-{
-  "visual_frame_id": "vf_1",
-  "observation_id": "obs_01",
-  "surface_id": "tab_23",
-  "viewport": {"width": 1280, "height": 720, "scale": 1},
-  "region": {"x": 0, "y": 100, "width": 900, "height": 600},
-  "fingerprint": "visual-fingerprint",
-  "captured_at": "2026-09-21T12:00:02Z",
-  "temporary_handle": "temp_visual_1"
-}
-```
-
-临时图片与截图在会话结束或取消后释放，不进入题库或历史。
-
-## 6. LocatorMap
-
-LocatorMap 按题目维护语义 ID 到本地目标的映射：
-
-```json
-{
-  "schema_version": "1.0",
-  "session_id": "session_01",
-  "question_id": "q_1",
-  "observation_id": "obs_01",
-  "platform": "web",
-  "question_fingerprint": "q-fingerprint",
-  "targets": {
-    "opt_1": {"kind": "semantic", "local_ref": "node_12", "role": "radio"},
-    "opt_2": {"kind": "semantic", "local_ref": "node_13", "role": "radio"}
-  }
-}
-```
-
-视觉目标不伪装成语义目标：
-
-```json
-{
-  "kind": "coordinate",
-  "visual_frame_id": "vf_1",
-  "point": {"x": 510, "y": 430},
-  "expected_label": "B",
-  "confidence": 0.93
-}
-```
-
-执行前必须重新验证语义目标或 VisualFrame 新鲜度。
-
-## 7. QuestionBatch
-
-```json
-{
-  "schema_version": "1.0",
-  "session_id": "session_01",
-  "batch_id": "batch_01",
-  "question_ids": ["q_1", "q_2"],
-  "questions": [],
-  "capability_requirements": {"image_input": true, "native_web_search": false},
-  "attempt": 1
-}
-```
-
-约束：
-
-- 每个 question_id 在批次中唯一。
-- 批次响应必须逐题返回，不允许依靠数组位置猜测对应关系。
-- 单题失败可从批次中拆出重新求解。
-
-## 8. BatchAnswerResult 与 AnswerResult
-
-```json
-{
-  "schema_version": "1.0",
-  "session_id": "session_01",
-  "batch_id": "batch_01",
-  "answers": [
-    {
-      "question_id": "q_1",
-      "answer_type": "single_choice",
-      "status": "answered",
-      "selected_option_ids": ["opt_2"],
-      "blank_answers": [],
-      "confidence": 0.98,
-      "warnings": []
-    }
-  ],
-  "errors": [
-    {"question_id": "q_2", "code": "CANNOT_ANSWER", "retryable": true}
-  ]
-}
-```
-
-AnswerResult 只引用 QuestionFrame 中存在的语义 ID。状态：`answered`、`uncertain`、`cannot_answer`。
-
-## 9. RetryContext
-
-```json
-{
-  "question_id": "q_1",
-  "attempt": 2,
-  "max_retries_after_initial": 2,
-  "previous_answers": [["opt_2"]],
-  "site_feedback": "回答错误",
-  "remaining_option_ids": ["opt_1", "opt_3"],
-  "can_resubmit": true
-}
-```
-
-站点反馈属于不可信数据，只用于当前题目的重新求解。不可保存为题库或自动学习数据。
-
-## 10. ProviderProfile
-
-```json
-{
-  "schema_version": "1.0",
-  "provider_profile_id": "provider_1",
-  "display_name": "个人 CPA",
-  "provider_type": "openai_compatible",
-  "base_url": "https://provider.example/v1",
-  "secret_ref": "local-secret-1",
-  "model_catalog": {
-    "source": "provider_api",
-    "models": ["model-a", "model-b"],
-    "refreshed_at": "2026-09-21T12:00:00Z"
-  },
-  "capabilities": {
-    "image_input": true,
-    "structured_output": true,
-    "native_web_search": false
-  }
-}
-```
-
-用户可以新增、编辑和删除多个 ProviderProfile。活动会话使用中的 Profile 不得在没有确认迁移或停止的情况下删除。
-
-## 11. ExecutionPlan 与 ActionResult
-
-```json
-{
-  "session_id": "session_01",
-  "question_id": "q_1",
-  "observation_id": "obs_01",
-  "strategy": "unattended",
-  "actions": [
-    {"action_id": "act_1", "kind": "set_selected", "target_id": "opt_2", "value": true}
-  ],
-  "preconditions": ["same_question_fingerprint", "target_available"]
-}
-```
-
-ActionResult 状态：`succeeded`、`failed`、`skipped`、`unknown`。`unknown` 必须先进入 VERIFY，不能直接重复提交。
-
-## 12. VerificationResult
-
-```json
-{
-  "session_id": "session_01",
-  "question_id": "q_1",
-  "status": "verified",
-  "stage": "graded",
-  "outcome": "incorrect",
-  "signals": [],
-  "can_retry": true,
-  "next_action": "resolve_again"
-}
-```
-
-`stage`：`answer_applied`、`submitted`、`graded`、`advanced`、`session_submitted`、`session_completed`。
-
-## 13. SessionSummary
-
-```json
-{
-  "session_id": "session_01",
-  "status": "completed",
-  "total": 20,
-  "answered": 19,
-  "guessed": 2,
-  "retried": 3,
-  "skipped": 1,
-  "failed": 0,
-  "coordinate_actions": 4,
-  "model_calls": 28,
-  "visible_score": "18/20",
-  "stop_reason": null
-}
-```
-
-SessionSummary 只存在于当前会话 UI；关闭后清除。
-
-## 14. 错误模型
-
-建议分类：`readiness`、`observation`、`parse`、`provider`、`answer_validation`、`page_changed`、`visual_stale`、`execution`、`verification`、`permission`、`authentication`、`hard_blocker`、`cancelled`、`internal`。
-
-错误必须标明是否可重试、从哪个阶段恢复，以及是否需要用户处理。
-
-## 15. 版本与兼容性
-
-- `schema_version` 与产品版本分别管理。
-- 新增平台 Adapter 不改变核心 schema 主版本。
-- 新增可选字段提升协议次版本；删除、改义或改变必填规则才提升协议主版本。
-- 未知主版本必须拒绝处理，不能静默猜测。
-
+`SavedCourseRecord` 包含课程运行快照、原始启动配置、清理敏感参数后的课程地址和更新时间。准备会话保存相同课程加载所需的配置、预算及目录。恢复时使用实际页面重新核验这些身份和结果。

@@ -9,6 +9,12 @@ export class ModelCallBudget {
   readonly limit: number;
   #used = 0;
   #reserved = 0;
+  #persistence:((charged:number)=>Promise<void>)|null=null;
+  #write:Promise<void>=Promise.resolve();
+  get reserved():number{return this.#reserved;}
+  setPersistence(persist:(charged:number)=>Promise<void>):void {this.#persistence=persist;}
+  async flush():Promise<void>{await this.#write;}
+  private changed():void {const persist=this.#persistence,charged=this.#used+this.#reserved;if(persist)this.#write=this.#write.then(()=>persist(charged));}
 
   constructor(limit = 300) {
     if (!Number.isInteger(limit) || limit <= 0) {
@@ -30,6 +36,7 @@ export class ModelCallBudget {
       throw new ModelCallLimitError(this.limit);
     }
     this.#used += 1;
+    this.changed();
     return this.#used;
   }
 
@@ -37,12 +44,14 @@ export class ModelCallBudget {
     if (!Number.isInteger(amount) || amount <= 0) throw new RangeError("Reservation must be a positive integer.");
     if (amount > this.remaining) throw new ModelCallLimitError(this.limit);
     this.#reserved += amount;
+    this.changed();
     let settled = false;
     return { settle: actual => {
       if (settled || !Number.isInteger(actual) || actual < 0 || actual > amount) throw new RangeError("Invalid call reservation settlement.");
       settled = true;
       this.#reserved -= amount;
       this.#used += actual;
+      this.changed();
     } };
   }
 }

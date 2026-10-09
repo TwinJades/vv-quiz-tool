@@ -1,4 +1,5 @@
 import { SCHEMA_VERSION } from "./schema";
+import { validateAnswer } from './answer-validator';
 import type {
   AnswerResult,
   ExecutionAction,
@@ -45,6 +46,8 @@ export function buildAnswerExecutionPlan(
   strategy: RunStrategy,
 ): ExecutionPlan {
   assertSameContext(question, answer, locatorMap);
+  const validation = validateAnswer(question, answer);
+  if (!validation.valid || !validation.executable) throw new ExecutionPlanError('Answer validation failed before execution.');
   const actions: ExecutionAction[] = [];
 
   if (question.type === "fill_blank") {

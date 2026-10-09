@@ -1,5 +1,6 @@
 import type { ExtensionRequest, TaskPanelSnapshot } from "./messages";
 import { requestCurrentWebsite } from "./website-access";
+import { hasUiTranslation, initializeUiLanguage, showNotice, stateLabel, t } from './ui-language';
 
 const tasks = document.querySelector<HTMLElement>("#tasks")!;
 const errorText = document.querySelector<HTMLElement>("#error")!;
@@ -21,19 +22,19 @@ async function send<T>(request: ExtensionRequest): Promise<T> {
 
 function text(tag: string, value: string, className = ""): HTMLElement {
   const element = document.createElement(tag);
-  element.textContent = value;
+  element.textContent = hasUiTranslation(value) ? t(value) : value;
   element.className = className;
   return element;
 }
 
 function action(label: string, disabled: boolean, run: () => Promise<unknown>): HTMLButtonElement {
   const button = document.createElement("button");
-  button.textContent = label;
+  button.textContent = t(label);
   button.disabled = disabled;
   button.addEventListener("click", () => {
     button.disabled = true;
-    void run().then(async () => { errorText.textContent = ""; await refresh(); }).catch(error => {
-      errorText.textContent = String(error.message || error);
+    void run().then(async () => { showNotice(errorText, ""); await refresh(); }).catch(error => {
+      showNotice(errorText,String(error.message || error));
       button.disabled = disabled;
     });
   });
@@ -45,7 +46,7 @@ async function refresh(): Promise<void> {
   refreshing = true;
   try {
     const state = await send<TaskPanelSnapshot>({ type: "VV_GET_TASKS" });
-    document.querySelector("#queue")!.textContent = `运行 ${state.running.length} 场 · 排队 ${state.queued.length} 场`;
+    document.querySelector("#queue")!.textContent = t('运行 {{running}} 场 · 排队 {{queued}} 场',{running:state.running.length,queued:state.queued.length});
     if (document.activeElement !== limitInput) limitInput.value = String(state.concurrency);
     const marker = JSON.stringify({ ...state, tasks: state.tasks.map(task => ({ ...task, snapshot: { ...task.snapshot, timings: undefined, steps: undefined } })) });
     if (marker === lastRenderMarker) return;
@@ -57,29 +58,42 @@ async function refresh(): Promise<void> {
       const card = document.createElement("article");
       card.className = "panel task";
       card.dataset.paused = String(snapshot.state === "PAUSED" || snapshot.state === "FAILED");
-      card.append(text("h2", task.title), text("p", task.url || `标签 ${tabId}`, "muted"));
-      card.append(text("p", `${snapshot.state}${queuedPosition >= 0 ? ` · 排队第 ${queuedPosition + 1} 场` : ""}`, "state"));
-      if (!terminal && snapshot.timer_remaining_seconds !== null && snapshot.timer_remaining_seconds !== undefined) card.append(text("p", `剩余约 ${snapshot.timer_remaining_seconds} 秒${snapshot.timer_remaining_seconds <= 60 ? " · 优先收尾" : ""}`, "muted"));
-      card.append(text("p", `${snapshot.strategy === "supervised" ? "监督自动" : "无人值守"} · ${task.provider_name} · ${snapshot.model_id}`));
-      card.append(text("p", snapshot.practice?`新提交练习 ${snapshot.progress.answered}/${snapshot.progress.total} · 已有记录/无练习 ${snapshot.progress.skipped} · 调用 ${snapshot.model_calls.used}/${snapshot.model_calls.limit}`:`已答 ${snapshot.progress.answered}/${snapshot.progress.total} · 猜答 ${snapshot.progress.guessed} · 重试 ${snapshot.progress.retried} · 跳过 ${snapshot.progress.skipped} · 失败 ${snapshot.progress.failed} · 调用 ${snapshot.model_calls.used}/${snapshot.model_calls.limit}`));
-      if (snapshot.notice) card.append(text("p", snapshot.notice, "notice"));
+      card.append(text("h2", task.title), text("p", task.url || t('标签 {{id}}',{id:tabId}), "muted"));
+      card.append(text("p", `${stateLabel(snapshot.state)}${queuedPosition >= 0 ? ' · '+t('排队第 {{position}} 场',{position:queuedPosition+1}) : ""}`, "state"));
+      if (!terminal && snapshot.timer_remaining_seconds !== null && snapshot.timer_remaining_seconds !== undefined) card.append(text("p", t('剩余约 {{seconds}} 秒',{seconds:snapshot.timer_remaining_seconds})+(snapshot.timer_remaining_seconds <= 60 ? ' · '+t('优先收尾') : ''), "muted"));
+      card.append(text("p", `${task.provider_name} · ${snapshot.model_id}`));
+      const progressValues={...snapshot.progress,used:snapshot.model_calls.used,limit:snapshot.model_calls.limit};
+      card.append(text("p", t(snapshot.practice?'新提交练习 {{answered}}/{{total}} · 已有记录/无练习 {{skipped}} · 调用 {{used}}/{{limit}}':'已答 {{answered}}/{{total}} · 猜答 {{guessed}} · 重试 {{retried}} · 跳过 {{skipped}} · 失败 {{failed}} · 调用 {{used}}/{{limit}}',progressValues)));
+      if (snapshot.notice) { const notice=text('p','','notice'); notice.id='notice-'+tabId; card.append(notice); showNotice(notice,snapshot.notice); }
       if(snapshot.course){
         const course=snapshot.course;
-        card.append(text('p',`${course.title} · ${course.phase} · 仅本次选定的视频与关联测验`));
-        card.append(text('p',`预计剩余播放时间：${course.estimate_seconds===null?'暂无法估计':course.estimate_seconds+'秒'}${course.estimate_frozen?'（冻结）':''}；不含未知缓冲、答题与平台同步。`,'muted'));
-        card.append(text('p',`视频结束 ${course.video.ended?'已确认':'未确认'} · 平台记录 ${course.video.progress_recorded?'已确认':'未确认'}`));
-        for(const item of course.results)card.append(text('p',`${item.kind==='video_popup'?'弹题':'课时/章节测验'} · ${item.result.status} · 提交 ${item.result.submission_confirmed?'已确认':'未确认'} · 得分 ${item.result.visible_score??'未提供'}`));
+        const current=course.checkpoint?.children.find(task=>task.id===course.current_task_id)??course.tasks.find(task=>task.id===course.current_task_id);
+        card.append(text('p',`${course.title} · ${stateLabel(course.phase)} · ${t('仅本次选定的视频与关联测验')}`));
+        if(current)card.append(text('p',t('当前资源：{{title}}',{title:current.title})));
+        card.append(text('p',t('预计剩余播放时间：{{estimate}}{{frozen}}；不含未知缓冲、答题与平台同步。',{estimate:course.estimate_seconds===null?t('暂无法估计'):t('{{seconds}}秒',{seconds:course.estimate_seconds}),frozen:course.estimate_frozen?t('（冻结）'):''}),'muted'));
+        card.append(text('p',t('视频结束 {{ended}} · 平台记录 {{recorded}}',{ended:t(course.video.ended?'已确认':'未确认'),recorded:t(course.video.progress_recorded?'已确认':'未确认')})));
+        if(course.video.rate!==undefined)card.append(text('p',t('实际倍速 {{rate}}x · 速度由外部插件设置',{rate:course.video.rate??t('未确认')}),'muted'));
+        for(const issue of course.issues??[])card.append(text('p',`${issue.title} · ${issue.reason}`,'notice'));
+        for(const item of course.results)card.append(text('p',t('{{kind}} · {{status}} · 提交 {{submission}} · 得分 {{score}}',{kind:t(item.kind==='video_popup'?'弹题':'课时/章节测验'),status:stateLabel(item.result.status),submission:t(item.result.submission_confirmed?'已确认':'未确认'),score:item.result.visible_score??t('未提供')})));
       }
       if(snapshot.practice){
-        card.append(text('p',`${snapshot.practice.title} · ${snapshot.practice.phase} · 仅选定知识点练习`));
+        card.append(text('p',`${snapshot.practice.title} · ${stateLabel(snapshot.practice.phase)} · ${t('仅选定知识点练习')}`));
         card.append(text('p','视频、PPT、独立作业与期末考试未纳入；答对数不等于掌握度或及格。','muted'));
-        for(const item of snapshot.practice.results)card.append(text('p',`${item.title} · ${item.status==='submitted'?'新提交已确认':item.status==='existing_record'?'保留已有作答记录':'页面明确无练习'}${item.score?' · '+item.score:''}`));
+        for(const item of snapshot.practice.results)card.append(text('p',`${item.title} · ${t(item.status==='submitted'?'新提交已确认':item.status==='existing_record'?'保留已有作答记录':'页面明确无练习')}${item.score?' · '+item.score:''}`));
       }
-      if (snapshot.summary) card.append(text("p", `本场总结：${snapshot.summary.status} · 得分 ${snapshot.summary.visible_score || "网站未提供"} · ${snapshot.summary.stop_reason || "测验结束"}`));
+      if (snapshot.summary) {
+        card.append(text('p',t('本场总结：{{status}} · 得分 {{score}} · {{reason}}',{status:stateLabel(snapshot.summary.status),score:snapshot.summary.visible_score||t('网站未提供'),reason:snapshot.summary.stop_reason?'':t('测验结束')})));
+        if(snapshot.summary.stop_reason){const reason=text('p',''); reason.id='reason-'+tabId; card.append(reason);showNotice(reason,snapshot.summary.stop_reason);}
+      }
       const visual = snapshot.summary?.visual_metrics ?? snapshot.visual_metrics;
-      if (visual?.coordinate_attempts || visual?.stale_frame_rejections) card.append(text("p", `视觉操作：坐标尝试 ${visual.coordinate_attempts} · 点击已发送 ${visual.coordinate_clicks} · 截图复核 ${visual.verification_reads} · 验证失败 ${visual.verification_failures} · 拒绝过期截图 ${visual.stale_frame_rejections}`, "muted"));
+      if (visual?.coordinate_attempts || visual?.stale_frame_rejections) card.append(text("p", t('视觉操作：坐标尝试 {{attempts}} · 点击已发送 {{clicks}} · 截图复核 {{reads}} · 验证失败 {{failures}} · 拒绝过期截图 {{stale}}',{attempts:visual.coordinate_attempts,clicks:visual.coordinate_clicks,reads:visual.verification_reads,failures:visual.verification_failures,stale:visual.stale_frame_rejections}), "muted"));
       const actions = document.createElement("div");
       actions.className = "task-actions";
+      if(task.saved_session_id){
+        actions.append(action('打开课程',false,()=>send({type:'VV_OPEN_SAVED_COURSE',session_id:task.saved_session_id!})));
+        actions.append(action('清除本场',false,()=>send({type:'VV_CLEAR_SAVED_COURSE',session_id:task.saved_session_id!})));
+        card.append(actions,text('p','打开课程并登录后，在VV中点击继续。','muted'));return card;
+      }
       actions.append(
         action("回到网站", false, async () => { const tab = await chrome.tabs.update(tabId, { active: true }); if (tab) await chrome.windows.update(tab.windowId, { focused: true }); }),
         action("暂停", terminal || snapshot.state === "PAUSED", () => send({ type: "VV_PAUSE_SESSION", tab_id: tabId })),
@@ -89,20 +103,19 @@ async function refresh(): Promise<void> {
         }),
         action("停止", terminal, () => send({ type: "VV_STOP_SESSION", tab_id: tabId })),
         action("清除本场", !terminal && snapshot.state !== "PAUSED", () => send({ type: "VV_CLEAR_SESSION", tab_id: tabId })),
-        action(snapshot.strategy === "supervised" ? "切换无人值守" : "切换监督自动", terminal, () => send({ type: "VV_SWITCH_STRATEGY", tab_id: tabId, strategy: snapshot.strategy === "supervised" ? "unattended" : "supervised" })),
       );
       card.append(actions);
       if (!task.resumable && snapshot.state === "PAUSED") card.append(text("p", "浏览器已回收这场运行。请清除状态后从网站重新启动。", "muted"));
       return card;
     });
     tasks.replaceChildren(...(cards.length ? cards : [text("p", "尚无测验任务。请在网站标签中启动 VV。", "muted")]));
-  } catch (error) { errorText.textContent = String((error as Error).message || error); }
+  } catch (error) { showNotice(errorText,String((error as Error).message || error)); }
   finally { refreshing = false; }
 }
 
 document.querySelector("#apply")!.addEventListener("click", () => {
-  void send({ type: "VV_SET_CONCURRENCY", limit: Number(limitInput.value) }).then(() => { errorText.textContent = ""; return refresh(); }).catch(error => { errorText.textContent = String(error.message || error); });
+  void send({ type: "VV_SET_CONCURRENCY", limit: Number(limitInput.value) }).then(() => { showNotice(errorText, ""); return refresh(); }).catch(error => { showNotice(errorText,String(error.message || error)); });
 });
 connect();
-void refresh();
+void initializeUiLanguage(()=>{lastRenderMarker='';return refresh();});
 window.setInterval(() => { try { port.postMessage({ heartbeat: true }); } catch {} void refresh(); }, 1000);

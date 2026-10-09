@@ -8,7 +8,8 @@ export class WebVerifier implements Verifier {
     actions: ActionResult[],
     after: PlatformState,
   ): VerificationResult {
-    const failedAction = actions.some((action) => action.status === "failed");
+    const completeReport = actions.length === plan.actions.length && new Set(actions.map(action=>action.action_id)).size===actions.length && plan.actions.every(action=>actions.some(result=>result.action_id===action.action_id));
+    const failedAction = !completeReport || actions.some((action) => action.status === "failed");
     const unknownAction = actions.some((action) => action.status === "unknown");
     const expectedSelections = new Map(
       plan.actions
@@ -28,7 +29,8 @@ export class WebVerifier implements Verifier {
       action.kind === "submit_question" || action.kind === "submit_session",
     );
     const advanced = plan.actions.some((action) => action.kind === "advance");
-    const strongControlSignal = contextChanged || after.completed || after.feedback !== null;
+    const freshFeedback = after.feedback !== null && (before.feedback !== after.feedback || before.feedback_text !== after.feedback_text || before.question_graded !== after.question_graded);
+    const strongControlSignal = contextChanged || after.completed && !before.completed || freshFeedback;
     const submissionSignal =
       strongControlSignal || before.has_next !== after.has_next || before.can_retry !== after.can_retry;
 

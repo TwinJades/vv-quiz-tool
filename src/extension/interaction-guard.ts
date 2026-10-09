@@ -12,25 +12,44 @@ export interface NativeInputTicket extends InteractionBinding {
   expected_text?: string;
 }
 
+export function assertInteractionActive(binding:InteractionBinding|null,signal:AbortSignal,sessionId?:string,epoch?:string):void {
+  if(sessionId&&(!binding?.enabled||binding.session_id!==sessionId||binding.epoch!==epoch))throw new Error('USER_INTERACTION: execution belongs to an inactive session.');
+  if(signal.aborted)throw new Error('USER_INTERACTION: execution was cancelled; observe the page before continuing.');
+}
+
+export class AutomationExecution {
+  #depth=0;
+  get depth():number{return this.#depth;}
+  run<T>(operation:()=>T):T {
+    this.#depth++;let asynchronous=false;
+    try{const result=operation();if(result instanceof Promise){asynchronous=true;return result.finally(()=>{this.#depth--;}) as T;}return result;}
+    finally{if(!asynchronous)this.#depth--;}
+  }
+}
+
 // A page-local latch stops execution before the asynchronous background pause arrives.
 export class InteractionGuard {
   #binding: InteractionBinding | null = null;
   #controller = new AbortController();
-  #executionDepth = 0;
+  #automation=new AutomationExecution();
   #nativeTicket: NativeInputTicket | null = null;
   #nativeCause: EventTarget | null = null;
   #derivedEvents = new Set<string>();
   #visualScope: VisualGeometry | null = null;
+  readonly #listener=(event:Event)=>this.handle(event);
 
   constructor(
     private readonly document: Document,
     private readonly isQuizTarget: (target: EventTarget | null) => boolean,
     private readonly notify: (binding: InteractionBinding) => void,
   ) {
-    const listener = (event: Event) => this.handle(event);
     for (const type of ["pointerdown", "keydown", "beforeinput", "input", "change"]) {
-      document.addEventListener(type, listener, { capture: true });
+      document.addEventListener(type, this.#listener, { capture: true });
     }
+  }
+  dispose():void {
+    this.#controller.abort();this.#binding=null;this.armNativeInput(null);this.#visualScope=null;
+    for(const type of ['pointerdown','keydown','beforeinput','input','change'])this.document.removeEventListener(type,this.#listener,{capture:true});
   }
 
   configure(binding: InteractionBinding): boolean {
@@ -94,7 +113,7 @@ export class InteractionGuard {
     }
     // Native radio .click() emits trusted input/change synchronously. Suppress only
     // that immediate effect; pointer/keyboard input is never suppressed.
-    if (this.#executionDepth > 0 && ["input", "change"].includes(event.type)) return;
+    if (this.#automation.depth > 0 && ["input", "change"].includes(event.type)) return;
     if (event.type === "keydown" && ["Tab", "Shift", "Control", "Alt", "Meta", "Escape"].includes(event.key ?? "")) return;
     const path = event.composedPath?.() ?? [event.target];
     if (!path.some(target => this.isQuizTarget(target)) && !this.#visualInteraction(event, path)) return;
@@ -111,16 +130,11 @@ export class InteractionGuard {
   }
 
   runAutomation<T>(operation: () => T): T {
-    this.#executionDepth++;
-    try { return operation(); }
-    finally { this.#executionDepth--; }
+    return this.#automation.run(operation);
   }
 
   signal(sessionId?: string, epoch?: string): AbortSignal {
-    if (sessionId && (!this.#binding?.enabled || this.#binding.session_id !== sessionId || this.#binding.epoch !== epoch)) {
-      throw new Error("USER_INTERACTION: execution belongs to an inactive session.");
-    }
-    if (this.#controller.signal.aborted) throw new Error("USER_INTERACTION: the quiz was operated manually; resume to observe it again.");
+    assertInteractionActive(this.#binding,this.#controller.signal,sessionId,epoch);
     return this.#controller.signal;
   }
 

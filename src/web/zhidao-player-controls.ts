@@ -15,7 +15,6 @@ export class ZhidaoPlayerControls {
   readonly #expected: ZhidaoPlayerReading;
   #closed = false;
   #buffering = false;
-  #allowedRates = new Set([1]);
   readonly #events: Array<[string, EventListener]> = [];
 
   constructor(private readonly document: Document, expected: ZhidaoPlayerReading,
@@ -75,8 +74,8 @@ export class ZhidaoPlayerControls {
   }
   snapshot(): ZhidaoPlayerReading & { buffering: boolean; visible: boolean } {
     const reading=this.assertCurrent();
-    if(!reading.paused&&!reading.ended&&(reading.rate===null||!this.#allowedRates.has(reading.rate)))
-      throw new Error('播放速度超出本次已确认的正常菜单选项，请关闭外部加速后继续。');
+    if(!reading.paused&&!reading.ended&&(reading.rate===null||!Number.isFinite(reading.rate)||reading.rate<=0))
+      throw new Error('实际播放速度无效。');
     return { ...reading, buffering: this.#buffering || this.#video.readyState < 3,
       visible: this.document.visibilityState === 'visible' };
   }
@@ -130,47 +129,24 @@ export class ZhidaoPlayerControls {
   }
   async highestAllowedSpeed(allowed: boolean | null, signal: AbortSignal): Promise<void> {
     const before = this.assertCurrent(signal);
-    if (allowed === null) throw new Error('本课程倍速规则未知。');
-    if (!allowed) {
-      if (before.rate !== 1) throw new Error('课程不允许倍速但实际速度不是1x，请关闭外部加速。');
-      this.#allowedRates = new Set([1]); return;
-    }
-    if (!this.normalHover) throw new Error('正常倍速菜单需要已授权的页面悬停通道。');
-    await this.reveal(signal);
-    const caption = this.control(':scope > .controlsBar > .speedBox > span', signal);
-    await this.normalHover(caption, signal);
-    const current = this.assertCurrent(signal);
-    if (!current.speed_menu_visible) throw new Error('正常倍速菜单未展开，不能猜测允许速度。');
-    const options = current.speed_options.filter(option => option.enabled).sort((a, b) => b.rate - a.rate);
-    if (!options.length) throw new Error('正常菜单没有可核对的允许速度。');
-    const best = options[0]!.rate;
-    const choices = Array.from(this.#root.querySelectorAll<HTMLElement>(':scope > .controlsBar > .speedBox > .speedList > .speedTab'))
-      .filter(choice => isVisibleZhidaoPlayerElement(choice) && Number(choice.getAttribute('rate')) === best &&
-        Number(/^X\s+(\d+(?:\.\d+)?)$/.exec(normalizedText(choice.textContent))?.[1]) === best);
-    if (choices.length !== 1) throw new Error('最高允许倍速控件身份不唯一。');
-    const fresh = this.assertCurrent(signal);
-    if (!fresh.speed_menu_visible || !fresh.speed_options.some(option => option.enabled && option.rate === best) ||
-      JSON.stringify(fresh.speed_options.filter(option => option.enabled).sort((a, b) => b.rate - a.rate)) !== JSON.stringify(options))
-      throw new Error('正常倍速菜单已改变。');
-    if (fresh.rate !== best) choices[0]!.click();
-    await this.confirm(reading => reading.rate === best, signal);
-    this.#allowedRates = new Set(options.map(option => option.rate));
+    if(before.rate===null||!Number.isFinite(before.rate)||before.rate<=0)throw new Error('实际播放速度无效。');
+    if(allowed===false&&before.rate!==1)throw new Error('课程不允许倍速，请调整外部加速插件。');
   }
   async play(signal: AbortSignal): Promise<void> {
     await this.mute(signal);
     const before = this.assertCurrent(signal);
-    if (before.rate === null || !this.#allowedRates.has(before.rate)) throw new Error('实际速度不在当前已确认的允许选项内。');
+    if (before.rate === null || !Number.isFinite(before.rate)||before.rate<=0) throw new Error('实际播放速度无效。');
     if (before.ended) throw new Error('视频已结束，禁止把播放控件当重播。');
     if (!before.paused) return;
     await this.reveal(signal);
     const button = this.control(':scope > .controlsBar > .playButton, :scope > .controlsBar > .pauseButton', signal);
     const current = this.assertCurrent(signal);
-    if (!(current.muted || current.volume === 0) || current.rate === null || !this.#allowedRates.has(current.rate) || current.ended)
+    if (!(current.muted || current.volume === 0) || current.rate === null || !Number.isFinite(current.rate)||current.rate<=0 || current.ended)
       throw new Error('恢复播放前静音、倍速或结束状态已改变。');
     if (!current.paused) return;
     button.click();
     await this.confirm(reading => !reading.paused && !reading.ended && (reading.muted || reading.volume === 0) &&
-      reading.rate !== null && this.#allowedRates.has(reading.rate), signal);
+      reading.rate !== null && Number.isFinite(reading.rate)&&reading.rate>0, signal);
   }
   close(): void {
     this.#closed = true;

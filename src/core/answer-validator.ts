@@ -14,6 +14,7 @@ export type AnswerValidationIssueCode =
   | "DUPLICATE_BLANK"
   | "UNKNOWN_BLANK"
   | "MISSING_BLANK"
+  | "BLANK_LENGTH"
   | "UNEXPECTED_OPTION_SELECTION";
 
 export interface AnswerValidationIssue {
@@ -117,10 +118,14 @@ export function validateAnswer(
     }
     if (
       answer.status === "answered" &&
-      question.blanks.some((blank) => blank.required && !answerBlankIds.includes(blank.id))
+      question.blanks.some((blank) => blank.required && !answer.blank_answers.find(item => item.blank_id === blank.id)?.value.trim())
     ) {
       issues.push({ code: "MISSING_BLANK", message: "A required blank has no answer." });
     }
+    if (answer.blank_answers.some(item => {
+      const blank = question.blanks.find(blank => blank.id === item.blank_id);
+      return blank?.max_length !== undefined && item.value.length > blank.max_length;
+    })) issues.push({ code: "BLANK_LENGTH", message: "A blank exceeds its maximum length." });
   }
 
   if (issues.length > 0) {

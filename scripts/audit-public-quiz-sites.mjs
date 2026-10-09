@@ -14,13 +14,13 @@ const waitDemo=process.argv.includes('--wait-demo');
 const startIspring=process.argv.includes('--start-ispring');
 const startSurvey=process.argv.includes('--start-survey');
 const watchSurvey=process.argv.includes('--watch-survey');
+const syntheticSurveyName=process.argv.includes('--synthetic-survey-name');
 const catalogWalk=process.argv.includes('--catalog-walk');
-const filterQuestionSet=process.argv.includes('--filter-question-set');
 const catalogCandidates=catalogWalk||process.argv.includes('--catalog-candidates');
 const auditedCandidates=new Set();
 const auditedCatalogPages=new Set();
-const renderProbe=waitCanvas||waitDemo||startIspring||startSurvey||filterQuestionSet;
-const siteArguments=process.argv.slice(2).filter(argument=>!['--wait-canvas','--wait-demo','--start-ispring','--start-survey','--watch-survey','--catalog-candidates','--catalog-walk','--filter-question-set'].includes(argument));
+const renderProbe=waitCanvas||waitDemo||startIspring||startSurvey;
+const siteArguments=process.argv.slice(2).filter(argument=>!['--wait-canvas','--wait-demo','--start-ispring','--start-survey','--watch-survey','--synthetic-survey-name','--catalog-candidates','--catalog-walk'].includes(argument));
 const urls=siteArguments.length?siteArguments:[
   "https://testmoz.com/1",
   "https://h5p.open.ubc.ca/h5p-examples/quiz-question-set/",
@@ -44,15 +44,16 @@ const inspect=`(()=>{
       let data;try{data=JSON.parse(value.jsonContent)}catch{continue}
       if(inventories.some(item=>item.id===id&&item.library===value.library))continue;
       const questions=/QuestionSet/.test(value.library??'')?(data.questions??data.content?.questions??[]):[{library:value.library,params:data}];
-      const kinds={single:0,multi:0,fill:0,unsupported:0};const libraries=[];
+      const kinds={single:0,multi:0,fill:0,unknown_choice:0,unsupported:0};const libraries=[];
       const hasImage=object=>typeof object==='string'?/<img\\b[^>]*\\bsrc\\s*=/i.test(object):object&&typeof object==="object"&&(Boolean(object.path&&/\\.(?:png|jpe?g|gif|webp|svg)(?:\\?|$)/i.test(object.path))||Object.values(object).some(hasImage));
       for(const q of questions){const library=q.library??q.content?.library??"unknown",p=q.params??q.content?.params??{};libraries.push(library);
         if(/Blanks/.test(library))kinds.fill++;
         else if(/SingleChoiceSet|TrueFalse/.test(library))kinds.single++;
         else if(/MultiChoice/.test(library)){
           const type=p.behaviour?.type??"auto";
-          const single=type==="single"||(type==="auto"&&p.answers?.filter(answer=>answer.correct===true).length===1);
-          if(single)kinds.single++;else kinds.multi++;
+          if(type==="single")kinds.single++;
+          else if(type==="multi")kinds.multi++;
+          else kinds.unknown_choice++;
         }
         else if(/ImageChoice/.test(library)){if(p.behaviour?.singleAnswer===false||p.behaviour?.type==="multi")kinds.multi++;else kinds.single++}
         else kinds.unsupported++;
@@ -72,6 +73,7 @@ const inspect=`(()=>{
   return {url:location.href,title:document.title,visibility:document.visibilityState,
     text:document.body?.innerText.slice(0,2500),inventories,access_blocked:accessBlocked,
     related_links:[...document.querySelectorAll('a[href]')].filter(a=>(/quiz|question set|questionset|paleolithic/i.test(a.textContent)||/Question Set/.test(a.closest('tr')?.textContent??'')||(location.hostname==='studio.libretexts.org'&&location.pathname==='/library'&&a.hostname==='studio.libretexts.org'&&a.pathname.startsWith('/h5p/')&&!a.pathname.includes('embed')))&&/^https?:/.test(a.href)).slice(0,60).map(a=>({text:a.textContent.trim().slice(0,150),url:a.href})),
+    catalog_question_set_links:location.hostname==='studio.libretexts.org'&&location.pathname==='/library'?[...document.querySelectorAll('.item-text-wrap')].filter(e=>e.innerText.includes(' Question Set by ')).map(e=>e.querySelector('h3.item-title a[href]')?.href).filter(Boolean):undefined,
     pagination_links:[...document.querySelectorAll('a[href]')].filter(a=>/[?&](?:page|hpage)=/.test(a.href)).map(a=>({text:a.textContent.trim().slice(0,80),url:a.href})),
     timer_elements:[...document.querySelectorAll('[role=timer], [class*=timer], [class*=countdown]')].filter(visible).slice(0,12).map(e=>({tag:e.tagName,class:e.className,role:e.getAttribute('role'),text:e.innerText?.slice(0,250)})),
     public_catalog_filters:['h5pstudio.ecampusontario.ca','studio.libretexts.org'].includes(location.hostname)?[...document.querySelectorAll('form')].map(form=>({action:form.action,method:form.method,selects:[...form.querySelectorAll('select')].map(select=>({name:select.name,options:[...select.options].map(option=>({value:option.value,text:option.textContent}))})),type_options:[...form.querySelectorAll('input[type=radio][name=type]')].map(input=>({value:input.value,text:input.labels?.[0]?.textContent?.trim()??null})),text_inputs:[...form.querySelectorAll('input[type=text]')].map(input=>({name:input.name,placeholder:input.placeholder}))})):undefined,
@@ -116,13 +118,6 @@ async function audit(url,index,embedded=false){
       await sleep(200);
     }
     await sleep(2000);
-    if(filterQuestionSet&&new URL(url).hostname==='studio.libretexts.org'&&new URL(url).pathname==='/library'){
-      for(const action of ['choose','submit']){
-        const point=await page.evaluate(`(()=>{const input=[...document.querySelectorAll('input[type=radio][name=type]')].find(e=>e.value==='Question Set');if(!input)throw new Error('Reviewed public filter missing');const form=input.closest('form');if(!form||form.method.toLowerCase()!=='get'||new URL(form.action).origin!==location.origin)throw new Error('Public filter is not same-origin GET');const e=${JSON.stringify(action)}==='choose'?input.labels[0]??input:form.querySelector('button[type=submit],input[type=submit]');if(!e)throw new Error('Public filter control missing');e.scrollIntoView({block:'center'});const r=e.getBoundingClientRect(),x=r.x+r.width/2,y=r.y+r.height/2,hit=document.elementFromPoint(x,y);if(r.width<=0||r.height<=0||(hit!==e&&!e.contains(hit)))throw new Error('Public filter control is not exposed');return{x,y};})()`);
-        await page.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});await page.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});await sleep(700);
-      }
-      await sleep(1500);item.public_filter_native_get=true;
-    }
     if(waitDemo||startIspring||(waitCanvas&&await page.evaluate('document.querySelectorAll("canvas").length>0'))) {
       item.canvas_initial=await page.evaluate('({text:document.body?.innerText.slice(0,800),canvas:[...document.querySelectorAll("canvas")].map(canvas=>({width:canvas.width,height:canvas.height}))})');
       await sleep(45000);
@@ -155,6 +150,17 @@ async function audit(url,index,embedded=false){
         await page.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...confirm});
         await sleep(300);item.cookie_choices_confirmed=true;
       }
+      if(syntheticSurveyName){
+        if(!/Enter your name below and click Start Quiz to begin\./.test(await page.evaluate('document.body.innerText')))
+          throw new Error('Reviewed demo name prompt is missing');
+        const namePoint=await page.evaluate(`(()=>{const fields=[...document.querySelectorAll('input[type=text]')].filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&!e.disabled&&!/Type to filter the list/i.test(e.placeholder)});if(fields.length!==1||fields[0].value)throw new Error('Synthetic test-name field missing or ambiguous');const e=fields[0],r=e.getBoundingClientRect(),x=r.x+r.width/2,y=r.y+r.height/2,hit=document.elementFromPoint(x,y);if(hit!==e)throw new Error('Synthetic test-name field obstructed');return{x,y};})()`);
+        await page.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...namePoint});
+        await page.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...namePoint});
+        await page.send('Input.insertText',{text:'VV Acceptance Test'});
+        if(!await page.evaluate(`(()=>[...document.querySelectorAll('input[type=text]')].filter(e=>e.value==='VV Acceptance Test').length===1)()`))
+          throw new Error('Synthetic test name was not applied');
+        item.synthetic_test_name_entered=true;
+      }
       const point=await page.evaluate(`(()=>{const buttons=[...document.querySelectorAll('button,input[type=button],input[type=submit]')].filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&!e.disabled&&/^Start(?: Quiz)?$/i.test((e.textContent||e.value||'').trim())});if(buttons.length!==1)throw new Error('Reviewed quiz start control missing or ambiguous');const e=buttons[0];e.scrollIntoView({block:'center',behavior:'instant'});const r=e.getBoundingClientRect(),x=r.x+r.width/2,y=r.y+r.height/2;if(document.elementFromPoint(x,y)!==e&&!e.contains(document.elementFromPoint(x,y)))throw new Error('Quiz start control obstructed');return {x,y};})()`);
       await page.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});
       await page.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});
@@ -174,6 +180,7 @@ async function audit(url,index,embedded=false){
         item.state=state;
       }
       item.passive_timer_watch_input_sent=false;
+      item.survey_terminal=await page.evaluate(`(()=>{const result=document.querySelector('.sd-completedpage,.sv-completedpage');const timer=document.querySelector('.sd-timer');const visible=e=>{if(!e)return false;const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'};return {result_present:!!result,result_visible:visible(result),result_class:result?.className??null,result_text:visible(result)?result.innerText.slice(0,1200):null,timer_present:!!timer,timer_visible:visible(timer),body_class:document.querySelector('.sd-body')?.className??null,visible_question_inputs:[...document.querySelectorAll('.sd-body input')].filter(visible).length,visible_navigation:[...document.querySelectorAll('.sd-body button')].filter(visible).map(e=>({class:e.className,text:e.innerText.slice(0,100)}))};})()`);
     }
     if(!/^https?:/.test(item.state.url))throw new Error("Owned site navigation did not settle; inventory unverified");
     await page.send("Page.startScreencast",{format:"png",maxFramesInFlight:1});
@@ -193,14 +200,27 @@ async function audit(url,index,embedded=false){
       }
     }
     const parsedCatalog=new URL(url);
-    const catalogSupported=(parsedCatalog.hostname==='h5pstudio.ecampusontario.ca'&&/^\/(?:catalogue)?$/.test(parsedCatalog.pathname))||(parsedCatalog.hostname==='studio.libretexts.org'&&parsedCatalog.pathname==='/library'&&item.state.active_catalog_type==='Question Set');
+    const catalogSupported=(parsedCatalog.hostname==='h5pstudio.ecampusontario.ca'&&/^\/(?:catalogue)?$/.test(parsedCatalog.pathname))||(parsedCatalog.hostname==='studio.libretexts.org'&&parsedCatalog.pathname==='/library'&&Array.isArray(item.state.catalog_question_set_links));
     if(catalogCandidates&&!embedded&&!item.state.access_blocked&&catalogSupported){
       auditedCatalogPages.add(item.state.url);
-      const candidates=[...new Set(item.state.related_links.map(link=>link.url))].filter(link=>/^https:\/\/(?:h5pstudio\.ecampusontario\.ca\/content|studio\.libretexts\.org\/h5p)\/\d+$/.test(link)).slice(0,20);
+      const sourceLinks=parsedCatalog.hostname==='studio.libretexts.org'?item.state.catalog_question_set_links:item.state.related_links.map(link=>link.url);
+      const candidates=[...new Set(sourceLinks)].filter(link=>/^https:\/\/(?:h5pstudio\.ecampusontario\.ca\/content|studio\.libretexts\.org\/h5p)\/\d+$/.test(link)).slice(0,20);
       item.followed_public_candidates=candidates;
       let next=0;
       await Promise.all(Array.from({length:2},async()=>{while(next<candidates.length){const slot=next++;await audit(candidates[slot],`${index}-candidate-${slot}`,false);}}));
-      const nextPage=item.state.pagination_links?.find(link=>/^Next\b/.test(link.text))?.url;
+      let nextPage;
+      if(parsedCatalog.hostname==='studio.libretexts.org'){
+        const currentUrl=new URL(item.state.url);
+        const currentPage=Number(currentUrl.searchParams.get('page')??0);
+        const nextLink=item.state.pagination_links?.find(link=>{
+          const target=new URL(link.url);
+          return target.origin===currentUrl.origin&&target.pathname===currentUrl.pathname&&Number(target.searchParams.get('page'))===currentPage+1;
+        });
+        if(nextLink){
+          const target=new URL(nextLink.url);
+          nextPage=target.href;
+        }
+      }else nextPage=item.state.pagination_links?.find(link=>/^Next\b/.test(link.text))?.url;
       if(catalogWalk&&nextPage&&!auditedCatalogPages.has(nextPage)&&auditedCatalogPages.size<15){
         item.followed_next_catalog_page=nextPage;
         await browser.send('Target.closeTarget',{targetId:ownedTargetId});ownedTargetId=null;delete item.page;

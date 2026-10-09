@@ -21,6 +21,8 @@ import type { InitialSemanticSnapshot, InitialSemanticReading } from "../web/ini
 import { requireCurrentWebsite } from "./website-access";
 import { ZhidaoSubmissionReceipt } from '../web/zhidao-result';
 import type { ZhidaoResultReading } from '../web/zhidao-result';
+import { readSurveyJsResult } from "./surveyjs-result";
+import { readH5pSingleChoiceResult } from "./h5p-single-choice-result";
 
 async function rawSendToTab<T>(tabId: number, frameId: number, request: ContentRequest): Promise<T> {
   const response = (await chrome.tabs.sendMessage(tabId, request, { frameId })) as ContentResponse | undefined;
@@ -61,6 +63,7 @@ export class TabPlatformProxy implements RuntimePlatform {
   #separationStructure: LocalStructure | null = null;
   #firstSemanticSnapshotSent = false;
   #initialSemanticValidated = false;
+  #customSemanticMapped = false;
   #snapshotOrigin: string | null = null;
   #lastStructureKey: string | null = null;
   #interaction: InteractionBinding | null = null;
@@ -85,7 +88,7 @@ export class TabPlatformProxy implements RuntimePlatform {
     readonly observationInputMode: ObservationInputMode = "structured",
     private readonly calibrateSeparation?: (snapshot: SeparationSnapshot, signal: AbortSignal) => Promise<SeparationRoles>,
     private readonly recognizeVisual?: (capture: VisualCapture, signal: AbortSignal, context?: VisualRecognitionContext) => Promise<VisualReading>,
-    private readonly recognizeInitialSemantic?: (snapshot: InitialSemanticSnapshot, signal: AbortSignal) => Promise<InitialSemanticReading>,
+    private readonly recognizeInitialSemantic?: (snapshot: InitialSemanticSnapshot, signal: AbortSignal, capture?: VisualCapture) => Promise<InitialSemanticReading>,
   ) {}
 
   capabilities(): PlatformCapabilities {
@@ -111,6 +114,7 @@ export class TabPlatformProxy implements RuntimePlatform {
     await this.#visualClosing;
     this.#interaction = { session_id: sessionId, epoch: crypto.randomUUID(), enabled: true };
     this.#initialSemanticValidated = false;
+    this.#customSemanticMapped = false;
     this.#frameIds = await ensureContentInjected(this.tabId);
     await this.#bindInteraction();
   }
@@ -191,11 +195,20 @@ export class TabPlatformProxy implements RuntimePlatform {
       if (this.observationInputMode === "visual_snapshot") {
         if (!this.recognizeVisual) throw new Error("VISUAL_UNAVAILABLE: authorized visual recognition is required.");
         this.#activeFrameId = 0;
-        this.#activateVisual();
+        if (!this.recognizeInitialSemantic || geometries.some(geometry => geometry.isolated_canvas)) this.#activateVisual();
       } else if (!this.recognizeInitialSemantic) {
         throw new Error("SEMANTIC_UNAVAILABLE: initial page recognition is required.");
       }
       return { ready: true };
+    }
+    if (this.#initialSemanticValidated && this.#frameIds.includes(this.#activeFrameId)) {
+      const active = await rawSendToTab<ReadinessResult>(this.tabId, this.#activeFrameId, { type: 'VV_WAIT_READY' });
+      _signal.throwIfAborted();
+      if (active.ready) return active;
+      if (this.#customSemanticMapped && active.reason === 'semantic_structure_changed') {
+        this.#initialSemanticValidated = false;
+        return { ready: true };
+      }
     }
     let mainFrameResult: ReadinessResult | null = null;
     const childResults = await Promise.all(
@@ -211,6 +224,12 @@ export class TabPlatformProxy implements RuntimePlatform {
       }),
     );
     const readyChildren = childResults.filter((item) => item.result.ready);
+    const changedChildren = childResults.filter(item => item.result.reason === 'semantic_structure_changed');
+    if (this.#customSemanticMapped && changedChildren.length === 1 && readyChildren.length === 0) {
+      this.#activeFrameId = changedChildren[0]!.frameId;
+      this.#initialSemanticValidated = false;
+      return { ready: true };
+    }
     if (readyChildren.length === 1) {
       this.#activeFrameId = readyChildren[0]!.frameId;
       return readyChildren[0]!.result;
@@ -219,6 +238,11 @@ export class TabPlatformProxy implements RuntimePlatform {
       try {
         const mainFrame = await rawSendToTab<ReadinessResult>(this.tabId, 0, { type: "VV_WAIT_READY" });
         mainFrameResult = mainFrame;
+        if (this.#customSemanticMapped && mainFrame.reason === 'semantic_structure_changed') {
+          this.#activeFrameId = 0;
+          this.#initialSemanticValidated = false;
+          return { ready: true };
+        }
         if (mainFrame.ready) {
           this.#activeFrameId = 0;
           return mainFrame;
@@ -300,42 +324,62 @@ export class TabPlatformProxy implements RuntimePlatform {
     })));
     signal.throwIfAborted();
     const snapshot: InitialSemanticSnapshot = {
-      visible_text: frames.map(item => `[frame ${item.frameId}]\n${item.snapshot.visible_text}`).join("\n").slice(0, 12_000),
+      visible_text: frames.map(item => `[frame ${item.frameId}]\n${item.snapshot.visible_text}`).join("\n"),
       regions: frames.flatMap(item => item.snapshot.regions.map(region => ({
         ...region, region_id: `frame_${item.frameId}:${region.region_id}`,
-      }))).slice(0, 64),
+      }))),
+      elements: frames.flatMap(item => (item.snapshot.elements ?? []).map(element => ({ ...element,
+        element_id: `frame_${item.frameId}:${element.element_id}`,
+        parent_id: element.parent_id ? `frame_${item.frameId}:${element.parent_id}` : null,
+      }))),
     };
-    while (JSON.stringify(snapshot).length > 20_000 && snapshot.regions.length) snapshot.regions.pop();
     await requireCurrentWebsite(this.tabId);
     signal.throwIfAborted();
     if (!this.interactionMatches(sessionId, binding.epoch)) throw new Error("USER_INTERACTION: initial recognition was paused.");
-    const reading = await this.recognizeInitialSemantic(snapshot, signal);
+    const capture = this.observationInputMode === 'visual_snapshot' ? await this.#getTransport().capture(sessionId, crypto.randomUUID(), signal) : undefined;
+    const reading = await this.recognizeInitialSemantic(snapshot, signal, capture);
     signal.throwIfAborted();
     if (!this.interactionMatches(sessionId, binding.epoch)) throw new Error("USER_INTERACTION: initial reading belongs to an inactive session.");
-    const selected = frames.filter(item => reading.region_ids.some(id => id.startsWith(`frame_${item.frameId}:`)));
-    if (selected.length !== 1 || !reading.region_ids.length || new Set(reading.region_ids).size !== reading.region_ids.length ||
-      reading.region_ids.some(id => !snapshot.regions.some(region => region.region_id === id))) {
-      throw new Error("SEMANTIC_UNCERTAIN: initial model reading has no unambiguous locally mapped question regions.");
+    if (reading.use_visual) {
+      if (this.observationInputMode !== 'visual_snapshot') throw new Error('SEMANTIC_UNCERTAIN: the displayed question requires screenshot mode.');
+      this.#activateVisual();
+      return;
     }
+    const regionIds = [...new Set([...reading.region_ids, ...(reading.questions ?? []).map(question => question.region_id)])];
+    if (!regionIds.length) throw new Error('SEMANTIC_NO_QUESTIONS: the model returned no active supported question.');
+    const unknownIds = regionIds.filter(id => !snapshot.regions.some(region => region.region_id === id) && !snapshot.elements?.some(element => element.element_id === id));
+    if (unknownIds.length) throw new Error(`SEMANTIC_UNKNOWN_ELEMENT: ${unknownIds.length} returned question region(s) are absent from the current snapshot.`);
+    const selected = frames.filter(item => regionIds.some(id => id.startsWith(`frame_${item.frameId}:`)));
+    if (selected.length !== 1) throw new Error(`SEMANTIC_MULTIPLE_SURFACES: the model mapped questions to ${selected.length} page frames.`);
     await requireCurrentWebsite(this.tabId);
     signal.throwIfAborted();
     const frame = selected[0]!;
     const validated = await rawSendToTab<boolean>(this.tabId, frame.frameId, {
       type: "VV_APPLY_INITIAL_SEMANTIC", binding,
-      reading: { region_ids: reading.region_ids.map(id => id.slice(`frame_${frame.frameId}:`.length)) },
+      reading: { region_ids: regionIds.map(id => id.slice(`frame_${frame.frameId}:`.length)),
+        questions: reading.questions?.map(question => ({ ...question,
+          region_id: question.region_id.slice(`frame_${frame.frameId}:`.length),
+          stem_ids: question.stem_ids.map(id => id.slice(`frame_${frame.frameId}:`.length)),
+          option_ids: question.option_ids.map(id => id.slice(`frame_${frame.frameId}:`.length)),
+          blank_ids: question.blank_ids.map(id => id.slice(`frame_${frame.frameId}:`.length)),
+          controls: question.controls.map(control => ({ ...control, element_id: control.element_id.slice(`frame_${frame.frameId}:`.length) })),
+        })),
+      },
     });
     signal.throwIfAborted();
     if (!validated) throw new Error("SEMANTIC_UNCERTAIN: initial model regions failed local DOM validation.");
     this.#activeFrameId = frame.frameId;
     this.#initialSemanticValidated = true;
+    this.#customSemanticMapped = Boolean(reading.questions?.length);
     this.#separationStructure = null;
   }
 
   async observeSession(sessionId: string, _signal: AbortSignal): Promise<PlatformObservation> {
     _signal.throwIfAborted();
     if (this.#visualActive) return this.#activateVisual().observeSession(sessionId, _signal);
-    const initialized = this.observationInputMode === "semantic_snapshot" && !this.#initialSemanticValidated;
+    const initialized = this.observationInputMode !== "structured" && !this.#initialSemanticValidated;
     if (initialized) await this.#recognizeInitialPage(sessionId, _signal);
+    if (this.#visualActive) return this.#activateVisual().observeSession(sessionId, _signal);
     let reused = false;
     const hadStructure = Boolean(this.#separationStructure);
     if (this.#separationStructure) {
@@ -347,7 +391,7 @@ export class TabPlatformProxy implements RuntimePlatform {
     }
     const mode: ObservationInputMode = this.observationInputMode === "semantic_snapshot"
       ? (!this.#firstSemanticSnapshotSent || (hadStructure && !reused) ? "semantic_snapshot" : "structured")
-      : reused ? "structured" : this.observationInputMode;
+      : this.observationInputMode === 'visual_snapshot' && this.#initialSemanticValidated ? 'structured' : reused ? "structured" : this.observationInputMode;
     let observation: PlatformObservation;
     let recoveredByCalibration = false;
     try {
@@ -355,6 +399,13 @@ export class TabPlatformProxy implements RuntimePlatform {
         type: "VV_OBSERVE", session_id: sessionId, mode,
       });
     } catch (error) {
+      if (this.recognizeInitialSemantic && this.#customSemanticMapped && /No supported question|question_not_found/i.test(error instanceof Error ? error.message : '')) {
+        this.#initialSemanticValidated = false;
+        await this.#recognizeInitialPage(sessionId, _signal);
+        if (this.#visualActive) return this.#activateVisual().observeSession(sessionId, _signal);
+        observation = await this.#sendWithNavigationRecovery<PlatformObservation>({ type: 'VV_OBSERVE', session_id: sessionId, mode: 'structured' });
+        recoveredByCalibration = true;
+      } else {
       if (this.observationInputMode === "visual_snapshot" && this.recognizeVisual && /No supported question|observation_missing/i.test(error instanceof Error ? error.message : "")) {
         return this.#activateVisual().observeSession(sessionId, _signal);
       }
@@ -369,6 +420,7 @@ export class TabPlatformProxy implements RuntimePlatform {
       observation = await this.#sendWithNavigationRecovery<PlatformObservation>({
         type: "VV_OBSERVE", session_id: sessionId, mode: this.observationInputMode,
       });
+      }
     }
     _signal.throwIfAborted();
     const structureChanged = this.#lastStructureKey !== null && this.#structureKey(observation) !== this.#lastStructureKey;
@@ -471,7 +523,13 @@ export class TabPlatformProxy implements RuntimePlatform {
     }
     const state = await this.#sendWithNavigationRecovery<PlatformState>({ type: "VV_READ_STATE" });
     _signal.throwIfAborted();
-    if (!this.#zhidaoReceipt.awaiting) return state;
+    if (!this.#zhidaoReceipt.awaiting) {
+      if (state.completed || this.#activeFrameId !== 0) return state;
+      const result = await readSurveyJsResult(this.tabId) ?? await readH5pSingleChoiceResult(this.tabId);
+      _signal.throwIfAborted();
+      return result ? { ...state, completed: true, visible_score: result, feedback: null,
+        can_retry: false, has_next: false, has_session_submit: false } : state;
+    }
     await requireCurrentWebsite(this.tabId); _signal.throwIfAborted();
     const receipt = this.#zhidaoReceipt.reconcile(await this.#sendWithNavigationRecovery<ZhidaoResultReading | null>({type:'VV_READ_ZHIDAO_RESULT'}));
     _signal.throwIfAborted();

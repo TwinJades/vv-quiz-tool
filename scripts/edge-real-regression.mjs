@@ -1,51 +1,31 @@
-const base = `http://127.0.0.1:${process.argv[3] ?? 9341}`;
+import {CdpClient} from './cdp-client.mjs';
+import {ownedBrowserConnection,ownedExtensionIds} from './owned-browser.mjs';
+const connection=await ownedBrowserConnection(process.env.VV_BROWSER_CONNECTION??'.browser-regression-runtime/course-login-20261004-040551/connection-login-ready.json');
+if(process.argv[3]&&Number(process.argv[3])!==connection.port)throw new Error('Requested port does not belong to the verified owned browser.');
+const base = `http://127.0.0.1:${connection.port}`;
 const site = process.argv[2];
 const sampleQuestions = Number(process.argv[5] ?? 0);
-const extensionIdHint = process.env.VV_EXTENSION_ID ?? "denncmmiepljpbohhclcjcdjondnfgco";
+const extensionIdHint = process.env.VV_EXTENSION_ID ?? (await ownedExtensionIds(connection.profile)).vv;
 const genericComplete = site === "generic" && process.argv[7] === "complete";
 if (!["frontend", "quizzy", "w3c", "generic", "separation", "separation_controls", "inspect", "quizzyprobe", "w3probe", "reload", "models"].includes(site)) throw new Error("Unknown regression target");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-class Cdp {
+class Cdp extends CdpClient {
   constructor(url) {
-    this.socket = new WebSocket(url);
-    this.id = 0;
-    this.pending = new Map();
+    super(url);
     this.events = [];
-    this.ready = new Promise((resolve, reject) => {
-      this.socket.addEventListener("open", resolve, { once: true });
-      this.socket.addEventListener("error", reject, { once: true });
-    });
     this.socket.addEventListener("message", (event) => {
       const message = JSON.parse(event.data);
-      if (message.method) this.events.push(message);
-      const pending = this.pending.get(message.id);
-      if (!pending) return;
-      this.pending.delete(message.id);
-      message.error ? pending.reject(new Error(message.error.message)) : pending.resolve(message.result);
-    });
-    this.socket.addEventListener("close", () => {
-      for (const pending of this.pending.values()) pending.reject(new Error("CDP target closed"));
-      this.pending.clear();
+      if (message.method) {if(this.events.length>=1000)this.events.shift();this.events.push(message);}
     });
   }
   async send(method, params = {}, sessionId) {
-    await this.ready;
-    const id = ++this.id;
-    const result = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
-    this.socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
-    return result;
+    return super.send(method,params,30000,sessionId);
   }
-  async evaluate(expression) {
-    const result = await this.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
-    return result.result.value;
-  }
-  close() { this.socket.close(); }
 }
 
 async function get(path, init) {
-  const response = await fetch(`${base}${path}`, init);
+  const response = await fetch(`${base}${path}`, {...init,signal:AbortSignal.timeout(10000)});
   if (!response.ok) throw new Error(`${response.status} ${path}`);
   return response.json();
 }

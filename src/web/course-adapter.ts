@@ -2,18 +2,21 @@ import type { CourseCatalog, CoursePlatform, CourseVerification, LearningTask, Q
 import { isExplicitlyHidden } from './dom-utils';
 import { readZhidaoDirectory } from './zhidao-directory';
 import { readChaoxingDirectory } from './chaoxing-directory';
-import { readChaoxingLearningPage } from './chaoxing-learning-page';
 import { readZhidaoNavigation } from './zhidao-navigation';
 import { readZhidaoPlayer } from './zhidao-player';
 import { ZhidaoLearningPage } from './zhidao-learning-page';
 import type { VisualGeometry } from '../core/visual';
+import {LiveCoursePage} from './live-course-page';
+import {SemanticCoursePage} from './semantic-course-page';
+import type {CourseSurfaceReading,CourseSurfaceSnapshot} from './course-surface';
 
 export type CoursePageRequest =
-  | { operation: 'catalog' }
-  | { operation: 'enter' | 'video' | 'speed' | 'speed_target' | 'mute' | 'play' | 'pause' | 'verify' | 'quiz' | 'rewatch'; course_id: string; task: LearningTask }
+  | {operation:'bind';catalog:CourseCatalog}
+  | { operation: 'catalog';known?:CourseCatalog }
+  | { operation: 'children' | 'enter' | 'video' | 'speed' | 'speed_target' | 'mute' | 'play' | 'pause' | 'verify' | 'quiz' | 'rewatch' | 'retry' | 'record'; course_id: string; task: LearningTask;hover_at?:number;tab_muted?:boolean }
   | { operation: 'directory'; course_id: string };
 export type CourseSpeedTarget={point:{x:number;y:number};captured_at:number;geometry:VisualGeometry};
-export type CoursePageResult = CourseCatalog | VideoSnapshot | CourseVerification | QuizBoundary | CourseSpeedTarget | boolean | null;
+export type CoursePageResult = CourseCatalog | LearningTask[] | VideoSnapshot | CourseVerification | QuizBoundary | CourseSpeedTarget | boolean | null;
 
 export function coursePlatform(url: string): CoursePlatform | null {
   try {
@@ -40,8 +43,16 @@ export class CoursePageAdapter {
   #popupPosition = new WeakMap<HTMLElement,number>();
   #allowedRates = new WeakMap<HTMLVideoElement,Set<number>>();
   readonly #zhidao:ZhidaoLearningPage;
-  constructor(private document:Document, readonly platform:CoursePlatform) {this.#zhidao=new ZhidaoLearningPage(document);}
-  close():void {this.#zhidao.close();}
+  readonly #live:LiveCoursePage;
+  readonly #semantic:SemanticCoursePage;
+  constructor(private document:Document, readonly platform:CoursePlatform) {this.#zhidao=new ZhidaoLearningPage(document);this.#live=new LiveCoursePage(document);this.#semantic=new SemanticCoursePage(document,platform);}
+  close():void {this.#zhidao.close();this.#live.close();this.#semantic.close();}
+  captureSemantic(context?:import('./course-surface').CourseFrameContext):CourseSurfaceSnapshot{return this.#semantic.capture(context);}
+  embeddedFrames():import('./course-surface').CourseEmbeddedFrame[]{return this.#semantic.ready()?this.#semantic.embeddedFrames():[];}
+  pauseCurrent(courseId:string,contextId:string|null,context?:import('./course-surface').CourseFrameContext):boolean{return this.#semantic.pauseCurrent(courseId,contextId,context);}
+  applySemantic(reading:CourseSurfaceReading):void{this.#semantic.apply(reading);}
+  expandSemantic(signal:AbortSignal,direction:'next'|'previous'='next'):boolean{return this.#semantic.loadNext(signal,direction);}
+  semanticInteractionTarget(target:EventTarget|null):boolean{return this.#semantic.ready()&&target instanceof this.document.defaultView!.Element&&Boolean(this.document.body?.contains(target));}
   root():HTMLElement {
     if(coursePlatform(this.document.location.href)!==this.platform)throw new Error('课程平台或网站身份改变。');
     const pageText=this.document.body?.innerText||this.document.body?.textContent||'';
@@ -54,16 +65,8 @@ export class CoursePageAdapter {
   private course(id:string):HTMLElement {const root=this.root();if(root.dataset.courseId!==id)throw new Error('课程身份失配。');return root;}
   catalog():CourseCatalog {
     if (coursePlatform(this.document.location.href) !== this.platform) throw new Error('课程平台或网站身份改变。');
-    if(this.platform==='zhidao'&&!this.document.querySelector('[data-course-id][data-course-catalog]')&&this.#zhidao.handles())return this.#zhidao.catalog();
-    // Real directory evidence is useful for preview, but knowledge cards and
-    // lesson rows are not yet executable video/quiz tasks. Never promote their
-    // percentages or icons into completed tasks or mark the catalog complete.
+    if(!this.document.querySelector('[data-course-id][data-course-catalog]')&&this.#live.handles())return this.#live.catalog();
     if (!this.document.querySelector('[data-course-id][data-course-catalog]')) {
-      const learning=this.platform==='chaoxing' ? readChaoxingLearningPage(this.document) : null;
-      if(learning)return {course_id:learning.course_id,platform:this.platform,title:learning.lesson_title??this.document.title,
-        revision:JSON.stringify(learning),complete:false,tasks:[],rules:{visibility_required:learning.visibility_required,speed_allowed:null},
-        diagnostics:[`当前课时有${learning.videos.length}个视频、${learning.quizzes.length}个关联测验；尚未完成真实执行映射。`,
-          ...learning.diagnostics,...(learning.quizzes.some(q=>q.visual_text_required)?['题干使用显示字体，需视觉识别后核对控件，不能直接求解原始乱码文字。']:[])]};
       const zhidao = this.platform === 'zhidao' ? readZhidaoDirectory(this.document) : null;
       if (zhidao) return { course_id: zhidao.course_id, platform: this.platform, title: this.document.title,
         revision: JSON.stringify(zhidao), complete: false, tasks: [],
@@ -175,6 +178,12 @@ export class CoursePageAdapter {
     return roots[0]!;
   }
   assertBoundary(courseId:string,task:LearningTask,expected:QuizBoundary):HTMLElement {
+    if(this.#semantic.ready())return this.#semantic.quizRoot(task,expected);
+    if(!this.document.querySelector('[data-course-catalog]')&&this.#live.handles()){
+      if(expected.kind==='video_popup')return this.#live.assertPopup(task,expected);
+      if(expected.course_id!==courseId||expected.task_id!==task.id||expected.id!==task.id)throw new Error('真实测验边界身份改变。');
+      return this.#live.quizRoot(task);
+    }
     const root=this.quizRoot(courseId,task,expected.kind);
     if(expected.course_id!==courseId||expected.task_id!==task.id||root.dataset.quizId!==expected.id||
       (expected.kind==='video_popup'?task.kind!=='video':expected.kind!==task.kind))throw new Error('弹题/测验身份改变。');
@@ -256,7 +265,11 @@ export class CoursePageAdapter {
   }
   execute(request:CoursePageRequest,signal:AbortSignal=new AbortController().signal):CoursePageResult|Promise<CoursePageResult> {
     signal.throwIfAborted();
-    if(this.platform==='zhidao'&&!this.document.querySelector('[data-course-id][data-course-catalog]')&&this.#zhidao.handles())return this.#zhidao.execute(request,signal);
+    if(this.#semantic.ready())return this.#semantic.execute(request,signal);
+    if(!this.document.querySelector('[data-course-id][data-course-catalog]')&&this.#live.handles())return this.#live.execute(request,signal);
+    if(request.operation==='bind')return true;
+    if(request.operation==='retry'||request.operation==='record')throw new Error('测验入口尚未确认。');
+    if(request.operation==='children')throw new Error('当前任务没有实际课时资源。');
     if(request.operation==='catalog')return this.catalog();
     if(request.operation==='directory'){this.click(this.button(this.course(request.course_id),'directory'));return true;}
     const {course_id,task}=request;
@@ -283,6 +296,7 @@ export class ChaoxingCourseAdapter extends CoursePageAdapter {constructor(docume
 export class CoursePageLease {
   #session:string|null=null;#adapter:CoursePageAdapter|null=null;
   constructor(private document:Document){}
+  close():void {this.#adapter?.close();this.#adapter=null;this.#session=null;}
   preview(platform:CoursePlatform):CoursePageAdapter {return new CoursePageAdapter(this.document,platform);}
   forSession(platform:CoursePlatform,session:string):CoursePageAdapter {
     if(!session)throw new Error('课程执行缺少父会话身份。');

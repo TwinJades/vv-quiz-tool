@@ -94,12 +94,7 @@ export class VisualWebAdapter implements RuntimePlatform {
     const capture = await this.#capture(observationId, signal);
     signal.throwIfAborted();
     let reading = this.#reading;
-    let sameRegions = false;
-    if(reading?.status === "questions" && reading.timer_is_countdown !== true && this.#current) {
-      try { assertVisualFreshness({ ...this.#current.frame, validated_regions: this.#regions(reading,this.#current.frame) }, capture.frame); sameRegions=true; }
-      catch { /* Changed question/control pixels need a new independent reading. */ }
-    }
-    if (!reading || !this.#current || (!sameRegions && capture.frame.fingerprint !== this.#current.frame.fingerprint) ||
+    if (!reading || !this.#current || capture.frame.fingerprint !== this.#current.frame.fingerprint ||
       JSON.stringify(capture.frame.geometry) !== JSON.stringify(this.#current.frame.geometry) || capture.frame.zoom !== this.#current.frame.zoom) {
       this.#metrics.recognitions++;
       const context: VisualRecognitionContext | undefined = reading?.status === 'questions' ? {

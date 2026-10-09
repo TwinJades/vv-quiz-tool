@@ -26,7 +26,7 @@ export async function listProviderModels(
         : profile.provider_type === "anthropic"
           ? { "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true", ...(apiKey ? { "x-api-key": apiKey } : {}) }
           : (apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-      ...(signal ? { signal } : {}),
+      signal: signal ? AbortSignal.any([signal,AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
     };
     const models: string[] = [];
     const inputTokenLimits: Record<string, number> = Object.create(null);

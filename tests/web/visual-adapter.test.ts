@@ -68,7 +68,7 @@ describe("visual execution and independent verification", () => {
     driver.click.mockImplementation(async point=>{await click(point);controlRole('session_submit');});
     const observed=await platform.observeSession('s1',signal()),item=observed.questions[0]!;
     await expect(platform.execute({schema_version:'1.0',session_id:'s1',question_id:item.question.question_id,
-      observation_id:observed.observation_id,strategy:'supervised',preconditions:[],
+      observation_id:observed.observation_id,strategy:'unattended',preconditions:[],
       actions:[{action_id:'select',kind:'set_selected',target_id:item.question.options[0]!.id,value:true},
         {action_id:'submit',kind:'submit_question',target_id:'control_submit'}]},item.locator_map,signal())).rejects.toThrow('control role changed');
     expect(driver.click).toHaveBeenCalledOnce();
@@ -79,7 +79,7 @@ describe("visual execution and independent verification", () => {
     const observed=await platform.observeSession('s1',signal()),item=observed.questions[0]!;
     expect(recognize.mock.calls[0]?.[2]).toBeUndefined();
     await platform.execute({schema_version:'1.0',session_id:'s1',question_id:item.question.question_id,
-      observation_id:observed.observation_id,strategy:'supervised',preconditions:[],
+      observation_id:observed.observation_id,strategy:'unattended',preconditions:[],
       actions:[{action_id:'select',kind:'set_selected',target_id:item.question.options[0]!.id,value:true}]},item.locator_map,signal());
     const hint=recognize.mock.calls.at(-1)?.[2];
     expect(hint).toEqual({previous_structure:[{type:'single_choice',stem:item.question.stem.text,

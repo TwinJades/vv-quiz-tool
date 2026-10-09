@@ -1,5 +1,6 @@
 // Real MV3 browsers, local HTTP protocol fixtures only. No external model calls.
 import { spawn, spawnSync } from "node:child_process";
+import {finishOwnedTestRun} from './finish-owned-test-run.mjs';
 import { createServer } from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -22,6 +23,7 @@ const lifecycleTests = process.argv.includes("--lifecycle");
 const budgetTests = process.argv.includes("--budget");
 const panelTests = process.argv.includes("--panel");
 const heldTimers = new Map();
+const ownedBrowsers=[];
 const heldMedia = new Map();
 const mediaRequests = new Map();
 const heldLife = new Map();
@@ -216,6 +218,7 @@ async function runBrowser(name, path, port) {
     "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--no-sandbox", "about:blank"],
     { windowsHide: true, stdio: useTcp ? ["ignore", "ignore", "pipe"] : ["ignore", "ignore", "pipe", "pipe", "pipe"] });
   child.on("error", error => result.errors.push(error.message));
+  ownedBrowsers.push(child);
   child.on("exit", (code, signal) => { result.launcher_exit = { code, signal }; });
   child.stderr.on("data", chunk => stderr.push(chunk.toString()));
   let cdp;
@@ -316,20 +319,16 @@ async function runBrowser(name, path, port) {
         // Actual extension panels and actual port disconnection, only owned tabs.
         const panels=await Promise.all([1,2].map(async()=> (await cdp.send('Target.createTarget',{url:`chrome-extension://${extensionId}/tasks.html`})).targetId));
         await pause(300);
-        const ctl1=await start('ctl1','supervised'),ctl2=await start('ctl2','supervised'),ctlU=await start('ctlu');
+        const ctl1=await start('ctl1'),ctl2=await start('ctl2'),ctlU=await start('ctlu');
         await waitFor(async()=>['ctl1','ctl2','ctlu'].every(id=>heldLife.has(`${name}:${id}`)),'controller tasks held');
         await cdp.send('Target.closeTarget',{targetId:panels[0]});await pause(150);
-        if((await state(ctl1.tab.id)).state!=='SOLVE')throw new Error('One of two controllers closing paused supervision');
+        if((await state(ctl1.tab.id)).state!=='SOLVE')throw new Error('Closing one controller paused the task');
         await cdp.send('Target.closeTarget',{targetId:panels[1]});
-        await waitFor(async()=> (await state(ctl1.tab.id)).state==='PAUSED'&&(await state(ctl2.tab.id)).state==='PAUSED','last supervised controller closes');
-        if((await state(ctlU.tab.id)).state!=='SOLVE')throw new Error('Unattended task paused with controller close');
+        if((await state(ctl1.tab.id)).state!=='SOLVE'||(await state(ctl2.tab.id)).state!=='SOLVE'||(await state(ctlU.tab.id)).state!=='SOLVE')throw new Error('Closing all controllers paused a task');
         release('ctl1');release('ctl2');await finish(ctlU);
-        const panel=(await cdp.send('Target.createTarget',{url:`chrome-extension://${extensionId}/tasks.html`})).targetId;await pause(200);
-        await send({type:'VV_RESUME_SESSION',tab_id:ctl1.tab.id});await send({type:'VV_RESUME_SESSION',tab_id:ctl2.tab.id});
-        await waitFor(async()=> (await state(ctl1.tab.id)).state==='COMPLETE'&&(await state(ctl2.tab.id)).state==='COMPLETE','supervised resumes after fresh panel');
+        await waitFor(async()=> (await state(ctl1.tab.id)).state==='COMPLETE'&&(await state(ctl2.tab.id)).state==='COMPLETE','tasks complete after controllers close');
         for(const job of [ctl1,ctl2,ctlU])await send({type:'VV_CLEAR_SESSION',tab_id:job.tab.id});
-        await cdp.send('Target.closeTarget',{targetId:panel});
-        item.checks.push('multiple_controllers/last_controller_supervised_pause/unattended_continues');
+        item.checks.push('multiple_controllers/last_controller_close_continues');
         const closed=await start('closed');await waitFor(async()=>heldLife.has(`${name}:closed`),'closed task model held');
         await control.evaluate(`chrome.tabs.remove(${closed.tab.id})`);release('closed');
         await waitFor(async()=>!(await send({type:'VV_GET_TASKS'})).tasks.some(task=>task.tab_id===closed.tab.id),'closed tab removed from panel');
@@ -356,7 +355,7 @@ async function runBrowser(name, path, port) {
       result.timer=[];
       const timerPanel=(await cdp.send('Target.createTarget',{url:`chrome-extension://${extensionId}/tasks.html`})).targetId;
       await pause(200);
-      const timerCases=['shortened','stalled','media-shortened'].flatMap(kind=>['supervised','unattended'].map(strategy=>({id:`${kind}-${strategy}`,kind,strategy})));
+      const timerCases=['shortened','stalled','media-shortened'].map(kind=>({id:`${kind}-unattended`,kind,strategy:'unattended'}));
       await Promise.all(timerCases.map(async({id,kind,strategy})=>{
         const item={id,strategy,passed:false,error:null};result.timer.push(item);
         try {
@@ -364,7 +363,7 @@ async function runBrowser(name, path, port) {
           const mediaCase=kind==='media-shortened';
           const p={...original,provider_profile_id:`timer-${id}`,secret_ref:`timer-${id}`,base_url:`http://127.0.0.1:${port}/${name}/openai_compatible/timer-${id}/v1`,capabilities:{...original.capabilities,image_input:mediaCase},image_upload_authorized:mediaCase};
           await control.evaluate(`chrome.storage.local.set(${JSON.stringify({[`provider-profile:${p.provider_profile_id}`]:p,[`provider-secret:${p.secret_ref}`]:'local-fixture-only'})})`);
-          const url=`http://${strategy==='supervised'?'localhost':'127.0.0.1'}:${port}/timer/${name}/${id}`;
+          const url=`http://127.0.0.1:${port}/timer/${name}/${id}`;
           const tab=await control.evaluate(`chrome.tabs.create({url:${JSON.stringify(url)},active:false})`);await pause(300);
           const start=await control.evaluate(`chrome.runtime.sendMessage(${JSON.stringify({type:'VV_START_SESSION',tab_id:tab.id,provider_profile_id:p.provider_profile_id,model_id:p.model_catalog.models[0],strategy,model_call_limit:3,observation_input_mode:'structured'})})`);
           if(!start.ok)throw new Error(start.error);
@@ -384,7 +383,7 @@ async function runBrowser(name, path, port) {
           item.close_out_notices=item.all_notification_requests.filter(notice=>notice.id.startsWith(`vv-${tab.id}-`)&&notice.title==='VV 正在收尾');
           item.passed=item.snapshot?.state==='COMPLETE'&&item.snapshot.progress.answered===0&&item.snapshot.progress.skipped===2&&item.snapshot.model_calls.used===(mediaCase?0:1)&&item.website?.submissions===1&&item.website.text.includes('0 out of 2')&&item.after_late_answer.state==='COMPLETE'&&item.website_after_late_answer.submissions===1&&item.website.visibility==='hidden';
           if(!item.passed)throw new Error('Close-out did not preserve blank answers, single submission, late response isolation and hidden state');
-          if(item.close_out_notices.length!==(strategy==='supervised'?1:0)) {item.passed=false;throw new Error('Close-out notice was missing, duplicated or sent for unattended mode');}
+          if(item.close_out_notices.length!==1) {item.passed=false;throw new Error('Close-out notice was missing or duplicated');}
         }catch(error){item.error=error.message;}
         console.log(name,'timer',id,'passed',item.passed,'error',item.error);
       }));
@@ -464,7 +463,7 @@ async function runBrowser(name, path, port) {
       await Promise.all([
         { id: "main", host: "localhost", layout: "main", strategy: "unattended" },
         { id: "iframe", host: "127.0.0.1", layout: "iframe", strategy: "unattended" },
-        { id: "supervised", host: "127.0.0.1", layout: "fill", strategy: "supervised" },
+        { id: "fill", host: "127.0.0.1", layout: "fill", strategy: "unattended" },
         { id: "closed", host: "localhost", layout: "closed", strategy: "unattended" },
       ].map(async job => {
         const item = { ...job, passed: false, error: null };
@@ -576,7 +575,7 @@ async function runBrowser(name, path, port) {
     }
     if (visualTests) {
       result.visual = [];
-      const visualJobs = ["single", "multi", "fill"].flatMap(kind => ["unattended", "supervised"].map(strategy => ({ kind, strategy })));
+      const visualJobs = ["single", "multi", "fill"].map(kind => ({ kind, strategy: 'unattended' }));
       await Promise.all(visualJobs.map(async ({ kind, strategy }) => {
         const item = { strategy, kind, passed: false, error: null };
         result.visual.push(item);
@@ -585,7 +584,7 @@ async function runBrowser(name, path, port) {
           const profile = { ...profiles.find(profile => profile.provider_type === "openai_compatible"),
             provider_profile_id: profileId, secret_ref: profileId, capabilities: { image_input: true, structured_output: true, native_web_search: false }, image_upload_authorized: true };
           await control.evaluate(`chrome.storage.local.set(${JSON.stringify({ [`provider-profile:${profileId}`]: profile, [`provider-secret:${profileId}`]: "local-fixture-only" })})`);
-          const url = `http://${strategy === "supervised" ? "localhost" : "127.0.0.1"}:${port}/canvas/${name}/${strategy}/${kind}`;
+          const url = `http://127.0.0.1:${port}/canvas/${name}/${strategy}/${kind}`;
           item.url = url;
           const tab = await control.evaluate(`chrome.tabs.create({url:${JSON.stringify(url)},active:false})`);
           await pause(300);
@@ -633,15 +632,14 @@ async function runBrowser(name, path, port) {
 try {
   await mkdir(directory, { recursive: true });
   console.log("REPORT_DIRECTORY", directory);
-  const build = spawnSync(process.execPath, [resolve(root, "scripts/build.mjs")], { cwd: root, env: { ...process.env, VV_BUILD_DIR: extension }, stdio: "inherit" });
+  const build = spawnSync(process.execPath, [resolve(root, "scripts/build.mjs")], { cwd: root, env: { ...process.env, VV_BUILD_DIR: extension,VV_TEST_BUILD:'1' }, stdio: "inherit" });
   if (build.status !== 0) throw new Error("Isolated MV3 build failed");
   const manifest = JSON.parse(await readFile(resolve(extension, "manifest.json"), "utf8"));
   manifest.host_permissions = ["http://127.0.0.1/*", "http://localhost/*"];
   await writeFile(resolve(extension, "manifest.json"), JSON.stringify(manifest, null, 2));
-  // Only the owned test build records notifications. Every worker instance uses
-  // the same session store; no runtime API monkey patch or OS toast is involved.
+  // 诊断构建保留正常通知，并记录实际发送结果。
   await installTestNotificationRecorder(extension);
-  report.notification_delivery='private_build_recording_only_no_os_notifications';
+  report.notification_delivery='native_notifications_with_diagnostic_records';
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
   await Promise.all([
@@ -658,5 +656,6 @@ finally {
   server.close();
   report.finished_at = new Date().toISOString();
   await writeFile(resolve(directory, "report.json"), JSON.stringify(report, null, 2));
+  await finishOwnedTestRun(directory,ownedBrowsers);
   console.log("FINAL", JSON.stringify({ directory, browsers: report.browsers.map(browser => ({ name: browser.name, passed: browser.passed, errors: browser.errors, results: browser.results.map(item => ({ type: item.type, search: item.search, state: item.snapshot?.state, passed: item.passed, error: item.error })) })), errors: report.errors }));
 }

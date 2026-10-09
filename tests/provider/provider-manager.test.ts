@@ -21,12 +21,25 @@ const profile: ProviderProfile = {
 };
 
 describe("ProviderManager", () => {
+  it('retains both profiles when two managers save concurrently',async()=>{
+    const store=new MemoryKeyValueStore(),first=new ProviderManager(store),second=new ProviderManager(store);
+    const other={...profile,provider_profile_id:'provider_2',secret_ref:'secret_2'};
+    await Promise.all([first.save({profile}),second.save({profile:other})]);
+    expect((await first.list()).map(item=>item.provider_profile_id).sort()).toEqual(['provider_1','provider_2']);
+  });
+  it('rejects a stale refresh after a newer configuration has been saved',async()=>{
+    const manager=new ProviderManager(new MemoryKeyValueStore());await manager.save({profile});
+    const original=(await manager.get(profile.provider_profile_id))!;
+    await manager.save({profile:{...original,display_name:'新名称'},expected:original});
+    await expect(manager.save({profile:{...original,model_catalog:{...original.model_catalog,models:['new-model']}},expected:original})).rejects.toThrow('changed');
+    expect((await manager.get(profile.provider_profile_id))?.display_name).toBe('新名称');
+  });
   it("keeps API keys separate from stored profiles", async () => {
     const store = new MemoryKeyValueStore();
     const manager = new ProviderManager(store);
     await manager.save({ profile, apiKey: "private-key" });
 
-    expect(await manager.list()).toEqual([profile]);
+    expect(await manager.list()).toEqual([{ ...profile, provider_batch_limits: { max_questions: 5, max_estimated_tokens: 12000, max_images: 4 } }]);
     expect(JSON.stringify(await manager.list())).not.toContain("private-key");
     expect(await manager.getApiKey(profile)).toBe("private-key");
   });

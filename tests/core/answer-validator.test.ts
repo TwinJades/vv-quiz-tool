@@ -36,6 +36,17 @@ function answer(overrides: Partial<AnswerResult> = {}): AnswerResult {
 }
 
 describe("validateAnswer", () => {
+  it('rejects whitespace-only required values and values exceeding maxlength',()=>{
+    const frame:QuestionFrame={...singleChoiceQuestion,type:'fill_blank',options:[],blanks:[{id:'blank_1',label:'值',required:true,max_length:3}],constraints:{min_selections:0,max_selections:0}};
+    const result=(value:string)=>validateAnswer(frame,answer({answer_type:'fill_blank',selected_option_ids:[],blank_answers:[{blank_id:'blank_1',value}]}));
+    expect(result('  ').issues.map(issue=>issue.code)).toContain('MISSING_BLANK');
+    expect(result('1234').issues.map(issue=>issue.code)).toContain('BLANK_LENGTH');
+    expect(result('123')).toMatchObject({valid:true,executable:true});
+  });
+  it('rejects too many selections for a multiple-choice question',()=>{
+    const frame:QuestionFrame={...singleChoiceQuestion,type:'multiple_choice',constraints:{min_selections:1,max_selections:1}};
+    expect(validateAnswer(frame,answer({answer_type:'multiple_choice',selected_option_ids:['option_1','option_2']})).issues.map(issue=>issue.code)).toContain('SELECTION_COUNT');
+  });
   it("accepts an answer that references the current question and option", () => {
     expect(validateAnswer(singleChoiceQuestion, answer())).toMatchObject({
       valid: true,

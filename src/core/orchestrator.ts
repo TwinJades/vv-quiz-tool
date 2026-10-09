@@ -11,6 +11,7 @@ import {
   questionFrameSchema,
 } from "./schema";
 import type {
+  ActionResult,
   AnswerResult,
   BatchAnswerResult,
   ExecutionPlan,
@@ -83,6 +84,7 @@ export interface SessionSummary {
 }
 
 export interface SessionRuntimeSnapshot {
+  checkpoint?:{last_outcome:{fingerprint:string;status:'answered'|'failed';guessed:boolean}|null;answers:Array<[string,{answer:AnswerResult;guessed:boolean}]>;submission_pending:boolean;answer_retry_counts?:Array<[string,number]>};
   practice?: import('./knowledge-practice').KnowledgeRuntime;
   course?: import('./course').CourseRuntime;
   session_id: string;
@@ -102,6 +104,7 @@ export interface SessionRuntimeSnapshot {
 }
 
 export interface OrchestratorOptions {
+  restore?:SessionRuntimeSnapshot;
   max_answer_retries?: number;
   require_retry_control?: boolean;
   answer_retry_counts?: Map<string, number>;
@@ -115,6 +118,7 @@ export interface OrchestratorOptions {
   image_upload_authorized: boolean;
   allow_native_search?: boolean;
   on_update?: (snapshot: SessionRuntimeSnapshot) => void;
+  persist?: (snapshot:SessionRuntimeSnapshot)=>Promise<void>;
   wait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   now?: () => number;
 }
@@ -208,7 +212,7 @@ function unattendedFallback(
     const hasCandidate =
       question.type === "fill_blank"
         ? answer.blank_answers.length === question.blanks.length
-        : answer.selected_option_ids.length >= question.constraints.min_selections;
+        : answer.selected_option_ids.length >= question.constraints.min_selections && answer.selected_option_ids.length <= question.constraints.max_selections;
     if (hasCandidate) return { ...answer, status: "answered", warnings: [...answer.warnings, "unattended_best_candidate"] };
   }
   if (question.type === "fill_blank") return undefined;
@@ -250,6 +254,9 @@ export class QuizOrchestrator {
   #stageTimings = new Map<SessionState, { visits: number; total_ms: number; max_ms: number }>();
   #stepTimings = new Map<string, { calls: number; total_ms: number; max_ms: number }>();
   #pageAnswers = new Map<string, { answer: AnswerResult; guessed: boolean }>();
+  #submissionPending=false;
+  #operationPending=false;
+  #submissionStep:string|null=null;
   readonly #wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly #timer: SessionTimer;
 
@@ -262,6 +269,13 @@ export class QuizOrchestrator {
     this.budget = options.model_call_budget ?? new ModelCallBudget(options.model_call_limit ?? 300);
     this.#wait = options.wait ?? defaultWait;
     this.#timer = new SessionTimer(options.now);
+    if(options.restore){
+      const old=options.restore;
+      if(old.session_id!==options.session_id||old.provider_profile_id!==options.provider_profile_id||!old.checkpoint)throw new Error('Session recovery identity is invalid.');
+      this.#progress={...old.progress};this.#lastSequentialOutcome=old.checkpoint.last_outcome;this.#pageAnswers=new Map(old.checkpoint.answers);this.#state='PAUSED';
+      if(options.answer_retry_counts)for(const [id,count] of old.checkpoint.answer_retry_counts??[])options.answer_retry_counts.set(id,count);
+      if(old.checkpoint.submission_pending){this.#submissionPending=true;this.#notice='Submission recovery requires an explicit public result.';}
+    }
   }
 
   snapshot(): SessionRuntimeSnapshot {
@@ -286,6 +300,7 @@ export class QuizOrchestrator {
       progress: { ...this.#progress },
       notice: this.#notice,
       summary: this.#summary,
+      checkpoint:{last_outcome:this.#lastSequentialOutcome,answers:[...this.#pageAnswers],submission_pending:this.#submissionPending||this.#operationPending||this.platform.hasPendingSubmission?.()===true,answer_retry_counts:[...(this.options.answer_retry_counts??new Map())]},
       timer_remaining_seconds: this.#timer.remaining() === null ? null : Math.ceil(this.#timer.remaining()!),
       ...(this.platform.visualMetrics ? { visual_metrics: this.platform.visualMetrics() } : {}),
       timings: [...timings].map(([stage, value]) => ({
@@ -328,11 +343,6 @@ export class QuizOrchestrator {
     if (this.#state === "PAUSED") await this.run();
   }
 
-  switchStrategy(strategy: RunStrategy): void {
-    this.options.strategy = strategy;
-    this.options.on_update?.(this.snapshot());
-  }
-
   /** Only the authorized course parent may replace a paused child's solver. */
   replaceSolver(solver: RuntimeSolver, modelId: string): void {
     if (this.#state !== 'PAUSED' || this.#running) throw new Error('Solver replacement requires a settled paused child.');
@@ -368,6 +378,9 @@ export class QuizOrchestrator {
 
   async #readState(signal: AbortSignal): Promise<PlatformState> {
     const state = await this.platform.readState(signal);
+    signal.throwIfAborted();
+    if(state.completed){this.#submissionPending=false;this.#operationPending=false;}
+    else if(this.#submissionStep==='execute_submit'&&(state.question_graded||state.feedback!==null)){this.#submissionPending=false;this.#operationPending=false;}
     this.#timer.observe(state.timer_remaining_seconds);
     return state;
   }
@@ -427,9 +440,15 @@ export class QuizOrchestrator {
       this.#visibleScore = before.visible_score ?? null;
       this.#setState("COMPLETE"); this.#finish("completed", null); return;
     }
-    if (this.#timer.remaining() === 0) { this.pause("The observed deadline expired before submission; no late input was sent."); return; }
+    if (this.#timer.remaining() === 0) {
+      if (await this.#awaitTimedCompletion(signal)) return;
+      this.pause("The observed deadline expired before submission; no late input was sent."); return;
+    }
     const target = locatorMap.targets.control_submit_session ? "control_submit_session" : this.#controlHints.get("session_submit");
-    if (!target) { this.pause("Close-out needs an unambiguous whole-session submit control; no new model request was started."); return; }
+    if (!target) {
+      if (await this.#awaitTimedCompletion(signal)) return;
+      this.pause("Close-out needs an unambiguous whole-session submit control; no new model request was started."); return;
+    }
     const plan = controlPlan(locatorMap, this.options.strategy, "submit_session", target);
     const actions = await this.#timeStep("close_out_submit", () => this.platform.execute(plan, locatorMap, signal));
     const after = await this.#waitForControlOutcome(before, signal, true);
@@ -438,6 +457,25 @@ export class QuizOrchestrator {
     this.#progress.skipped = Math.max(this.#progress.skipped, this.#progress.total - this.#progress.answered - this.#progress.failed);
     this.#visibleScore = after.visible_score ?? null;
     this.#setState("COMPLETE"); this.#finish("completed", null);
+  }
+
+  async #awaitTimedCompletion(signal: AbortSignal): Promise<boolean> {
+    const remaining = this.#timer.remaining();
+    if (remaining === null) return false;
+    const deadline = performance.now() + Math.min(65_000, remaining * 1000 + 5_000);
+    while (!signal.aborted && performance.now() <= deadline) {
+      const state = await this.#readState(signal);
+      if (state.completed) {
+        this.#progress.skipped = Math.max(this.#progress.skipped,
+          this.#progress.total - this.#progress.answered - this.#progress.failed);
+        this.#visibleScore = state.visible_score ?? null;
+        this.#setState("COMPLETE"); this.#finish("completed", null);
+        return true;
+      }
+      await new Promise<void>(resolve => setTimeout(resolve, 500));
+    }
+    signal.throwIfAborted();
+    return false;
   }
 
   #recordStep(step: string, elapsed: number): void {
@@ -453,8 +491,16 @@ export class QuizOrchestrator {
     const started = performance.now();
     try {
       this.#controller?.signal.throwIfAborted();
+      const writing=step.startsWith('execute_')||step==='close_out_submit',submitting=step==='execute_submit'||step==='execute_session_submit'||step==='close_out_submit';
+      if(writing){this.#operationPending=true;if(submitting){this.#submissionPending=true;this.#submissionStep=step;}await this.options.persist?.(this.snapshot());}
+      this.#controller?.signal.throwIfAborted();
       const value = await action();
       this.#controller?.signal.throwIfAborted();
+      if(writing&&Array.isArray(value)){
+        const results=value as ActionResult[];
+        if(results.length&&results.every(result=>result.status==='failed')){this.#operationPending=false;if(submitting)this.#submissionPending=false;}
+        else if(!submitting&&results.length&&results.every(result=>result.status==='succeeded'))this.#operationPending=false;
+      }
       return value;
     }
     finally { this.#recordStep(step, performance.now() - started); }
@@ -604,7 +650,7 @@ export class QuizOrchestrator {
           const item = pending.get(question.question_id)!;
           let answer = validation.executable_answers.find(answer => answer.question_id === question.question_id);
           let guessed = false;
-          if (!answer && attempt === 3 && this.options.strategy === "unattended") {
+          if (!answer && attempt === 3) {
             const candidate = validation.valid_answers.find(answer => answer.question_id === question.question_id);
             // A malformed/wrong-batch response cannot authorize a guess.
             if (!validation.issues.some(issue => !issue.question_id || issue.question_id === question.question_id)) {
@@ -661,7 +707,7 @@ export class QuizOrchestrator {
     try {
       while (!signal.aborted) {
         this.#notice = null;
-        if (this.platform.hasPendingSubmission?.()) {
+        if (this.platform.hasPendingSubmission?.()||this.#submissionPending||this.#operationPending) {
           this.#setState("VERIFY");
           const terminal = await this.#timeStep("read_pending_submission", () => this.#readState(signal));
           signal.throwIfAborted();
@@ -673,6 +719,21 @@ export class QuizOrchestrator {
             this.pause("本次提交结果尚未确认；继续时先核对结果，不重复识别、填写或提交。");
           }
           return;
+        }
+        if (this.#progress.answered > 0) {
+          let terminal = await this.#timeStep("read_terminal_result", () => this.#readState(signal));
+          if (!terminal.completed && terminal.visible_score && this.#timer.remaining() === null) {
+            const deadline = performance.now() + 5_000;
+            while (!terminal.completed && performance.now() < deadline) {
+              await new Promise<void>(resolve => setTimeout(resolve, 250));
+              terminal = await this.#timeStep("read_terminal_result", () => this.#readState(signal));
+            }
+          }
+          if (terminal.completed && terminal.visible_score) {
+            this.#visibleScore = terminal.visible_score;
+            this.#setState("COMPLETE"); this.#finish("completed", null);
+            return;
+          }
         }
         this.#setState("WAIT_READY");
         const readiness = await this.#timeStep("wait_ready", () => this.platform.waitUntilReady(signal));
@@ -692,6 +753,16 @@ export class QuizOrchestrator {
         }
 
         this.#setState("OBSERVE_SESSION");
+        const initialState = await this.#readState(signal);
+        if (initialState.completed) {
+          this.#visibleScore = initialState.visible_score ?? null;
+          this.#setState('COMPLETE'); this.#finish('completed', null); return;
+        }
+        if(this.options.restore?.checkpoint?.submission_pending){this.pause('Submission recovery requires an explicit public result.');return;}
+        if (initialState.question_graded) {
+          this.pause('The current question has already been graded. Open an unanswered question on the page before continuing.');
+          return;
+        }
         let observation = await this.#timeStep("observe_session", () => this.platform.observeSession(this.options.session_id, signal));
         signal.throwIfAborted();
         this.#timer.observe(observation.timer_remaining_seconds);
@@ -731,21 +802,13 @@ export class QuizOrchestrator {
             this.#visibleScore = live.visible_score ?? null;
             this.#setState("COMPLETE"); this.#finish("completed", null); return;
           }
+          if (live.question_graded) {
+            this.pause('The current question has already been graded. Open an unanswered question on the page before continuing.');
+            return;
+          }
           if (this.#timer.solveMilliseconds() === 0) { await this.#closeSequential(locatorMap, signal); return; }
           this.#setState("BUILD_BATCH");
-          const batch = this.#timeSync("build_batch", () => questionBatchSchema.parse({
-            schema_version: SCHEMA_VERSION,
-            session_id: this.options.session_id,
-            batch_id: `batch_${crypto.randomUUID()}`,
-            question_ids: [question.question_id],
-            questions: [question],
-            ...(observation.page_context ? { page_context: observation.page_context } : {}),
-            capability_requirements: {
-              image_input: question.stem.media.length > 0 || question.options.some((option) => option.media.length > 0) || (observation.page_context?.media.length ?? 0) > 0,
-              native_web_search: false,
-            },
-            attempt: retriesAfterInitial + 1,
-          }));
+          const batch = this.#timeSync("build_batch", () => planBatches([question], observation.page_context, retriesAfterInitial + 1, this.solver.batchLimits?.())[0]!);
           const handles = [
             ...question.stem.media.map((item) => item.temporary_handle),
             ...question.options.flatMap((option) => option.media.map((item) => item.temporary_handle)),
@@ -790,13 +853,10 @@ export class QuizOrchestrator {
           }
           this.#setState("VALIDATE_ANSWER");
           const validation = this.#timeSync("validate_answer", () => validateBatchAnswer(batch, rawAnswer));
+          if (validation.issues.length) throw new Error('ANSWER_INVALID: ' + validation.issues.map(issue => issue.code).join(', '));
           let answer = validation.valid_answers.find((item) => item.question_id === question.question_id);
           let guessed = false;
           if (!answer || !validation.executable_answers.some((item) => item.question_id === question.question_id)) {
-            if (this.options.strategy === "supervised") {
-              this.pause("The solver did not return a certain executable answer.");
-              return;
-            }
             answer = unattendedFallback(question, answer, previousAnswers);
             guessed = true;
           }
@@ -866,38 +926,36 @@ export class QuizOrchestrator {
           if (finalState.feedback === "incorrect") {
             feedback = finalState.feedback_text ?? "The site marked the previous answer incorrect.";
             if (answerRetryAllowed(retriesAfterInitial, this.options.max_answer_retries ?? 2) && finalState.can_retry && !this.#timer.closing()) {
-              retriesAfterInitial += 1;
-              this.options.answer_retry_counts?.set(question.question_id, retriesAfterInitial);
-              this.#progress.retried += 1;
               const mappedRetryTarget = locatorMap.targets.control_retry ? "control_retry" : this.#controlHints.get("retry");
               if (this.options.require_retry_control && !mappedRetryTarget) { this.pause('课程测验未提供明确重试控件，停止重答。'); return; }
               if (mappedRetryTarget) {
                 const retryPlan = controlPlan(locatorMap, this.options.strategy, "retry_question", mappedRetryTarget);
                 if (!await this.#executeQuestionRetry(retryPlan, locatorMap, signal)) return;
-              }
-              observation = await this.#timeStep("observe_session", () => this.platform.observeSession(this.options.session_id, signal));
-              this.#controlHints.clear();
-              parsed = observation.questions[0]!;
-              question = questionFrameSchema.parse(parsed.question);
-              locatorMap = locatorMapSchema.parse(parsed.locator_map);
-              const retryTarget = mappedRetryTarget ? undefined :
-                (locatorMap.targets.control_retry ? "control_retry" : this.#controlHints.get("retry") ??
-                  (!this.options.require_retry_control ? observedRetryTarget(observation, locatorMap) : undefined));
-              if (retryTarget) {
-                const retryPlan = controlPlan(locatorMap, this.options.strategy, "retry_question", retryTarget);
-                if (!await this.#executeQuestionRetry(retryPlan, locatorMap, signal)) return;
+              } else {
                 observation = await this.#timeStep("observe_session", () => this.platform.observeSession(this.options.session_id, signal));
                 this.#controlHints.clear();
                 parsed = observation.questions[0]!;
                 question = questionFrameSchema.parse(parsed.question);
                 locatorMap = locatorMapSchema.parse(parsed.locator_map);
+                const retryTarget = locatorMap.targets.control_retry ? "control_retry" :
+                  observedRetryTarget(observation, locatorMap);
+                if (!retryTarget) {
+                  this.pause("The graded question has no available retry control. No new answer was requested.");
+                  return;
+                }
+                const retryPlan = controlPlan(locatorMap, this.options.strategy, "retry_question", retryTarget);
+                if (!await this.#executeQuestionRetry(retryPlan, locatorMap, signal)) return;
               }
+              retriesAfterInitial += 1;
+              this.options.answer_retry_counts?.set(question.question_id, retriesAfterInitial);
+              this.#progress.retried += 1;
+              observation = await this.#timeStep("observe_session", () => this.platform.observeSession(this.options.session_id, signal));
+              this.#controlHints.clear();
+              parsed = observation.questions[0]!;
+              question = questionFrameSchema.parse(parsed.question);
+              locatorMap = locatorMapSchema.parse(parsed.locator_map);
               this.#setState("REPLAN");
               continue;
-            }
-            if (this.options.strategy === "supervised") {
-              this.pause("Answer retries were exhausted.");
-              return;
             }
           }
           const outcome=finalState.feedback === "incorrect" ? "failed" : "answered";
@@ -1065,7 +1123,7 @@ export class QuizOrchestrator {
         error instanceof Error &&
         (error.name === "SolverProviderError" ||
           error.name === "ModelCallLimitError" ||
-          /VISUAL_|USER_INTERACTION|HARD_BLOCKER|separation_uncertain|permission|Cannot access|authentication|captcha|proctor|login|Provider|model call limit/i.test(message));
+          /SEMANTIC_|VISUAL_|USER_INTERACTION|HARD_BLOCKER|separation_uncertain|permission|Cannot access|authentication|captcha|proctor|login|Provider|model call limit/i.test(message));
       if (operational) {
         this.pause(message);
       } else {

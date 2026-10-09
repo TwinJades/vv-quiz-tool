@@ -1,24 +1,27 @@
 {
   "name": "vv-quiz-tool",
-  "version": "0.1.0",
+  "version": "1.2.0",
   "description": "Local-first automatic quiz browser extension with structured solving and verified execution.",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.19.0",
   "engines": {
-    "node": ">=20.11"
+    "node": ">=22.18"
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "verify:release": "node scripts/verify-release.mjs",
     "check": "pnpm typecheck && pnpm test && pnpm build",
-    "test": "vitest run",
+    "test": "vitest run --config vitest.logic.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.71",
     "@ai-sdk/google": "^4.0.87",
+    "@ai-sdk/openai": "4.0.83",
     "@ai-sdk/openai-compatible": "^3.0.62",
     "ai": "^7.0.126",
+    "i18next": "^26.4.2",
     "zod": "^4.6.5"
   },
   "devDependencies": {
@@ -26,7 +29,9 @@
     "@types/node": "^26.6.2",
     "esbuild": "^0.28.2",
     "happy-dom": "^20.14.5",
+    "pngjs": "^7.0.0",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.1"
+    "vitest": "^5.0.1",
+    "yaml": "^2.9.1"
   }
 }

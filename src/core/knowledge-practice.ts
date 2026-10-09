@@ -7,7 +7,7 @@ export interface KnowledgeCatalog {course_id:string;context_id:string;title:stri
 export type KnowledgeOutcome={id:string;title:string;status:'submitted'|'existing_record'|'no_practice';score:string|null};
 export interface KnowledgeRuntime {title:string;phase:string;scope:string[];current_point:string|null;results:KnowledgeOutcome[];model_notice?:string|null;checkpoint?:{catalog:KnowledgeCatalog;index:number;child_active:boolean};}
 export interface PracticeChild {
-  run(signal:AbortSignal):Promise<void>;resume(signal:AbortSignal):Promise<void>;pause(reason?:string):void;switchStrategy(strategy:RunStrategy):void;
+  run(signal:AbortSignal):Promise<void>;resume(signal:AbortSignal):Promise<void>;pause(reason?:string):void;
   snapshot():SessionRuntimeSnapshot;
 }
 export interface KnowledgeAdapter {
@@ -62,7 +62,6 @@ export class KnowledgePracticeOrchestrator {
   }
   #emit(state:SessionRuntimeSnapshot['state'],phase:string,notice:string|null=null):void {this.#state=state;this.#phase=phase;this.#notice=notice;this.options.on_update?.(this.snapshot());}
   modelChanged(id:string,reason:string):void {this.options.model_id=id;this.#modelNotice=reason;this.options.on_update?.(this.snapshot());}
-  switchStrategy(strategy:RunStrategy):void {this.options.strategy=strategy;this.#child?.switchStrategy(strategy);this.options.on_update?.(this.snapshot());}
   pause(reason='知识点练习已暂停；继续时重新核对当前页面。'):void {
     if(['COMPLETE','CANCELLED'].includes(this.#state))return;
     this.#abort?.abort();this.#child?.pause(reason);
@@ -89,11 +88,11 @@ export class KnowledgePracticeOrchestrator {
               throw new Error('所选课程或知识点清单已改变。');
             const prepared=await this.adapter.prepare(point,signal);signal.throwIfAborted();
             if(prepared!=='practice')this.#results.set(point.id,{id:point.id,title:point.title,status:prepared,score:null});
-            else this.#child=await this.makeChild(point,()=>{if(!signal.aborted)this.options.on_update?.(this.snapshot());},signal);
+            else this.#child=await this.makeChild(point,()=>{if(this.#running&&!this.#abort?.signal.aborted)this.options.on_update?.(this.snapshot());},signal);
           }
           if(this.#child){
             signal.throwIfAborted();
-            this.#emit('SOLVE','处理 '+point.title);this.#child.switchStrategy(this.options.strategy);
+            this.#emit('SOLVE','处理 '+point.title);
             if(this.#child.snapshot().state==='PAUSED')await this.#child.resume(signal);else await this.#child.run(signal);
             signal.throwIfAborted();const result=this.#child.snapshot();
             if(result.state!=='COMPLETE')throw new Error(result.notice??'本次知识点练习提交尚未确认。');

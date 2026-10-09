@@ -1,7 +1,8 @@
 import { assertVisualFreshness, fingerprintVisualTiles, insideRect } from "../core/visual";
 import type { VisualCapture, VisualFrame, VisualGeometry } from "../core/visual";
 import type { InteractionBinding, NativeInputTicket } from "./interaction-guard";
-import { requireCurrentWebsite } from './website-access';
+import { activeWebsiteFrame, requireCurrentWebsite } from './website-access';
+import {recordTestEvent} from './test-hooks';
 
 export interface NormalHoverTarget {
   point: { x: number; y: number };
@@ -12,6 +13,8 @@ export interface NormalHoverTarget {
 }
 let captureTail: Promise<void> = Promise.resolve();
 const connectionTails = new Map<number, Promise<void>>();
+const activeDebuggerTransports=new Set<number>();
+export function hasActiveDebuggerTransport(tabId:number):boolean{return activeDebuggerTransports.has(tabId);}
 function serializedConnection<T>(tabId: number, operation: () => Promise<T>): Promise<T> {
   const result = (connectionTails.get(tabId) ?? Promise.resolve()).then(operation);
   const tail = result.then(() => {}, () => {});
@@ -59,6 +62,7 @@ export class VisualTransport {
     private readonly geometry: () => Promise<VisualGeometry>,
     private readonly binding: () => InteractionBinding | null,
     private readonly armInput: (ticket: NativeInputTicket | null) => Promise<void>,
+    private readonly emulateFocus = true,
   ) {}
 
   captureCount(): number { return this.#captures; }
@@ -110,6 +114,7 @@ export class VisualTransport {
           throw new Error("VISUAL_UNAVAILABLE: cancelled visual connection was released.");
         }
         this.#attached = true;
+        activeDebuggerTransports.add(this.tabId);
         chrome.debugger.onEvent.addListener(this.#frameListener);
         this.#listening = true;
       });
@@ -141,7 +146,7 @@ export class VisualTransport {
     signal.throwIfAborted();
     const geometry = await bounded(this.geometry(), signal, "visual geometry");
     const frames = await bounded(chrome.webNavigation.getAllFrames({ tabId: this.tabId }), signal, "visual frames");
-    const origins = [...new Set([geometry.url, ...(frames ?? []).map(frame => frame.url)].filter(url => /^https?:/.test(url)).map(url => `${new URL(url).origin}/*`))];
+    const origins = [...new Set([geometry.url, ...(frames ?? []).filter(activeWebsiteFrame).map(frame => frame.url)].filter(url => /^https?:/.test(url)).map(url => `${new URL(url).origin}/*`))];
     if (!await bounded(chrome.permissions.contains({ origins }), signal, "visual website permission")) throw new Error("VISUAL_UNAVAILABLE: website/frame permission was revoked or is missing.");
     if (geometry.blocker) throw new Error(`HARD_BLOCKER: ${geometry.blocker}`);
     if (!/^https?:/.test(geometry.url) || geometry.viewport.scale !== 1 || geometry.region.width <= 0 || geometry.region.height <= 0) throw new Error("VISUAL_UNAVAILABLE: unsupported viewport or document.");
@@ -175,6 +180,8 @@ export class VisualTransport {
       const viewport_context = !this.#viewportContextSent && geometry.isolated_canvas &&
         (left !== 0 || top !== 0 || width !== bitmap.width || height !== bitmap.height)
         ? { data: raw, width: bitmap.width, height: bitmap.height } : undefined;
+      recordTestEvent('pixels',{data,session_id:sessionId,at:Date.now(),width,height,geometry});
+      if(viewport_context)recordTestEvent('pixels',{...viewport_context,session_id:sessionId,at:Date.now(),purpose:'initial_viewport_context',geometry:{...geometry,region:{x:0,y:0,width:viewport_context.width,height:viewport_context.height}}});
       this.#viewportContextSent = true;
       return { frame: { visual_frame_id: crypto.randomUUID(), session_id: sessionId, observation_id: observationId,
         surface_id: `tab_${this.tabId}`, captured_at: Date.now(), geometry, zoom, width, height, ...(pixel_tiles ? {pixel_tiles} : {}),
@@ -211,6 +218,7 @@ export class VisualTransport {
     return serializedOperation(async () => {
       signal.throwIfAborted();
       if (this.#closed) throw new Error("VISUAL_UNAVAILABLE: visual transport is closed.");
+      if(!this.emulateFocus)return operation();
       // Target-only focus is held for one native operation. Multiple parallel
       // sessions must not compete for the browser's background rendering focus.
       await this.#send("Emulation.setFocusEmulationEnabled", { enabled: true }, signal);
@@ -309,9 +317,10 @@ export class VisualTransport {
     const release = serializedConnection(this.tabId, async () => {
       if (!this.#attached) return;
       this.#attached = false;
+      activeDebuggerTransports.delete(this.tabId);
       // The outer wait is bounded, but the lease stays held until browser RPCs
       // finish, including late replies. New sessions on other tabs are independent.
-      await chrome.debugger.sendCommand({ tabId: this.tabId }, "Emulation.setFocusEmulationEnabled", { enabled: false }).catch(() => {});
+      if(this.emulateFocus)await chrome.debugger.sendCommand({ tabId: this.tabId }, "Emulation.setFocusEmulationEnabled", { enabled: false }).catch(() => {});
       await chrome.debugger.detach({ tabId: this.tabId }).catch(() => {});
     });
     this.#closing = bounded(release, new AbortController().signal, "visual disconnect").catch(() => {});

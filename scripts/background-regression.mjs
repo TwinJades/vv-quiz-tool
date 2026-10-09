@@ -1,5 +1,6 @@
 // Isolated headless browser only. Never navigates, activates or closes user tabs.
 import { spawn, spawnSync } from "node:child_process";
+import {finishOwnedTestRun} from './finish-owned-test-run.mjs';
 import { mkdir, readFile, writeFile, appendFile } from "node:fs/promises";
 import { resolve, relative, isAbsolute } from "node:path";
 import { CdpClient, cdpJson } from "./cdp-client.mjs";
@@ -7,6 +8,7 @@ import { createServer } from "node:http";
 import { canvasFixtureHtml } from "./canvas-fixture.mjs";
 import { installTestNotificationRecorder, readTestNotices } from "./record-test-notifications.mjs";
 import { preparePublicCanvas } from "./prepare-public-canvas.mjs";
+import { preparePublicTimedSurvey } from "./prepare-public-timed-survey.mjs";
 import { installTestVisualRecorder, readTestVisualReadings } from "./record-test-visual-readings.mjs";
 import { authorizedTestModel, assertAcceptanceProvider } from './authorized-test-model.mjs';
 import { installTestProviderRecorder } from './record-test-provider-requests.mjs';
@@ -21,7 +23,7 @@ const browserPath = process.env.VV_TEST_BROWSER || resolve(root, ".browser-regre
 const sourcePort = Number(process.env.VV_CPA_SOURCE_PORT || 50739);
 const localCanvas = process.argv.includes("--canvas-local");
 const strategy = process.env.VV_TEST_STRATEGY || "unattended";
-if (!["unattended", "supervised"].includes(strategy)) throw new Error("Unknown test strategy");
+if (strategy !== 'unattended') throw new Error('VV_TEST_STRATEGY must be unattended.');
 let localServer;
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const report = { started_at: new Date().toISOString(), browser: browserPath, headless: true, parallel: true, selected_model: null, results: [], errors: [] };
@@ -43,6 +45,8 @@ let availableSites = [
   { id: "h5p-mixed-text", url: "https://h5pstudio.ecampusontario.ca/content/2360", expected_questions: 8, mixed_text_only: true },
   { id: "h5p-copyright-image-text", url: "https://h5pstudio.ecampusontario.ca/content/60107", expected_questions: 5, mixed_text_image_two_types: true },
   { id: "daily-whole", url: "https://quizofthedayuk.co.uk/", expected_questions: 10, whole_page: true },
+  { id: "survey-timed", url: "https://surveyjs.io/form-library/examples/make-quiz-javascript/reactjs", expected_questions: 3, public_timed_survey: true },
+  { id: "survey-timed-feedback", url: "https://surveyjs.io/form-library/examples/create-quiz-with-immediate-results/reactjs", expected_questions: 3, public_timed_survey: true },
   { id: "wordwall-science", url: "https://wordwall.net/resource/114600206/general-science-quiz", expected_questions: 5, public_canvas: true },
 ];
 if (localCanvas) {
@@ -66,6 +70,7 @@ const extEval = body => control.evaluate(`(async()=>{${body}})()`, 45000);
 
 async function runSite(site) {
   let canvasPage;
+  let timedSurveyPage;
   const result = { ...site, started_at: new Date().toISOString(), tab_id: null, snapshot: null, website: null, error: null };
   report.results.push(result);
   try {
@@ -84,6 +89,7 @@ async function runSite(site) {
     }
     if(!navigationReady)throw new Error('Owned test navigation did not complete before the startup deadline');
     if(site.public_canvas){const prepared=await preparePublicCanvas(site,port,runDirectory);canvasPage=prepared.page;result.bootstrap=prepared.evidence;await save();}
+    if(site.public_timed_survey){const prepared=await preparePublicTimedSurvey(site,port);timedSurveyPage=prepared.page;result.bootstrap=prepared.evidence;await save();}
     const request = { type: "VV_START_SESSION", tab_id: tab.id, provider_profile_id: report.provider_id, model_id: report.selected_model, strategy, model_call_limit: 60, observation_input_mode: localCanvas||site.public_canvas ? "visual_snapshot" : "semantic_snapshot" };
     const started = await extEval(`const result=await chrome.runtime.sendMessage(${JSON.stringify(request)});if(!result.ok)throw new Error(result.error);return result.result;`);
     result.snapshot = started;
@@ -108,6 +114,11 @@ async function runSite(site) {
       result.error = "Test deadline exceeded; stopped own test session";
     }
     result.website = await extEval(`const [result]=await chrome.scripting.executeScript({target:{tabId:${tab.id}},world:"MAIN",func:()=>({url:location.href,title:document.title,text:document.body?.innerText.slice(-6000),canvas:window.canvasState??null,visibility:document.visibilityState})});return result?.result;`);
+    if(site.id==='h5p-single'||site.id==='h5p-image-multi') {
+      await pause(5000);
+      result.website_settled=await extEval(`const [result]=await chrome.scripting.executeScript({target:{tabId:${tab.id}},world:"MAIN",func:()=>({text:document.body?.innerText.slice(-6000),visibility:document.visibilityState})});return result?.result;`);
+    }
+    if(site.id==='h5p-single') result.h5p_terminal_dom=await extEval(`const [result]=await chrome.scripting.executeScript({target:{tabId:${tab.id}},world:"MAIN",func:()=>{const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'};return {score_nodes:[...document.querySelectorAll('*')].filter(e=>visible(e)&&e.children.length===0&&/You got \\d+ (?:of|out of) \\d+ (?:correct|points)/.test(e.innerText??'')).slice(0,12).map(e=>({tag:e.tagName,class:e.className,parent_class:e.parentElement?.className,text:e.innerText})),visible_inputs:[...document.querySelectorAll('input,textarea')].filter(visible).length,visible_buttons:[...document.querySelectorAll('button,[role=button]')].filter(visible).slice(0,20).map(e=>({class:e.className,text:e.innerText?.slice(0,90)}))};}});return result?.result;`);
     if(sites.some(site=>site.mixed_text_only)){
       result.dom_transitions=await extEval(`return chrome.scripting.executeScript({target:{tabId:${tab.id},allFrames:true},func:()=>globalThis.__vvTestDomTransitions??[]}).then(rows=>rows.map(row=>({frame_id:row.frameId,transitions:row.result})));`);
     }
@@ -166,9 +177,12 @@ async function runSite(site) {
       } finally { page.close(); }
     }
   } catch (error) { result.error = String(error.message || error); }
-  finally {canvasPage?.close();}
+  finally {canvasPage?.close();timedSurveyPage?.close();}
   result.finished_at = new Date().toISOString();
   result.passed = result.snapshot?.state === "COMPLETE" && result.snapshot.progress.answered === site.expected_questions && Boolean(result.website) && !result.error;
+  if(site.id==='h5p-single'||site.id==='h5p-image-multi') result.passed &&=
+    Boolean(result.snapshot?.summary?.visible_score) &&
+    Boolean(result.website_settled?.text?.split('\n').includes(result.snapshot.summary.visible_score));
   if(site.whole_page) result.passed &&= Boolean(result.snapshot.summary?.visible_score) &&
     (result.snapshot.steps?.find(step=>step.step==='solve_batch')?.calls??0)>=2 &&
     result.snapshot.steps?.find(step=>step.step==='execute_session_submit')?.calls===1;
@@ -178,6 +192,10 @@ async function runSite(site) {
     result.website.canvas.events.every(event=>event.trusted) && result.website.visibility === "hidden";
   if(site.public_canvas) result.passed &&= Boolean(result.snapshot?.summary?.visible_score) &&
     (result.snapshot?.summary?.visual_metrics?.coordinate_clicks??0)>0 && result.website?.visibility==='hidden';
+  if(site.public_timed_survey) result.passed = result.snapshot?.state==='COMPLETE' &&
+    Boolean(result.bootstrap?.timer_at_start) && result.bootstrap?.simulated_focus===true && report.headless===true &&
+    Boolean(result.snapshot?.summary?.visible_score?.includes('Run Survey Again')) &&
+    Boolean(result.website?.text?.includes('Run Survey Again')) && !result.error;
 }
 
 try {
@@ -201,7 +219,7 @@ try {
   assertAcceptanceProvider(configuration.profile);
   report.provider_base_url = configuration.profile.base_url;
   if ((localCanvas||sites.some(site=>site.public_canvas)) && (!configuration.profile.image_upload_authorized || !configuration.profile.capabilities.image_input)) throw new Error("Configured CPA has no existing image authorization/capability");
-  const build = spawnSync(process.execPath, [resolve(root, "scripts/build.mjs")], { cwd: root, env: { ...process.env, VV_BUILD_DIR: extensionDirectory }, stdio: "inherit" });
+  const build = spawnSync(process.execPath, [resolve(root, "scripts/build.mjs")], { cwd: root, env: { ...process.env, VV_BUILD_DIR: extensionDirectory,VV_TEST_BUILD:'1' }, stdio: "inherit" });
   if (build.status !== 0) throw new Error("Isolated extension build failed");
   const manifest = JSON.parse(await readFile(resolve(extensionDirectory, "manifest.json"), "utf8"));
   manifest.host_permissions = [...new Set([...sites.map(site => `${new URL(site.url).origin}/*`), `${new URL(configuration.profile.base_url).origin}/*`])];
@@ -305,5 +323,6 @@ finally {
   if (browserControl) { try { await browserControl.send("Browser.close"); } catch {} browserControl.close(); }
   // A failed bootstrap has no browser endpoint; this handle belongs only to this run.
   else browser?.kill();
+  await finishOwnedTestRun(runDirectory,browser?[browser]:[]);
   console.log("FINAL", JSON.stringify({ directory: runDirectory, errors: report.errors, results: report.results.map(result => ({ site: result.id, state: result.snapshot?.state, progress: result.snapshot?.progress, error: result.error })) }));
 }

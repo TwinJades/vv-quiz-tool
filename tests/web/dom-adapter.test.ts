@@ -5,6 +5,7 @@ import { buildAnswerExecutionPlan, SCHEMA_VERSION } from "../../src/core";
 import type { AnswerResult } from "../../src/core";
 import { DomWebAdapter } from "../../src/web/dom-adapter";
 import { WebVerifier } from "../../src/web/verifier";
+import { SemanticDomMapping } from "../../src/web/semantic-dom-mapping";
 
 function abortSignal(): AbortSignal {
   return new AbortController().signal;
@@ -16,6 +17,40 @@ afterEach(() => {
 });
 
 describe("DomWebAdapter", () => {
+  it('maps the H5P inline blank paragraph and preserves each blank position across observations', async () => {
+    document.body.innerHTML = `<div class="questionset"><section class="h5p-question h5p-blanks">
+      <h2>Fill in the missing words</h2><div><p>Copyright is taken seriously in business.
+      The charge for violating copyright includes <input type="text" aria-label="Blank input 1 of 2">
+      dollars and <input type="text" aria-label="Blank input 2 of 2"> in prison.</p></div>
+      <button class="h5p-question-check-answer">Check</button></section></div>`;
+    const mapping = new SemanticDomMapping(document);
+    const elements = mapping.capture();
+    const id = (selector: string) => elements.find(element => element.tag === selector)!.element_id;
+    expect(mapping.apply([{ region_id: id('section'), type: 'fill_blank', stem_ids: [id('h2'), id('p')],
+      option_ids: [], blank_ids: elements.filter(element => element.tag === 'input').map(element => element.element_id),
+      controls: [{ element_id: id('button'), role: 'submit' }] }])).toHaveLength(1);
+    try {
+      const adapter = new DomWebAdapter(document);
+      const first = await adapter.observeSession('inline-blanks', abortSignal());
+      expect(first.questions[0]!.question.stem.text).toBe('Fill in the missing words Copyright is taken seriously in business. The charge for violating copyright includes [blank_1] dollars and [blank_2] in prison.');
+      expect(first.questions[0]!.question.blanks.map(blank => blank.id)).toEqual(['blank_1', 'blank_2']);
+      document.querySelectorAll('input').forEach(input => { input.value = 'entered value'; });
+      const next = await adapter.observeSession('inline-blanks', abortSignal());
+      expect(next.questions[0]!.question.stem.text).toBe(first.questions[0]!.question.stem.text);
+      expect(mapping.roots()).toHaveLength(1);
+    } finally { mapping.clear(); }
+  });
+
+  it('rejects a stem inside a mapped editable blank', () => {
+    document.body.innerHTML = '<section><div contenteditable="true"><p>Editable answer</p></div><input type="text"></section>';
+    const mapping = new SemanticDomMapping(document);
+    const elements = mapping.capture();
+    expect(mapping.apply([{ region_id: elements.find(element => element.tag === 'section')!.element_id,
+      type: 'fill_blank', stem_ids: [elements.find(element => element.tag === 'p')!.element_id], option_ids: [],
+      blank_ids: elements.filter(element => element.tag === 'div' || element.tag === 'input').map(element => element.element_id), controls: [] }])).toBeNull();
+    mapping.clear();
+  });
+
   it('recognizes a standalone graded H5P image question even when its calibrated root remains', async () => {
     document.body.innerHTML = `<section class="h5p-question h5p-image-choice">
       <h2>Which images are correct?</h2><div role="checkbox" aria-checked="true">A</div>
@@ -97,15 +132,18 @@ describe("DomWebAdapter", () => {
   });
   it('reobserves disabled H5P true/false choices to bind a dynamically created Retry without changing question identity',async()=>{
     document.body.innerHTML=`<div class="questionset"><section class="h5p-question"><p>Complete both sessions.</p><div role="radio" class="h5p-true-false-answer">True<span class="aria-label"></span></div><div role="radio" class="h5p-true-false-answer">False<span class="aria-label"></span></div><button class="h5p-question-check-answer">Check</button><div class="h5p-question-feedback"></div><a class="h5p-question-next" aria-label="Next question"></a></section></div>`;
+    document.body.insertAdjacentHTML('afterbegin','<a href="/catalogue">Catalogue</a>');
     const adapter=new DomWebAdapter(document);
     const before=await adapter.observeSession('tf-retry',abortSignal());
+    expect((await adapter.readState(abortSignal())).question_graded).toBe(false);
     document.querySelectorAll('[role=radio]').forEach(element=>element.setAttribute('aria-disabled','true'));
     document.querySelectorAll('.aria-label')[1]!.textContent='.Wrong answer';
     document.querySelector('.h5p-question-check-answer')!.remove();
     const feedback=document.querySelector<HTMLElement>('.h5p-question-feedback')!;
     feedback.classList.add('h5p-question-visible');feedback.textContent='You got 0 of 1 points';
+    expect(await adapter.readState(abortSignal())).toMatchObject({question_graded:true,can_retry:false});
     document.querySelector('section')!.insertAdjacentHTML('beforeend','<button class="h5p-question-try-again">Retry<span class="hidden-but-read">Retry the task. Reset all responses and start over.</span></button>');
-    expect(await adapter.readState(abortSignal())).toMatchObject({fingerprint:before.fingerprint,feedback:'incorrect',can_retry:true,completed:false});
+    expect(await adapter.readState(abortSignal())).toMatchObject({fingerprint:before.fingerprint,feedback:'incorrect',question_graded:true,can_retry:true,completed:false});
     const graded=await adapter.observeSession('tf-retry',abortSignal());
     expect(graded.fingerprint).toBe(before.fingerprint);
     expect(graded.questions[0]!.question.options.map(o=>o.text)).toEqual(['True','False']);
@@ -114,7 +152,7 @@ describe("DomWebAdapter", () => {
     const item=graded.questions[0]!;
     expect(await adapter.execute({schema_version:SCHEMA_VERSION,session_id:'tf-retry',question_id:item.question.question_id,observation_id:graded.observation_id,strategy:'unattended',actions:[{action_id:'retry',kind:'retry_question',target_id:'control_retry'}],preconditions:['same_surface','same_question_fingerprint','target_available']},item.locator_map,abortSignal())).toMatchObject([{status:'succeeded'}]);
     expect((await adapter.observeSession('tf-retry',abortSignal())).fingerprint).toBe(before.fingerprint);
-    expect((await adapter.readState(abortSignal())).feedback).toBeNull();
+    expect(await adapter.readState(abortSignal())).toMatchObject({feedback:null,question_graded:false});
   });
   it('keeps H5P fill grading announcements out of question identity and retries visible scorebar failures',async()=>{
     document.body.innerHTML=`<div class="questionset"><section class="h5p-question"><p>Fill in the missing word.</p><div class="hidden-but-read"></div><p>A lesson lasts <span class="h5p-input-wrapper"><input type="text" aria-label="Blank input 1 of 1"></span> minutes.</p><button class="h5p-question-check-answer">Check</button><div class="h5p-question-feedback"></div><div class="h5p-question-scorebar" hidden><div class="h5p-joubelui-score-bar-progress">You got 0 out of 1 points</div><svg><title>star</title></svg><span>0/1</span></div><a class="h5p-question-next" aria-label="Next question"></a></section><section class="h5p-question" hidden><input type="text"><div class="h5p-question-scorebar h5p-question-visible">You got 1 out of 1 points</div></section></div>`;
@@ -460,7 +498,7 @@ describe("DomWebAdapter", () => {
       confidence: 0.9,
       warnings: [],
     };
-    const plan = buildAnswerExecutionPlan(question, answer, locatorMap, "supervised");
+    const plan = buildAnswerExecutionPlan(question, answer, locatorMap, "unattended");
     await adapter.execute(plan, locatorMap, abortSignal());
     expect(Array.from(document.querySelectorAll<HTMLInputElement>("input")).map((input) => input.value)).toEqual(["A", "B"]);
     const after = await adapter.readState(abortSignal());

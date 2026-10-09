@@ -46,23 +46,13 @@ export async function runPanelCases({name,port,profiles,control,cdp,extensionId,
     await waitFor(()=>panel.evaluate("Boolean(document.querySelector('#apply'))"),'panel loaded');
     await panel.evaluate("window.__vvPanelClicks=[];document.addEventListener('click',event=>{if(event.target.closest('button'))window.__vvPanelClicks.push({label:event.target.closest('button').textContent,trusted:event.isTrusted})});true");
     await setConcurrency(1);
-    const a=await start('panel-a','localhost','unattended'),b=await start('panel-b','127.0.0.1','supervised');
+    const a=await start('panel-a','localhost','unattended'),b=await start('panel-b','127.0.0.1','unattended');
     await waitFor(async()=>heldLife.has(`${name}:${a.id}`)&&(await state(b.tab.id)).state==='QUEUED','one running / one queued');
     await waitFor(()=>panel.evaluate("document.querySelectorAll('article.task').length===2"),'two cards');
     await button(b.url,'暂停');await waitFor(async()=> (await state(b.tab.id)).state==='PAUSED','pause queued');
     if(lifeCounts.has(`${name}:${b.id}`))throw new Error('Queued pause sent a Provider request');
     await pause(1100);await button(b.url,'继续');await waitFor(async()=> (await state(b.tab.id)).state==='QUEUED','resume queued');
-    // A denied operation leaves backend state unchanged. Exercise retry with a
-    // one-shot local transport failure in this owned panel, then restore it.
-    await panel.evaluate(`(()=>{const original=chrome.runtime.sendMessage.bind(chrome.runtime);chrome.runtime.sendMessage=(request,...args)=>{if(request.type==='VV_SWITCH_STRATEGY'){chrome.runtime.sendMessage=original;return Promise.reject(new Error('Owned panel retry fixture'));}return original(request,...args);};return true;})()`);
-    await button(a.url,'切换监督自动');
-    await waitFor(()=>panel.evaluate("document.querySelector('#error').textContent==='Owned panel retry fixture'"),'visible operation failure');
-    if((await state(a.tab.id)).strategy!=='unattended')throw new Error('Failed UI operation changed strategy');
-    await button(a.url,'切换监督自动');await waitFor(async()=> (await state(a.tab.id)).strategy==='supervised','switch supervised retry');
-    await waitFor(()=>panel.evaluate("document.querySelector('#error').textContent===''"),'error cleared after retry');
-    item.checks.push('failed_action_enabled_again/native_retry_clears_error');
-    await pause(1100);await button(a.url,'切换无人值守');await waitFor(async()=> (await state(a.tab.id)).strategy==='unattended','switch unattended');
-    item.checks.push('queued_pause_resume/no_queued_request/strategy_both_directions');
+    item.checks.push('queued_pause_resume/no_queued_request');
     await setConcurrency(2);await waitFor(()=>heldLife.has(`${name}:${b.id}`),'raise limit starts queue');
     await setConcurrency(1);
     if((await send({type:'VV_GET_TASKS'})).running.length!==2)throw new Error('Lowering concurrency preempted a live task');

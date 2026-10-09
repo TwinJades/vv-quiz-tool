@@ -1,11 +1,8 @@
 // Recorder state only; no browser actions or model calls.
 export const recommendations = [
-  { name: "H5P 逐题题组", url: "https://h5p.org/node/8777", detail: "文字、图片、单选、填空；此前整场未通过，不含多选。" },
-  { name: "H5P 文字单选", url: "https://h5p.org/h5p/embed/1512", detail: "此前 Chrome/Edge 自动完成 3/3。" },
-  { name: "H5P 图片多选", url: "https://h5p.org/h5p/embed/1249570", detail: "此前 Chrome/Edge 自动完成 4/4。" },
-  { name: "H5P 填空", url: "https://h5p.org/h5p/embed/1039075", detail: "此前 Chrome/Edge 自动完成 5/5。" },
-  { name: "W3Schools 测验目录", url: "https://www.w3schools.com/quiztest/", detail: "可自行挑选语言和题目；当前版本整场仍待验收。" },
-  { name: "H5P 活动类型目录", url: "https://h5p.org/content-types-and-applications", detail: "自行寻找例题；拖拽、主观题等不属于 VV 当前支持范围。" },
+  { name: "H5P 逐题题组", url: "https://h5p.org/node/8777", detail: "文字、图片、单选、填空。预算60，先用快照模式完成整场，再重新开始用截图模式；保存整个活动的结果页。" },
+  { name: "H5P 图片多选", url: "https://h5p.org/h5p/embed/1249570", detail: "预算60，启动VV，观察图片识别、多项选择和提交，保存网站最终评分。" },
+  { name: "H5P 填空", url: "https://h5p.org/h5p/embed/1039075", detail: "预算60，启动VV，观察填空输入和提交，保存网站最终评分。" },
 ];
 
 export function correlateTabs(pages, tabs) {

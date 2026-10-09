@@ -3,12 +3,15 @@ import { ProviderManager } from "../provider/provider-manager";
 import type { ExtensionRequest } from "./messages";
 import { ChromeLocalStore } from "./storage";
 import { supportsNativeSearch } from "../provider/provider-capabilities";
-import { requestCurrentWebsite } from "./website-access";
-import { courseModels, validateCourseScope } from '../core/course';
+import { activeWebsiteFrame, requestCurrentWebsite } from "./website-access";
+import { validateCourseScope,courseScopeForSelection } from '../core/course';
 import type { CourseCatalog } from '../core/course';
-import type { CourseInspectionBundle } from '../web/course-inspection';
 import {validateKnowledgeScope} from '../core/knowledge-practice';
 import type {KnowledgeCatalog} from '../core/knowledge-practice';
+import { hasUiTranslation, initializeUiLanguage, showNotice, stateLabel, t } from './ui-language';
+declare const __VV_BUILD_ID__: string;
+document.documentElement.dataset.vvBuild = __VV_BUILD_ID__;
+document.querySelector('#extension-version')!.textContent = `v${chrome.runtime.getManifest().version}`;
 
 interface RuntimeResponse<T> {
   ok: boolean;
@@ -21,6 +24,7 @@ interface PopupPreferences {
   model_id?: string;
   strategy?: RunStrategy;
   observation_input_mode?: ObservationInputMode;
+  model_call_limit?:number;
 }
 
 const POPUP_PREFERENCES_KEY = "vv-popup-preferences";
@@ -31,10 +35,8 @@ document.querySelector("#open-tasks")!.addEventListener("click", () => {
 });
 const providerSelect = document.querySelector<HTMLSelectElement>("#provider")!;
 const modelSelect = document.querySelector<HTMLSelectElement>("#model")!;
-const strategySelect = document.querySelector<HTMLSelectElement>("#strategy")!;
 const callLimit = document.querySelector<HTMLInputElement>("#call-limit")!;
 const inputMode = document.querySelector<HTMLInputElement>("#input-mode")!;
-const nativeSearch = document.querySelector<HTMLInputElement>("#native-search")!;
 const modeSlider = document.querySelector<HTMLElement>("#mode-slider")!;
 const inputModeTitle = document.querySelector<HTMLElement>("#input-mode-title")!;
 const inputModeDescription = document.querySelector<HTMLElement>("#input-mode-description")!;
@@ -43,7 +45,6 @@ const pauseButton = document.querySelector<HTMLButtonElement>("#pause")!;
 const resumeButton = document.querySelector<HTMLButtonElement>("#resume")!;
 const stopButton = document.querySelector<HTMLButtonElement>("#stop")!;
 const clearButton = document.querySelector<HTMLButtonElement>("#clear")!;
-const applyStrategyButton = document.querySelector<HTMLButtonElement>("#apply-strategy")!;
 const statusText = document.querySelector<HTMLElement>("#session-status")!;
 const detailText = document.querySelector<HTMLElement>("#session-detail")!;
 const progressText = document.querySelector<HTMLElement>("#session-progress")!;
@@ -54,92 +55,104 @@ let port: chrome.runtime.Port | undefined;
 let courseCatalog: CourseCatalog | null = null;
 let knowledgeCatalog:KnowledgeCatalog|null=null;
 let hasLiveSession=false;
+let displayedSnapshot:SessionRuntimeSnapshot|null=null;
+let displayedError='';
+let previewGeneration=0;
+let preparationId:string|undefined;
+let preparing=false;
+interface CoursePreparationView {preparation_id:string;catalog?:CourseCatalog;provider_profile_id:string;model_id:string;model_calls:{used:number;limit:number};loaded:number;title:string;phase:'loading'|'ready'|'paused';notice:string|null}
 const courseRange = document.querySelector<HTMLSelectElement>('#course-range')!;
 const courseStart = document.querySelector<HTMLButtonElement>('#start-course')!;
 const coursePreview = document.querySelector<HTMLElement>('#course-preview')!;
-const courseInspect = document.querySelector<HTMLButtonElement>('#inspect-course')!;
-const courseExport = document.querySelector<HTMLButtonElement>('#export-course-inspection')!;
-const courseInspectionOutput = document.querySelector<HTMLTextAreaElement>('#course-inspection')!;
-const courseInspectionStatus = document.querySelector<HTMLElement>('#course-inspection-status')!;
-let courseInspection: CourseInspectionBundle | null = null;
 function courseScope():string[] {
   if(knowledgeCatalog&&courseRange.value)return knowledgeCatalog.points.filter(p=>courseRange.value==='all'||courseRange.value==='point:'+p.id).map(p=>p.id);
   if(!courseCatalog||!courseRange.value)return [];
-  return courseCatalog.tasks.filter(task=>task.kind!=='excluded'&&(courseRange.value==='all'||courseRange.value==='lesson:'+task.lesson_id||courseRange.value==='chapter:'+task.chapter_id)).map(task=>task.id);
+  return courseScopeForSelection(courseCatalog,courseRange.value);
 }
 function renderCourseScope():void {
   const ids=courseScope();const container=document.querySelector('#course-tasks')!;container.replaceChildren();
-  for(const task of courseCatalog?.tasks.filter(t=>ids.includes(t.id))??[]){const p=document.createElement('p');p.textContent=`${task.title} · ${task.kind} · ${task.status}`;container.append(p);}
-  for(const point of knowledgeCatalog?.points.filter(p=>ids.includes(p.id))??[]){const p=document.createElement('p');p.textContent=point.title+' · 练习记录进入后逐项核对';container.append(p);}
+  for(const task of courseCatalog?.tasks.filter(t=>ids.includes(t.id))??[]){const p=document.createElement('p');p.textContent=`${task.title} · ${stateLabel(task.kind)} · ${stateLabel(task.status)}`;container.append(p);}
+  for(const point of knowledgeCatalog?.points.filter(p=>ids.includes(p.id))??[]){const p=document.createElement('p');p.textContent=point.title+' · '+t('练习记录进入后逐项核对');container.append(p);}
   courseStart.disabled=ids.length===0||hasLiveSession;
 }
-courseRange.addEventListener('change',renderCourseScope);
-courseInspect.addEventListener('click',()=>{
-  void(async()=>{
-    courseInspect.disabled=true;courseExport.disabled=true;courseInspection=null;
-    courseInspectionOutput.value='';courseInspectionOutput.hidden=true;
-    courseInspectionStatus.textContent='正在只读采集当前页面及已授权frame…';
-    if(activeTabId===undefined)throw new Error('没有当前网站标签页。');
-    await requestCurrentWebsite(activeTabId);
-    const result=await send<CourseInspectionBundle>({type:'VV_INSPECT_COURSE',tab_id:activeTabId});
-    courseInspection=result;
-    courseInspectionOutput.value=JSON.stringify(result,null,2);courseInspectionOutput.hidden=false;
-    courseExport.disabled=false;
-    const failures=result.frames.filter(frame=>frame.error);
-    courseInspectionStatus.textContent=`只读资料已生成：${result.frames.length-failures.length}/${result.frames.length}个frame。`+
-      (failures.length?'部分frame未读取，请保留错误标记；资料不完整。':'')+'检查可见个人信息后可导出JSON或复制；未播放、作答、提交或调用模型。';
-  })().catch(error=>{courseInspectionStatus.textContent=String(error.message||error);}).finally(()=>{courseInspect.disabled=false;});
-});
-courseExport.addEventListener('click',()=>{
-  if(!courseInspection||!courseInspectionOutput.value)return;
-  const blob=new Blob([courseInspectionOutput.value],{type:'application/json;charset=utf-8'});
-  const url=URL.createObjectURL(blob);
-  const link=document.createElement('a');
-  const platform=courseInspection.frames.find(frame=>frame.frame_id===0)?.inspection?.platform??'page';
-  link.href=url;link.download=`vv-course-${platform}-${courseInspection.captured_at.replace(/[:.]/g,'-')}.json`;
-  document.body.append(link);link.click();link.remove();
-  setTimeout(()=>URL.revokeObjectURL(url),1000);
-});
+courseRange.addEventListener('change',()=>{renderCourseScope();if(preparationId)void chrome.storage.local.set({['vv-course-scope:'+preparationId]:courseRange.value}).catch(error=>setError(error.message));});
+function setPreparing(value:boolean):void{
+  preparing=value;providerSelect.disabled=value;modelSelect.disabled=value;callLimit.disabled=value;
+  document.querySelector<HTMLButtonElement>('#preview-course')!.disabled=value;
+  document.querySelector<HTMLButtonElement>('#preview-practices')!.disabled=value;
+  renderSession(displayedSnapshot);
+}
+function showPreparation(prepared:CoursePreparationView,range='all'):void{
+  if(prepared.provider_profile_id!==providerSelect.value||prepared.model_id!==modelSelect.value||prepared.model_calls.limit!==Number(callLimit.value))return;
+  if(!prepared.catalog){
+    coursePreview.textContent=t('正在加载课程：{{count}}个课时 · 调用 {{used}}/{{limit}}',{count:prepared.loaded,used:prepared.model_calls.used,limit:prepared.model_calls.limit});
+    if(prepared.notice)showNotice(coursePreview,prepared.notice);
+    return;
+  }
+  const catalog=prepared.catalog;if(!catalog.complete||catalog.diagnostics.length)throw new Error(catalog.diagnostics.join('；')||'目录不完整。');
+  knowledgeCatalog=null;preparationId=prepared.preparation_id;courseCatalog=catalog;
+  coursePreview.textContent=t('{{platform}} · {{title}} · {{count}}个已识别任务',{platform:t(catalog.platform==='chaoxing'?'学习通':'知到'),title:catalog.title,count:catalog.tasks.length})+` · ${prepared.model_calls.used}/${prepared.model_calls.limit}`;
+  courseRange.replaceChildren();
+  for(const [value,label] of [['all',t('全部未完成课时')],...[...new Set(catalog.tasks.map(task=>task.chapter_id))].map(id=>['chapter:'+id,t('章节 {{id}}',{id})]),...catalog.tasks.map(task=>['lesson:'+task.lesson_id,task.title])]){
+    const option=document.createElement('option');option.value=value!;option.textContent=label!;courseRange.append(option);
+  }
+  if(![...courseRange.options].some(option=>option.value===range))throw new Error('保存的课程范围已改变，请重新选择范围。');
+  courseRange.value=range;courseRange.disabled=false;renderCourseScope();
+  document.querySelector<HTMLDetailsElement>('#course-mode')!.open=true;
+}
+async function refreshPreparation():Promise<void>{
+  if(activeTabId===undefined||!activeTabUrl||!/(?:chaoxing|zhihuishu)\.com$/.test(new URL(activeTabUrl).hostname))return;
+  const prepared=await send<CoursePreparationView|null>({type:'VV_GET_COURSE_PREPARATION',tab_id:activeTabId});
+  if(!prepared||hasLiveSession)return;
+  if(prepared.phase==='loading'){setPreparing(true);showPreparation(prepared);return;}
+  if(preparing)setPreparing(false);
+  if(!preparationId&&prepared.catalog){const stored=await chrome.storage.local.get('vv-course-scope:'+prepared.preparation_id),range=stored['vv-course-scope:'+prepared.preparation_id];if(range!==undefined&&typeof range!=='string')throw new Error('保存的课程范围无效。');showPreparation(prepared,range);}
+  else if(!prepared.catalog&&prepared.notice)showNotice(coursePreview,prepared.notice);
+}
+function invalidatePreparation():void{
+  previewGeneration++;preparationId=undefined;courseCatalog=null;knowledgeCatalog=null;courseRange.replaceChildren();courseRange.disabled=true;renderCourseScope();coursePreview.textContent=t('配置已改变，请重新加载课程。');
+  if(preparing&&activeTabId!==undefined)void send({type:'VV_CANCEL_COURSE_PREPARATION',tab_id:activeTabId}).catch(error=>setError(error.message));
+}
 document.querySelector('#preview-course')!.addEventListener('click',()=>{
+  const generation=++previewGeneration;
+  setPreparing(true);
   void (async()=>{
     knowledgeCatalog=null;courseCatalog=null;courseRange.replaceChildren();courseRange.disabled=true;courseStart.disabled=true;
-    renderCourseScope();coursePreview.textContent='正在只读核对目录…';
+    renderCourseScope();coursePreview.textContent=t('正在加载课程目录…');
     if(activeTabId===undefined)throw new Error('没有当前课程标签页。');
     await requestCurrentWebsite(activeTabId);
-    const catalog=await send<CourseCatalog>({type:'VV_PREVIEW_COURSE',tab_id:activeTabId});
-    if(!catalog.complete||catalog.diagnostics.length)throw new Error(catalog.diagnostics.join('；')||'目录不完整。');
-    courseCatalog=catalog;coursePreview.textContent=`${catalog.platform==='chaoxing'?'学习通':'知到'} · ${catalog.title} · ${catalog.tasks.length}个已识别任务`;
-    courseRange.replaceChildren();
-    for(const [value,label] of [['','请选择范围'],['all','本次已识别的视频与测验范围'],
-      ...[...new Set(catalog.tasks.map(t=>t.chapter_id))].map(id=>['chapter:'+id,'章节 '+id]),
-      ...[...new Set(catalog.tasks.map(t=>t.lesson_id))].map(id=>['lesson:'+id,'课时 '+id])]){const option=document.createElement('option');option.value=value!;option.textContent=label!;courseRange.append(option);}
-    courseRange.disabled=false;renderCourseScope();
-  })().catch(error=>{coursePreview.textContent=String(error.message||error);});
+    const limit=Number(callLimit.value);if(!Number.isInteger(limit)||limit<=0)throw new Error('调用上限必须为正整数。');
+    const prepared=await send<CoursePreparationView>({type:'VV_PREPARE_COURSE',tab_id:activeTabId,provider_profile_id:providerSelect.value,model_id:modelSelect.value,model_call_limit:limit});
+    if(generation!==previewGeneration)return;
+    showPreparation(prepared);
+  })().catch(error=>{if(generation===previewGeneration)showNotice(coursePreview,String(error.message||error));}).finally(()=>setPreparing(false));
 });
 document.querySelector('#preview-practices')!.addEventListener('click',()=>{
+  const generation=++previewGeneration;
   void(async()=>{
     knowledgeCatalog=null;courseCatalog=null;courseRange.replaceChildren();courseRange.disabled=true;courseStart.disabled=true;renderCourseScope();
     if(activeTabId===undefined)throw new Error('请进入知到知识点目录。');await requestCurrentWebsite(activeTabId);
-    const catalog=await send<KnowledgeCatalog>({type:'VV_PREVIEW_PRACTICES',tab_id:activeTabId});knowledgeCatalog=catalog;
-    coursePreview.textContent=`知到 · ${catalog.points.length}个已加载知识点；本范围仅核对关联练习，不代表整个课程目录完整。`;
+    const catalog=await send<KnowledgeCatalog>({type:'VV_PREVIEW_PRACTICES',tab_id:activeTabId});if(generation!==previewGeneration)return;knowledgeCatalog=catalog;
+    coursePreview.textContent=t('知到 · {{count}}个已加载知识点；本范围仅核对关联练习，不代表整个课程目录完整。',{count:catalog.points.length});
     for(const [value,label] of [['','请选择练习范围'],['all','当前已加载知识点的首次练习'],...catalog.points.map(p=>['point:'+p.id,p.title])]){
-      const option=document.createElement('option');option.value=value!;option.textContent=label!;courseRange.append(option);
+      const option=document.createElement('option');option.value=value!;option.textContent=hasUiTranslation(label!)?t(label!):label!;courseRange.append(option);
     }
-    courseRange.disabled=false;renderCourseScope();
-  })().catch(error=>{coursePreview.textContent=String(error.message||error);});
+    courseRange.value='all';courseRange.disabled=false;renderCourseScope();
+  })().catch(error=>{if(generation===previewGeneration)showNotice(coursePreview,String(error.message||error));});
 });
 courseStart.addEventListener('click',()=>{
   void (async()=>{
     if((!courseCatalog&&!knowledgeCatalog)||activeTabId===undefined)throw new Error('请先读取并选择课程范围。');
     const scope=courseScope();if(knowledgeCatalog)validateKnowledgeScope(knowledgeCatalog,scope);else validateCourseScope(courseCatalog!,scope);
     const profile=profiles.find(p=>p.provider_profile_id===providerSelect.value);if(!profile)throw new Error('请先配置Provider。');
-    const model=courseModels(profile.model_catalog.models)[0];if(!model)throw new Error('当前Provider没有授权Gemini课程模型。');
+    const model=modelSelect.value;if(!profile.model_catalog.models.includes(model))throw new Error('请在上方选择当前Provider的模型。');
     const limit=Number(callLimit.value);if(!Number.isInteger(limit)||limit<=0)throw new Error('调用上限必须为正整数。');
     await requestCurrentWebsite(activeTabId);
     const snapshot=await send<SessionRuntimeSnapshot>({type:'VV_START_SESSION',tab_id:activeTabId,provider_profile_id:profile.provider_profile_id,model_id:model,
-      strategy:strategySelect.value as RunStrategy,model_call_limit:limit,observation_input_mode:'structured',
+      ...(!knowledgeCatalog&&preparationId?{preparation_id:preparationId}:{}),
+      strategy:'unattended',model_call_limit:limit,observation_input_mode:'structured',
       ...(knowledgeCatalog?{practice_course:{catalog:knowledgeCatalog,scope}}:{course:{course_id:courseCatalog!.course_id,platform:courseCatalog!.platform,scope,revision:courseCatalog!.revision}})});
-    renderSession(snapshot);
+    displayedError='';renderSession(snapshot);
   })().catch(error=>setError(String(error.message||error)));
 });
 
@@ -157,8 +170,8 @@ function renderInputMode(): void {
   const position = Math.max(0, Math.min(2, Number(inputMode.value) || 0));
   const selected = INPUT_MODES[Math.round(position)] ?? INPUT_MODES[0]!;
   modeSlider.style.setProperty("--mode-position", String(position / 2));
-  inputModeTitle.textContent = selected.title;
-  inputModeDescription.textContent = selected.description;
+  inputModeTitle.textContent = t(selected.title);
+  inputModeDescription.textContent = t(selected.description);
 }
 
 function snapInputMode(): void {
@@ -169,9 +182,10 @@ function snapInputMode(): void {
 }
 
 function setError(message: string): void {
-  statusText.textContent = "需要处理";
+  displayedError=message;
+  statusText.textContent = t("需要处理");
   statusText.dataset.kind = "error";
-  detailText.textContent = message;
+  showNotice(detailText,message);
 }
 
 function sitePattern(urlValue: string): string {
@@ -182,7 +196,7 @@ function sitePattern(urlValue: string): string {
 async function tabSitePermissionOrigins(tabId: number, fallbackUrl: string): Promise<string[]> {
   const frames = await chrome.webNavigation.getAllFrames({ tabId });
   return [...new Set(
-    [fallbackUrl, ...(frames?.map((frame) => frame.url) ?? [])]
+    [fallbackUrl, ...(frames?.filter(activeWebsiteFrame).map((frame) => frame.url) ?? [])]
       .filter((url) => url.startsWith("http"))
       .map(sitePattern),
   )];
@@ -203,20 +217,15 @@ function renderModels(): void {
     option.textContent = model;
     modelSelect.append(option);
   }
-  renderSearchPermission();
-}
-
-function renderSearchPermission(): void {
-  const profile = profiles.find(item => item.provider_profile_id === providerSelect.value);
-  const supported = Boolean(profile && supportsNativeSearch(profile, modelSelect.value));
-  nativeSearch.disabled = !supported;
-  if (!supported) nativeSearch.checked = false;
 }
 
 async function loadPreferences(): Promise<PopupPreferences> {
   const result = await chrome.storage.local.get(POPUP_PREFERENCES_KEY);
   const preferences = result[POPUP_PREFERENCES_KEY];
-  return preferences && typeof preferences === "object" ? preferences as PopupPreferences : {};
+  if (!preferences || typeof preferences !== "object") return {};
+  const migrated = { ...preferences, strategy: 'unattended' } satisfies PopupPreferences;
+  await chrome.storage.local.set({ [POPUP_PREFERENCES_KEY]: migrated });
+  return migrated;
 }
 
 async function savePreferences(): Promise<void> {
@@ -224,44 +233,48 @@ async function savePreferences(): Promise<void> {
     [POPUP_PREFERENCES_KEY]: {
       provider_profile_id: providerSelect.value,
       model_id: modelSelect.value,
-      strategy: strategySelect.value as RunStrategy,
+      strategy: 'unattended',
       observation_input_mode: selectedInputMode(),
+      model_call_limit:Number(callLimit.value),
     } satisfies PopupPreferences,
   });
 }
 
 function renderSession(snapshot: SessionRuntimeSnapshot | null): void {
+  displayedSnapshot=snapshot;
   hasLiveSession=Boolean(snapshot&&!['COMPLETE','CANCELLED','FAILED'].includes(snapshot.state));
   const active = snapshot && !["COMPLETE", "CANCELLED", "FAILED", "PAUSED"].includes(snapshot.state);
   statusText.dataset.kind = snapshot?.state === "FAILED" ? "error" : snapshot?.state === "PAUSED" ? "warning" : "";
-  statusText.textContent = snapshot?.state ?? "未启动";
-  detailText.textContent = /question_not_found|readiness_timeout/.test(snapshot?.notice??'')
-    ? '当前题目尚未通过本地就绪或结构验证。请确认已进入答题页、已授予该页网站权限；模型调用次数见下方，可生成只读结构资料定位原因。'
-    : snapshot?.notice ?? "打开一个逐题测验后启动。";
+  statusText.textContent = snapshot ? stateLabel(snapshot.state) : t("未启动");
+  showNotice(detailText,snapshot?.notice ?? "打开一个逐题测验后启动。");
   progressText.textContent = snapshot
-    ? `已答 ${snapshot.progress.answered} · 猜答 ${snapshot.progress.guessed} · 重试 ${snapshot.progress.retried} · 调用 ${snapshot.model_calls.used}/${snapshot.model_calls.limit}`
+    ? t('已答 {{answered}} · 猜答 {{guessed}} · 重试 {{retried}} · 调用 {{used}}/{{limit}}',{...snapshot.progress,used:snapshot.model_calls.used,limit:snapshot.model_calls.limit})
     : "";
   if(snapshot?.course){
-    detailText.textContent=[snapshot.notice,`${snapshot.course.title} · ${snapshot.course.phase}`,
-      `预计剩余播放时间：${snapshot.course.estimate_seconds===null?'暂无法估计':snapshot.course.estimate_seconds+'秒'}${snapshot.course.estimate_frozen?'（冻结）':''}；不含答题、缓冲及平台同步耗时。`].filter(Boolean).join('\n');
+    const current=snapshot.course.checkpoint?.children.find(task=>task.id===snapshot.course!.current_task_id)??snapshot.course.tasks.find(task=>task.id===snapshot.course!.current_task_id);
+    const courseInfo=`${snapshot.course.title} · ${stateLabel(snapshot.course.phase)}\n`+
+      t('预计剩余播放时间：{{estimate}}{{frozen}}；不含答题、缓冲及平台同步耗时。',{estimate:snapshot.course.estimate_seconds===null?t('暂无法估计'):t('{{seconds}}秒',{seconds:snapshot.course.estimate_seconds}),frozen:snapshot.course.estimate_frozen?t('（冻结）'):''});
+    detailText.append(document.createTextNode('\n'+courseInfo));
+    if(current)detailText.append(document.createTextNode('\n'+t('当前资源：{{title}}',{title:current.title})));
+    if(snapshot.course.video.rate!==undefined)detailText.append(document.createTextNode('\n'+t('实际倍速 {{rate}}x · 速度由外部插件设置',{rate:snapshot.course.video.rate??t('未确认')})));
+    for(const issue of snapshot.course.issues??[])detailText.append(document.createTextNode(`\n${issue.title} · ${issue.reason}`));
+    for(const result of snapshot.course.results)detailText.append(document.createTextNode('\n'+t('测验结果 {{score}} · 提交 {{submission}} · 及格 {{passed}}',{score:result.result.visible_score??t('未提供'),submission:t(result.result.submission_confirmed?'已确认':'未确认'),passed:t(result.result.passed===true?'已确认':result.result.passed===false?'未通过':'未提供')})));
   }
   if(snapshot?.practice){
     const results=snapshot.practice.results;
-    detailText.textContent=[snapshot.notice,snapshot.practice.title+' · '+snapshot.practice.phase,
-      ...results.map(r=>`${r.title}：${r.status==='submitted'?'本次已提交 '+(r.score??'结果已确认'):r.status==='existing_record'?'已有作答记录，未重做':'页面明确免考／无练习'}`),
-      '本范围不包含视频、文档或期末考试；提交成功不等同于及格。'].filter(Boolean).join('\n');
-    progressText.textContent=`知识点 ${results.length}/${snapshot.practice.scope.length} 已核对 · 新提交 ${results.filter(r=>r.status==='submitted').length} · 调用 ${snapshot.model_calls.used}/${snapshot.model_calls.limit}`;
+    detailText.append(document.createTextNode('\n'+[snapshot.practice.title+' · '+stateLabel(snapshot.practice.phase),
+      ...results.map(r=>`${r.title}：${r.status==='submitted'?t('本次已提交 {{score}}',{score:r.score??t('结果已确认')}):t(r.status==='existing_record'?'已有作答记录，未重做':'页面明确免考／无练习')}`),
+      t('本范围不包含视频、文档或期末考试；提交成功不等同于及格。')].join('\n')));
+    progressText.textContent=t('知识点 {{checked}}/{{total}} 已核对 · 新提交 {{submitted}} · 调用 {{used}}/{{limit}}',{checked:results.length,total:snapshot.practice.scope.length,submitted:results.filter(r=>r.status==='submitted').length,used:snapshot.model_calls.used,limit:snapshot.model_calls.limit});
   }
   courseStart.disabled=hasLiveSession||courseScope().length===0;
   startButton.disabled = Boolean(snapshot && !["COMPLETE", "CANCELLED", "FAILED"].includes(snapshot.state));
   inputMode.disabled = Boolean(snapshot && !["COMPLETE", "CANCELLED", "FAILED"].includes(snapshot.state));
-  pauseButton.disabled = !active;
-  resumeButton.disabled = snapshot?.state !== "PAUSED";
-  stopButton.disabled = !snapshot || ["COMPLETE", "CANCELLED", "FAILED"].includes(snapshot.state);
+  pauseButton.disabled = !active&&!preparing;
+  resumeButton.disabled = snapshot?.state !== "PAUSED" || snapshot.notice?.includes('请核对已保存作答和提交结果后再重新启动')===true;
+  stopButton.disabled = !preparing&&(!snapshot || ["COMPLETE", "CANCELLED", "FAILED"].includes(snapshot.state));
   clearButton.disabled = !snapshot || !["COMPLETE", "CANCELLED", "FAILED", "PAUSED"].includes(snapshot.state);
-  applyStrategyButton.disabled = !snapshot || ["COMPLETE", "CANCELLED", "FAILED"].includes(snapshot.state);
   if (snapshot) {
-    strategySelect.value = snapshot.strategy;
     const modeIndex = INPUT_MODES.findIndex((item) => item.value === snapshot.observation_input_mode);
     if (modeIndex >= 0) inputMode.value = String(modeIndex);
     renderInputMode();
@@ -271,7 +284,9 @@ function renderSession(snapshot: SessionRuntimeSnapshot | null): void {
 async function refreshSession(): Promise<void> {
   if (activeTabId === undefined) return;
   try {
+    const error=displayedError;
     renderSession(await send<SessionRuntimeSnapshot | null>({ type: "VV_GET_SESSION", tab_id: activeTabId }));
+    if(error)setError(error);
   } catch (error) {
     setError(error instanceof Error ? error.message : "无法读取会话状态。");
   }
@@ -284,6 +299,7 @@ async function initialize(): Promise<void> {
 
   profiles = await manager.list();
   const preferences = await loadPreferences();
+  if(preferences.model_call_limit&&Number.isInteger(preferences.model_call_limit)&&preferences.model_call_limit>0)callLimit.value=String(preferences.model_call_limit);
   providerSelect.replaceChildren();
   for (const profile of profiles) {
     const option = document.createElement("option");
@@ -298,10 +314,6 @@ async function initialize(): Promise<void> {
   if (preferences.model_id && Array.from(modelSelect.options).some((option) => option.value === preferences.model_id)) {
     modelSelect.value = preferences.model_id;
   }
-  renderSearchPermission();
-  if (preferences.strategy && ["supervised", "unattended"].includes(preferences.strategy)) {
-    strategySelect.value = preferences.strategy;
-  }
   const modeIndex = INPUT_MODES.findIndex((item) => item.value === preferences.observation_input_mode);
   inputMode.value = String(modeIndex >= 0 ? modeIndex : 1);
   renderInputMode();
@@ -313,23 +325,25 @@ async function initialize(): Promise<void> {
   }
 
   if (activeTabId === undefined || !activeTabUrl?.startsWith("http")) {
-    setError("当前页面不是可授权的 HTTP/HTTPS 测验页面。");
+    setError("当前页面需要使用可授权的 HTTP/HTTPS 测验网页。");
     startButton.disabled = true;
     return;
   }
   port = chrome.runtime.connect({ name: "vv-control" });
   port.postMessage({ tab_id: activeTabId });
   await refreshSession();
+  await refreshPreparation();
+  window.setInterval(()=>{if(preparing)void refreshPreparation().catch(error=>setError(error.message));},1000);
   window.setInterval(() => void refreshSession(), 750);
 }
 
 providerSelect.addEventListener("change", () => {
-  nativeSearch.checked = false;
+  invalidatePreparation();
   renderModels();
   void savePreferences();
 });
-modelSelect.addEventListener("change", () => { nativeSearch.checked = false; renderSearchPermission(); void savePreferences(); });
-strategySelect.addEventListener("change", () => void savePreferences());
+modelSelect.addEventListener("change", () => { invalidatePreparation();void savePreferences(); });
+callLimit.addEventListener('change',()=>{invalidatePreparation();void savePreferences();});
 inputMode.addEventListener("pointerdown", () => modeSlider.classList.add("is-dragging"));
 inputMode.addEventListener("input", renderInputMode);
 inputMode.addEventListener("change", snapInputMode);
@@ -353,10 +367,10 @@ startButton.addEventListener("click", async () => {
       tab_id: activeTabId,
       provider_profile_id: providerSelect.value,
       model_id: modelSelect.value,
-      strategy: strategySelect.value as RunStrategy,
+      strategy: 'unattended',
       model_call_limit: limit,
       observation_input_mode: selectedInputMode(),
-      allow_native_search: !nativeSearch.disabled && nativeSearch.checked,
+      allow_native_search: supportsNativeSearch(profiles.find(p => p.provider_profile_id === providerSelect.value)!, modelSelect.value),
     } satisfies ExtensionRequest;
     await savePreferences();
     const origins = await tabSitePermissionOrigins(activeTabId, activeTabUrl);
@@ -374,7 +388,7 @@ startButton.addEventListener("click", async () => {
       type: "VV_COMMIT_SESSION_START",
       tab_id: activeTabId,
     });
-    renderSession(snapshot);
+    displayedError='';renderSession(snapshot);
   } catch (error) {
     setError(error instanceof Error ? error.message : "启动失败。");
   }
@@ -382,33 +396,39 @@ startButton.addEventListener("click", async () => {
 
 pauseButton.addEventListener("click", async () => {
   if (activeTabId === undefined) return;
-  renderSession(await send({ type: "VV_PAUSE_SESSION", tab_id: activeTabId }));
+  if(preparing){await send({type:'VV_CANCEL_COURSE_PREPARATION',tab_id:activeTabId});return;}
+  try {const snapshot=await send<SessionRuntimeSnapshot>({ type: "VV_PAUSE_SESSION", tab_id: activeTabId });displayedError='';renderSession(snapshot);}
+  catch(error){setError(error instanceof Error?error.message:'暂停失败。');}
 });
 resumeButton.addEventListener("click", async () => {
   if (activeTabId === undefined) return;
   try {
     await requestCurrentWebsite(activeTabId);
-    renderSession(await send({ type: "VV_RESUME_SESSION", tab_id: activeTabId }));
+    const snapshot=await send<SessionRuntimeSnapshot>({ type: "VV_RESUME_SESSION", tab_id: activeTabId });displayedError='';renderSession(snapshot);
   } catch (error) { setError(error instanceof Error ? error.message : "恢复失败。"); }
-});
-applyStrategyButton.addEventListener("click", async () => {
-  if (activeTabId === undefined) return;
-  renderSession(
-    await send({
-      type: "VV_SWITCH_STRATEGY",
-      tab_id: activeTabId,
-      strategy: strategySelect.value as RunStrategy,
-    }),
-  );
 });
 stopButton.addEventListener("click", async () => {
   if (activeTabId === undefined) return;
-  renderSession(await send({ type: "VV_STOP_SESSION", tab_id: activeTabId }));
+  if(preparing){await send({type:'VV_CANCEL_COURSE_PREPARATION',tab_id:activeTabId});return;}
+  try {const snapshot=await send<SessionRuntimeSnapshot>({ type: "VV_STOP_SESSION", tab_id: activeTabId });displayedError='';renderSession(snapshot);}
+  catch(error){setError(error instanceof Error?error.message:'停止失败。');}
 });
 clearButton.addEventListener("click", async () => {
   if (activeTabId === undefined) return;
-  await send({ type: "VV_CLEAR_SESSION", tab_id: activeTabId });
-  renderSession(null);
+  try {await send({ type: "VV_CLEAR_SESSION", tab_id: activeTabId });displayedError='';renderSession(null);}
+  catch(error){setError(error instanceof Error?error.message:'清除失败。');}
 });
 
-void initialize();
+void initializeUiLanguage(()=>{
+  const error=displayedError;
+  renderInputMode();renderSession(displayedSnapshot);renderCourseScope();
+  if(error)setError(error);
+  if(courseCatalog)coursePreview.textContent=t('{{platform}} · {{title}} · {{count}}个已识别任务',{platform:t(courseCatalog.platform==='chaoxing'?'学习通':'知到'),title:courseCatalog.title,count:courseCatalog.tasks.length});
+  if(knowledgeCatalog)coursePreview.textContent=t('知到 · {{count}}个已加载知识点；本范围仅核对关联练习，不代表整个课程目录完整。',{count:knowledgeCatalog.points.length});
+  for(const option of courseRange.options){
+    if(option.value.startsWith('chapter:'))option.textContent=t('章节 {{id}}',{id:option.value.slice(8)});
+    else if(option.value.startsWith('lesson:'))option.textContent=courseCatalog?.tasks.find(task=>task.lesson_id===option.value.slice(7))?.title??t('课时 {{id}}',{id:option.value.slice(7)});
+    else if(!option.value)option.textContent=t(courseCatalog?'请选择范围':knowledgeCatalog?'请选择练习范围':'请先读取目录');
+    else if(option.value==='all')option.textContent=t(knowledgeCatalog?'当前已加载知识点的首次练习':'全部未完成课时');
+  }
+}).then(initialize);

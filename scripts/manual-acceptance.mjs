@@ -5,20 +5,26 @@ import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { createServer as createTcpServer } from "node:net";
 import { resolve } from "node:path";
 import { recommendations, updateInventory } from "./browser-acceptance-state.mjs";
+import { readEasyCpaAcceptanceConfig } from './read-easycpa-acceptance-config.mjs';
+import { providerProfileSchema } from '../src/core/schema.ts';
 
 const root = resolve(import.meta.dirname, "..");
 const runtime = resolve(root, ".browser-regression-runtime");
+const fresh = process.argv.includes('--fresh');
+const runStamp = new Date().toISOString().replaceAll(':', '-');
+const readyConnectionPath = resolve(runtime, 'manual-ready-connection.json');
+const readyConnection = !fresh && existsSync(readyConnectionPath) ? JSON.parse(await readFile(readyConnectionPath, 'utf8')) : null;
 const browserPath = process.env.VV_TEST_BROWSER || resolve(runtime, "chrome-cft/chrome-win64/chrome.exe");
 const previousProfile = resolve(runtime, "visible-retry-20260930");
-const profilePath = process.env.VV_TEST_PROFILE || (existsSync(previousProfile) ? previousProfile : resolve(runtime, "manual-acceptance-profile"));
-const reportDirectory = resolve(runtime, "manual-reports", new Date().toISOString().replaceAll(":", "-"));
+const profilePath = process.env.VV_TEST_PROFILE || (fresh ? resolve(runtime, `manual-ready-${runStamp}`, 'profile') : readyConnection?.profile || (existsSync(previousProfile) ? previousProfile : resolve(runtime, "manual-acceptance-profile")));
+const reportDirectory = resolve(runtime, "manual-reports", runStamp);
 const defaultSite = "https://h5p.org/node/8777";
 const allowedModel = (model) => /^gemini-3\.(?:8|7)-flash(?:-|$)/.test(model) || /^gemini-3\.1-pro(?:-|$)/.test(model);
 const modelPriority = (model) => model.startsWith("gemini-3.8-flash") ? 0 : model.startsWith("gemini-3.7-flash") ? 1 : 2;
 const orderedAllowedModels = (models) => models.filter(allowedModel).sort((a, b) => modelPriority(a) - modelPriority(b) || a.localeCompare(b));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let attachPort = Number(process.argv.find(value => value.startsWith("--attach-port="))?.split("=")[1] || process.env.VV_TEST_CDP_PORT || 0);
-const connectionPath = resolve(runtime, "manual-recorder-connection.json");
+const connectionPath = process.env.VV_MANUAL_CONNECTION_PATH || (fresh || readyConnection ? readyConnectionPath : resolve(runtime, "manual-recorder-connection.json"));
 if (attachPort && (!Number.isInteger(attachPort) || attachPort < 1 || attachPort > 65535)) throw new Error("无效的浏览器调试端口");
 let browser;
 let controller;
@@ -38,6 +44,7 @@ let report = {
   browser: browserPath,
   profile: profilePath,
   extension_version: null,
+  extension_build: null,
   available_allowed_models: [],
   tabs: [],
   sessions: [],
@@ -295,7 +302,8 @@ const server = createServer(async (request, response) => {
 });
 
 async function main() {
-  if (!attachPort) {
+  if (fresh && attachPort) throw new Error('全新验收不能同时接入已有浏览器。');
+  if (!fresh && !attachPort) {
     try {
       const previous = JSON.parse(await readFile(connectionPath, "utf8"));
       if (previous.profile === profilePath && Number.isInteger(previous.cdp_port)) {
@@ -320,7 +328,7 @@ async function main() {
   if (!attachPort) {
     if (!existsSync(browserPath)) throw new Error(`找不到 Chrome for Testing：${browserPath}`);
     if (!existsSync(resolve(root, "node_modules"))) throw new Error("缺少 node_modules；请先运行 pnpm install --frozen-lockfile");
-    const build = spawnSync(process.execPath, [resolve(root, "scripts/build.mjs")], { cwd: root, stdio: "inherit" });
+    const build = spawnSync(process.execPath, [resolve(root, "scripts/build.mjs")], { cwd: root,env:{...process.env,VV_BUILD_DIR:resolve(root,'dist'),VV_TEST_BUILD:'0'}, stdio: "inherit" });
     if (build.status !== 0) throw new Error("VV 构建失败");
   }
   await mkdir(reportDirectory, { recursive: true });
@@ -348,10 +356,10 @@ async function main() {
     `--remote-debugging-port=${browserPort}`,
     `--load-extension=${resolve(root, "dist")}`,
     `--disable-extensions-except=${resolve(root, "dist")}`,
-    "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--no-sandbox",
+    "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--no-sandbox", "--enable-unsafe-extension-debugging",
     dashboardUrl,
   ];
-  browser = spawn(browserPath, args, { cwd: root, stdio: "ignore", windowsHide: false });
+  browser = spawn(browserPath, args, { cwd: root, stdio: "ignore", windowsHide: false, detached: true });
   browser.unref();
   browser.on("error", (error) => console.error("浏览器启动失败：", error));
   }
@@ -376,11 +384,28 @@ async function main() {
   if (!optionsReady) throw new Error(`VV 扩展设置页未加载：${optionsUrl}`);
   await controller.evaluate('document.title="VV 记录连接（请保留）"');
   report.controller_target_id = options.id;
+  const expectedBuild = JSON.parse(await readFile(resolve(root, 'dist/build-info.json'), 'utf8'));
+  const loadedBuild = await extEval(`const response=await fetch(chrome.runtime.getURL('build-info.json'));if(!response.ok)throw new Error('扩展没有构建标识，请加载最新构建。');return response.json();`);
+  const runningBuild = await extEval(`const response=await chrome.runtime.sendMessage({type:'VV_GET_BUILD'});if(!response?.ok||!response.result?.build_id)throw new Error('扩展后台没有当前构建标识，请重新加载最新扩展。');return response.result;`);
+  if (loadedBuild.build_id !== expectedBuild.build_id || runningBuild.build_id !== expectedBuild.build_id || loadedBuild.strategy !== 'unattended') throw new Error('测试浏览器加载的扩展与当前构建不一致，请重新加载最新扩展。');
+  report.extension_build = loadedBuild;
+  if (fresh && process.env.VV_EASYCPA_CONFIG_PATH) {
+    const accepted = await readEasyCpaAcceptanceConfig(process.env.VV_EASYCPA_CONFIG_PATH, ['gemini-3.8-flash-high', 'gemini-3.7-flash-high', 'gemini-3.1-pro-low']);
+    const response = await fetch(`${accepted.profile.base_url}/models`, { headers: { Authorization: `Bearer ${accepted.secret}` }, signal: AbortSignal.timeout(10000) });
+    if (!response.ok) throw new Error(`EasyCPA模型目录返回HTTP ${response.status}，停止准备。`);
+    const catalog = await response.json();
+    if (!Array.isArray(catalog.data)) throw new Error('EasyCPA模型目录格式错误。');
+    const live = new Set(catalog.data.map(item => item.id));
+    const models = orderedAllowedModels(accepted.profile.model_catalog.models.filter(id => live.has(id)));
+    if (!models.length) throw new Error('EasyCPA没有已授权的Gemini模型。');
+    const profile = providerProfileSchema.parse({ ...accepted.profile, display_name: 'CPA', model_catalog: { source: 'provider_api', models, refreshed_at: new Date().toISOString() }, capabilities: { ...accepted.profile.capabilities, native_web_search: models.includes('gemini-3.8-flash-high') }, native_web_search_model_ids: models.filter(id => id === 'gemini-3.8-flash-high') });
+    await extEval(`await chrome.storage.local.set(${JSON.stringify({ 'provider-profile-index': [profile.provider_profile_id], [`provider-profile:${profile.provider_profile_id}`]: profile, [accepted.secretKey]: accepted.secret, 'vv-popup-preferences': { provider_profile_id: profile.provider_profile_id, model_id: models[0], strategy: 'unattended', observation_input_mode: 'semantic_snapshot' } })});return true;`);
+  }
   const config = await extEval(`const keys=await chrome.storage.local.get(["provider-profile-index"]);const ids=keys["provider-profile-index"]||[];const profiles=await chrome.storage.local.get(ids.map(id=>"provider-profile:"+id));return {version:chrome.runtime.getManifest().version,profiles:ids.map(id=>profiles["provider-profile:"+id]).filter(Boolean).map(p=>({id:p.provider_profile_id,name:p.display_name,models:p.model_catalog.models}))};`);
   report.extension_version = config.version;
   const cpa = config.profiles.find((item) => item.name === "CPA");
   report.available_allowed_models = orderedAllowedModels(cpa?.models || []);
-  if (cpa && !attachPort) {
+  if (cpa && !attachPort && !(fresh && process.env.VV_EASYCPA_CONFIG_PATH)) {
     try {
       const liveModels = await extEval(`
         const stored=await chrome.storage.local.get("provider-profile:${cpa.id}");
@@ -394,9 +419,7 @@ async function main() {
         return Array.isArray(payload.data)?payload.data.map(item=>item.id).filter(Boolean):[];
       `);
       report.available_allowed_models = orderedAllowedModels(cpa.models.filter((model) => liveModels.includes(model)));
-    } catch (error) {
-      report.errors.push(`无法核对 CPA 实时模型目录，仅显示 VV 已配置模型：${String(error?.message || error)}`);
-    }
+    } catch { throw new Error('无法核对EasyCPA实时模型目录，停止准备；请检查接口权限和配置。'); }
     const preferred = report.available_allowed_models[0];
     if (preferred) await extEval(`const key="vv-popup-preferences";const stored=await chrome.storage.local.get(key);await chrome.storage.local.set({[key]:{...stored[key],provider_profile_id:${JSON.stringify(cpa.id)},model_id:${JSON.stringify(preferred)}}});return true;`);
   } else if (!cpa) report.errors.push("此隔离浏览器配置尚未设置 CPA，请在 VV 扩展设置中配置。");
@@ -406,7 +429,9 @@ async function main() {
   if (attachPort) await cdpGet(`/json/new?${encodeURIComponent(dashboardUrl)}`, "PUT");
   else await openSite(defaultSite);
   const version = await cdpGet("/json/version");
-  await writeFile(connectionPath, JSON.stringify({ profile: profilePath, cdp_port: browserPort, browser_websocket: version.webSocketDebuggerUrl, dashboard_url: dashboardUrl }, null, 2) + "\n", "utf8");
+  const connectionText = JSON.stringify({ profile: profilePath, cdp_port: browserPort, browser_websocket: version.webSocketDebuggerUrl, dashboard_url: dashboardUrl }, null, 2) + "\n";
+  await writeFile(connectionPath, connectionText, 'utf8');
+  await writeFile(resolve(reportDirectory, 'connection.json'), connectionText, 'utf8');
   timer = setInterval(() => void poll(), 2000);
   console.log(`\nVV 人工验收记录页：${dashboardUrl}`);
   console.log(`监视范围：该测试浏览器所有 HTTP/HTTPS 标签和窗口；调试端口 ${browserPort}`);

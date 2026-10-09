@@ -23,7 +23,7 @@ function fixture(){
   };
   const result:CourseQuizResult={status:'completed',reason:null,submission_confirmed:true,passed:null,visible_score:'75',retried:0};
   const budget=new ModelCallBudget(3);
-  const runner:CourseQuizRunner={run:vi.fn(async b=>{budget.consume();submitState.add(b.task_id);return result;}),pause:vi.fn(),switchStrategy:vi.fn()};
+  const runner:CourseQuizRunner={run:vi.fn(async b=>{budget.consume();submitState.add(b.task_id);return result;}),pause:vi.fn()};
   const run=new CourseOrchestrator(adapter,runner,{session_id:'parent',catalog:list,scope:list.tasks.map(t=>t.id),strategy:'unattended',provider_profile_id:'p',model_id:'gemini-3.8-flash',budget,now:()=>now,wait:async ms=>{now+=ms;}});
   return {adapter,runner,run,list,entered,budget,result,get now(){return now;}};
 }

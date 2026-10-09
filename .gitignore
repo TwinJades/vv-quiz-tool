@@ -6,3 +6,4 @@ dist/
 .browser-regression-runtime/
 .edge-real-regression-profile/
 .pnpm-store/
+/AGENTS.md

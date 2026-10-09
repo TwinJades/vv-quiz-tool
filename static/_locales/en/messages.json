@@ -1,0 +1,5 @@
+{
+  "extensionName": {"message":"VV Quiz Assistant"},
+  "extensionDescription": {"message":"A local browser extension for observing quizzes, solving structured questions, executing controlled actions and verifying results."},
+  "actionTitle": {"message":"VV Quiz Assistant"}
+}

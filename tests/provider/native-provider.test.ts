@@ -46,12 +46,9 @@ describe("native provider request and search boundaries", () => {
     expect(budget.remaining).toBe(allowed ? 0 : 1);
   });
 
-  it("keeps a non-declared model search-free despite requested session permission", async () => {
-    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => anthropicResponse());
-    const solver = new VercelAiSolverProvider(profile, "claude-haiku-4-5", "local-key", new ModelCallBudget(2), fetcher);
-    expect(solver.capabilities().native_web_search).toBe(false);
-    await solver.solve(batch, { strategy: "supervised", allow_images: false, allow_native_search: true }, []);
-    expect(JSON.parse(String(fetcher.mock.calls[0]![1]?.body)).tools ?? []).toEqual([]);
+  it("shares the configured provider search capability with every configured model", () => {
+    const solver = new VercelAiSolverProvider(profile, "claude-haiku-4-5", undefined, new ModelCallBudget(2));
+    expect(solver.capabilities().native_web_search).toBe(true);
   });
 
   it("does not start a search-capable request without room for its model and search calls", async () => {
@@ -69,16 +66,17 @@ describe("native provider request and search boundaries", () => {
     const google: ProviderProfile = { ...profile, provider_type: "google", base_url: "https://native.test/v1beta",
       capabilities: { ...profile.capabilities, native_web_search: false }, native_web_search_model_ids: [] };
     const solver = new VercelAiSolverProvider(google, "gemini-3.8-flash", "local-key", new ModelCallBudget(2), fetcher);
-    expect(await solver.solve(batch, { strategy: "supervised", allow_images: false, allow_native_search: true }, [])).toEqual(answer);
+    expect(await solver.solve(batch, { strategy: "unattended", allow_images: false, allow_native_search: true }, [])).toEqual(answer);
     expect(String(fetcher.mock.calls[0]![0])).toBe("https://native.test/v1beta/models/gemini-3.8-flash:generateContent");
     expect(new Headers(fetcher.mock.calls[0]![1]?.headers).get("x-goog-api-key")).toBe("local-key");
     expect(JSON.parse(String(fetcher.mock.calls[0]![1]?.body)).tools ?? []).toEqual([]);
   });
 
   it("rejects incompatible search claims and catalog mismatches before configuration is saved", () => {
-    expect(providerProfileSchema.safeParse({ ...profile, provider_type: "openai_compatible" }).success).toBe(false);
-    expect(providerProfileSchema.safeParse({ ...profile, native_web_search_model_ids: [] }).success).toBe(false);
-    expect(providerProfileSchema.safeParse({ ...profile, native_web_search_model_ids: ["missing"] }).success).toBe(false);
+    expect(providerProfileSchema.safeParse({ ...profile, provider_type: "openai_compatible" }).success).toBe(true);
+    expect(providerProfileSchema.safeParse({ ...profile, provider_type: "google" }).success).toBe(false);
+    expect(providerProfileSchema.safeParse({ ...profile, native_web_search_model_ids: [] }).success).toBe(true);
+    expect(providerProfileSchema.safeParse({ ...profile, native_web_search_model_ids: ["missing"] }).success).toBe(true);
   });
   it("restricts insecure provider URLs to actual loopback hosts", () => {
     expect(providerProfileSchema.safeParse({ ...profile, base_url: "http://localhost:8317/v1" }).success).toBe(true);

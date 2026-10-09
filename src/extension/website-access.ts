@@ -5,6 +5,10 @@ export function websitePermissionOrigin(urlValue: string): string | null {
   } catch { return null; }
 }
 
+export function activeWebsiteFrame(frame: { documentLifecycle?: string }): boolean {
+  return frame.documentLifecycle === undefined || frame.documentLifecycle === 'active';
+}
+
 export async function websiteIsAuthorized(url: string): Promise<boolean> {
   const origin = websitePermissionOrigin(url);
   return origin !== null && await chrome.permissions.contains({ origins: [origin] });
@@ -21,7 +25,7 @@ export async function requireCurrentWebsite(tabId: number, navigationUrl?: strin
 
 export async function requestCurrentWebsite(tabId: number): Promise<void> {
   const tab = await chrome.tabs.get(tabId);
-  const frames = await chrome.webNavigation.getAllFrames({ tabId });
+  const frames = (await chrome.webNavigation.getAllFrames({ tabId }))?.filter(activeWebsiteFrame);
   const url = frames?.find(frame => frame.frameId === 0)?.url ?? tab.url;
   const origin = url && websitePermissionOrigin(url);
   if (!origin) throw new Error("请先回到可使用 VV 的普通网站。");

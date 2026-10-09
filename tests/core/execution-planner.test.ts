@@ -50,6 +50,9 @@ const answer: AnswerResult = {
 };
 
 describe("buildAnswerExecutionPlan", () => {
+  it('rejects an excessive selection before constructing any write actions',()=>{
+    expect(()=>buildAnswerExecutionPlan({...question,constraints:{min_selections:1,max_selections:1}},{...answer,selected_option_ids:['a','b']},locatorMap,'unattended')).toThrow(ExecutionPlanError);
+  });
   it("sets the complete final selection state instead of blindly toggling", () => {
     const plan = buildAnswerExecutionPlan(question, answer, locatorMap, "unattended");
     expect(plan.actions).toEqual([
@@ -60,7 +63,7 @@ describe("buildAnswerExecutionPlan", () => {
 
   it("rejects stale or cross-question locator maps", () => {
     expect(() =>
-      buildAnswerExecutionPlan(question, answer, { ...locatorMap, observation_id: "old" }, "supervised"),
+      buildAnswerExecutionPlan(question, answer, { ...locatorMap, observation_id: "old" }, "unattended"),
     ).toThrow(ExecutionPlanError);
   });
 
@@ -74,7 +77,7 @@ describe("buildAnswerExecutionPlan", () => {
 
   it("rejects uncertain answers", () => {
     expect(() =>
-      buildAnswerExecutionPlan(question, { ...answer, status: "uncertain" }, locatorMap, "supervised"),
+      buildAnswerExecutionPlan(question, { ...answer, status: "uncertain" }, locatorMap, "unattended"),
     ).toThrow("Only validated answered results");
   });
 });

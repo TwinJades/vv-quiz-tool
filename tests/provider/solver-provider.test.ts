@@ -82,7 +82,7 @@ describe("VercelAiSolverProvider capability gates", () => {
     );
 
     await expect(
-      solver.solve(imageBatch, { strategy: "supervised", allow_images: false }, []),
+      solver.solve(imageBatch, { strategy: "unattended", allow_images: false }, []),
     ).rejects.toMatchObject({ code: "CAPABILITY_MISMATCH" });
     expect(budget.used).toBe(0);
   });

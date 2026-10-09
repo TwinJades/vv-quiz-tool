@@ -211,7 +211,7 @@ function result(batch: QuestionBatch, selected: string[], status: "answered" | "
   };
 }
 
-function options(strategy: "supervised" | "unattended") {
+function options(strategy: "unattended") {
   return {
     session_id: "s1",
     strategy,
@@ -359,7 +359,7 @@ describe("QuizOrchestrator", () => {
     const platform = new FakePlatform(); platform.failFirstSubmission = true;
     platform.state.timer_remaining_seconds = 45;
     let calls = 0;
-    const orchestrator = new QuizOrchestrator(platform, { solve: async (batch: QuestionBatch) => { calls++; return result(batch, ["a"]); } }, new WebVerifier(), options("supervised"));
+    const orchestrator = new QuizOrchestrator(platform, { solve: async (batch: QuestionBatch) => { calls++; return result(batch, ["a"]); } }, new WebVerifier(), options("unattended"));
     await orchestrator.run();
     expect(calls).toBe(1); expect(platform.submissions).toBe(1);
     expect(orchestrator.snapshot()).toMatchObject({ state: "PAUSED", progress: { retried: 0 } });
@@ -381,15 +381,6 @@ describe("QuizOrchestrator", () => {
     expect(orchestrator.snapshot().timings?.find((item) => item.stage === "OBSERVE_SESSION")?.visits).toBe(1);
   });
 
-  it("pauses supervised mode for an uncertain answer", async () => {
-    const platform = new FakePlatform();
-    const solver = { solve: async (batch: QuestionBatch) => result(batch, ["b"], "uncertain") };
-    const orchestrator = new QuizOrchestrator(platform, solver, new WebVerifier(), options("supervised"));
-
-    await orchestrator.run();
-    expect(orchestrator.snapshot()).toMatchObject({ state: "PAUSED" });
-  });
-
   it("uses a best candidate in unattended mode and records a guess", async () => {
     const platform = new FakePlatform();
     const solver = { solve: async (batch: QuestionBatch) => result(batch, ["b"], "uncertain") };
@@ -402,7 +393,7 @@ describe("QuizOrchestrator", () => {
     });
   });
 
-  it("re-solves after explicit incorrect feedback", async () => {
+  it("does not re-solve a graded question without a current retry control", async () => {
     const platform = new FakePlatform();
     platform.failFirstSubmission = true;
     let calls = 0;
@@ -415,11 +406,12 @@ describe("QuizOrchestrator", () => {
     const orchestrator = new QuizOrchestrator(platform, solver, new WebVerifier(), options("unattended"));
 
     await orchestrator.run();
-    expect(calls).toBe(2);
+    expect(calls).toBe(1);
     expect(orchestrator.snapshot()).toMatchObject({
-      state: "COMPLETE",
-      progress: { answered: 1, retried: 1 },
+      state: "PAUSED",
+      progress: { answered: 0, retried: 0 },
     });
+    expect(orchestrator.snapshot().notice).toContain("no available retry control");
   });
 
   it("clicks a mapped retry control before observing a graded question again", async () => {
@@ -456,11 +448,12 @@ describe("QuizOrchestrator", () => {
         if(++calls>1&&mode==='unique')expect(platform.state.feedback).toBeNull();
         return result(batch,[calls===1?'a':'b']);
       }};
-      const orchestrator=new QuizOrchestrator(platform,solver,new WebVerifier(),options('supervised'));
+      const orchestrator=new QuizOrchestrator(platform,solver,new WebVerifier(),options('unattended'));
       await orchestrator.run();
       expect(platform.retryClicked).toBe(mode==='unique');
       expect(orchestrator.snapshot().state).toBe(mode==='unique'?'COMPLETE':'PAUSED');
-      expect(calls).toBe(2);
+      expect(calls).toBe(mode==='unique'?2:1);
+      expect(orchestrator.snapshot().progress.retried).toBe(mode==='unique'?1:0);
     });
 
   it.each(['failed','unknown'] as const)('does not solve again after a retry action returns %s',async status=>{
@@ -473,7 +466,7 @@ describe("QuizOrchestrator", () => {
     const orchestrator=new QuizOrchestrator(platform,solver,new WebVerifier(),options('unattended'));
     await orchestrator.run();
     expect(calls).toBe(1);
-    expect(orchestrator.snapshot()).toMatchObject({state:'PAUSED',progress:{answered:0,retried:1}});
+    expect(orchestrator.snapshot()).toMatchObject({state:'PAUSED',progress:{answered:0,retried:0}});
   });
   it('waits for the previous grade to clear after a successful delayed retry',async()=>{
     const platform=new FakePlatform();platform.failFirstSubmission=true;platform.retryBeforeObserve=true;
@@ -631,7 +624,7 @@ describe("QuizOrchestrator", () => {
     });
   });
 
-  it.each(["supervised", "unattended"] as const)(
+  it.each(["unattended"] as const)(
     "waits for a cross-page submission to expose the next fingerprint in %s mode",
     async (strategy) => {
       const platform = new FakePlatform();

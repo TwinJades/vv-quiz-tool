@@ -1,0 +1,5 @@
+{
+  "extensionName": {"message":"VV 自动答题工具"},
+  "extensionDescription": {"message":"观察测验、结构化求解、受控执行并验证结果的本地浏览器扩展。"},
+  "actionTitle": {"message":"VV 自动答题"}
+}

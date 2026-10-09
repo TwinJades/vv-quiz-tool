@@ -70,9 +70,9 @@ describe("provider retry accounting", () => {
     mocks.generate.mockRejectedValue(Object.assign(new Error("Rejected"), { statusCode: 401 }));
     const budget = new ModelCallBudget(1);
     const solver = new VercelAiSolverProvider(profile, "test", "unused", budget);
-    await expect(solver.solve(batch, { strategy: "supervised", allow_images: false }, [])).rejects.toMatchObject({ code: "AUTHENTICATION" });
+    await expect(solver.solve(batch, { strategy: "unattended", allow_images: false }, [])).rejects.toMatchObject({ code: "AUTHENTICATION" });
     expect(mocks.generate).toHaveBeenCalledTimes(1);
-    await expect(solver.solve(batch, { strategy: "supervised", allow_images: false }, [])).rejects.toThrow("limit");
+    await expect(solver.solve(batch, { strategy: "unattended", allow_images: false }, [])).rejects.toThrow("limit");
     expect(mocks.generate).toHaveBeenCalledTimes(1);
   });
 
@@ -91,7 +91,7 @@ describe("provider retry accounting", () => {
     mocks.generate.mockImplementation(async () => { controller.abort(); throw Object.assign(new Error("Network error"), { statusCode: 503 }); });
     const budget = new ModelCallBudget(3);
     const solver = new VercelAiSolverProvider(profile, "test", "unused", budget);
-    await expect(solver.solve(batch, { strategy: "supervised", allow_images: false }, [], controller.signal)).rejects.toMatchObject({ code: "ABORTED" });
+    await expect(solver.solve(batch, { strategy: "unattended", allow_images: false }, [], controller.signal)).rejects.toMatchObject({ code: "ABORTED" });
     expect(budget.used).toBe(1);
     expect(mocks.generate).toHaveBeenCalledTimes(1);
     expect(vi.getTimerCount()).toBe(0);
@@ -104,7 +104,7 @@ describe("provider retry accounting", () => {
     mocks.generate.mockRejectedValue(Object.assign(new Error("Network error"), { statusCode: 503 }));
     const budget = new ModelCallBudget(3);
     const solver = new VercelAiSolverProvider(profile, "test", "unused", budget);
-    const outcome = solver.solve(batch, { strategy: "supervised", allow_images: false }, [], controller.signal).catch(error => error);
+    const outcome = solver.solve(batch, { strategy: "unattended", allow_images: false }, [], controller.signal).catch(error => error);
     await vi.advanceTimersByTimeAsync(0);
     expect(vi.getTimerCount()).toBe(1);
     controller.abort();

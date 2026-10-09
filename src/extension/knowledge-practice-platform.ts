@@ -1,6 +1,5 @@
 import {KnowledgePracticeOrchestrator,validateKnowledgeScope} from '../core/knowledge-practice';
 import type {KnowledgeAdapter,KnowledgeCatalog,KnowledgePoint,PracticeChild} from '../core/knowledge-practice';
-import {courseModels} from '../core/course';
 import {QuizOrchestrator} from '../core/orchestrator';
 import type {RuntimePlatform,SessionRuntimeSnapshot} from '../core/orchestrator';
 import type {ModelCallBudget} from '../core/call-budget';
@@ -11,6 +10,7 @@ import {ensureContentInjected,TabPlatformProxy} from './tab-platform';
 import {requireCurrentWebsite,websiteIsAuthorized} from './website-access';
 import type {ContentResponse} from './messages';
 import type {KnowledgePageRequest,KnowledgePageState} from '../web/knowledge-practice-page';
+import type {ZhidaoResultReading} from '../web/zhidao-result';
 
 export class KnowledgeTabPlatform implements KnowledgeAdapter {
   #epoch=crypto.randomUUID();#enabled=false;#document:string|null=null;#child:TabPlatformProxy|null=null;
@@ -56,6 +56,14 @@ export class KnowledgeTabPlatform implements KnowledgeAdapter {
   async prepare(point:KnowledgePoint,signal:AbortSignal):Promise<'practice'|'existing_record'|'no_practice'>{
     const muted=await chrome.tabs.update(this.tabId,{muted:true});signal.throwIfAborted();if(!muted?.mutedInfo?.muted)throw new Error('进入知识点前标签静音未确认。');
     let state=await this.#state(point,signal);
+    if(state.navigation.stage==='result'){
+      state=await this.#wait(point,signal,current=>current.navigation.stage==='result'&&current.navigation.ready);
+      const response=await chrome.tabs.sendMessage(this.tabId,{type:'VV_READ_ZHIDAO_RESULT'},{frameId:0}) as ContentResponse;signal.throwIfAborted();
+      if(!response?.ok)throw new Error(response?.error??'知识点公开结果读取失败。');
+      const result=response.result as ZhidaoResultReading|null;
+      if(!result||result.course_id!==this.initial.course_id||result.point_id!==point.id||result.context_id!==this.initial.context_id||result.exercise_id!==state.navigation.exercise_id)throw new Error('现有结果与当前知识点不一致，禁止重新提交。');
+      return 'existing_record';
+    }
     if(state.navigation.stage==='directory')await this.#page(this.#request('enter',point),signal);
     state=await this.#wait(point,signal,s=>s.no_practice||s.navigation.ready&&['learner','mastery_history','practice'].includes(s.navigation.stage));
     if(state.no_practice)return 'no_practice';
@@ -87,11 +95,11 @@ export class KnowledgeTabPlatform implements KnowledgeAdapter {
     const response=await chrome.tabs.sendMessage(this.tabId,{type:'VV_KNOWLEDGE_PAGE',request:this.#request('pause',point),session_id:this.sessionId,interaction_epoch:this.#epoch},{frameId:0});
     if(!response?.ok||response.result!==true)throw new Error('视频暂停未确认。');
   }
-  async makeChild(point:KnowledgePoint,profile:ProviderProfile,key:string|undefined,budget:ModelCallBudget,strategy:()=>RunStrategy,onUpdate:()=>void,signal:AbortSignal,modelChanged:(id:string,reason:string)=>void=()=>{}):Promise<PracticeChild>{
+  async makeChild(point:KnowledgePoint,profile:ProviderProfile,key:string|undefined,budget:ModelCallBudget,strategy:()=>RunStrategy,onUpdate:()=>void,signal:AbortSignal,modelChanged:(id:string,reason:string)=>void=()=>{},restore?:SessionRuntimeSnapshot,persist?:()=>Promise<void>):Promise<PracticeChild>{
     const state=await this.#state(point,signal);
     if(state.navigation.stage!=='practice'||!state.navigation.ready)throw new Error('知识点练习边界不明确。');
     const exercise=state.navigation.exercise_id!,proxy=new TabPlatformProxy(this.tabId,'structured');this.#child=proxy;
-    const childId=crypto.randomUUID();await proxy.enableInteraction(childId);signal.throwIfAborted();this.#enabled=false;
+    const childId=restore?.session_id??crypto.randomUUID();await proxy.enableInteraction(childId);signal.throwIfAborted();this.#enabled=false;
     // The proxy owns its cancellation epoch and final-submit receipt. Checking
     // public route identities here confines all generic quiz writes to this child.
     const bound=async(s:AbortSignal,writing=false)=>{const frame=await this.#permission(s),url=new URL(frame.url);const resultPath=`/point/${this.initial.course_id}/`;
@@ -103,22 +111,18 @@ export class KnowledgeTabPlatform implements KnowledgeAdapter {
       waitUntilReady:async s=>{await bound(s);return proxy.waitUntilReady(s);},observeSession:async(id,s)=>{await bound(s,true);return proxy.observeSession(id,s);},
       readState:async s=>{await bound(s);return proxy.readState(s);},readTimer:async s=>{await bound(s);return proxy.readTimer(s);},
       resolveMedia:async(h,s)=>{await bound(s);return proxy.resolveMedia(h,s);},execute:async(p,m,s)=>{await bound(s,true);return proxy.execute(p,m,s);}};
-    const models=courseModels(profile.model_catalog.models);if(!models.length)throw new Error('没有已配置的授权Gemini模型。');let modelIndex=this.#modelId===null?0:models.indexOf(this.#modelId);
-    if(modelIndex<0)throw new Error('恢复模型已不在配置的授权Gemini列表中。');this.#modelId=models[modelIndex]!;
+    this.#modelId=restore?.model_id??this.#modelId;
+    if(!this.#modelId||!profile.model_catalog.models.includes(this.#modelId))throw new Error('练习所选模型已不在Provider配置中。');
     const child=new QuizOrchestrator(platform,new VercelAiSolverProvider(profile,this.#modelId,key,budget,undefined,120000,true),new WebVerifier(),
-      {session_id:childId,strategy:strategy(),observation_input_mode:'structured',provider_profile_id:profile.provider_profile_id,model_id:this.#modelId,model_call_budget:budget,
-        image_upload_authorized:profile.image_upload_authorized,max_answer_retries:0,require_retry_control:true,on_update:onUpdate});
+      {session_id:childId,strategy:strategy(),observation_input_mode:'structured',...(restore?{restore}:{}),provider_profile_id:profile.provider_profile_id,model_id:this.#modelId,model_call_budget:budget,
+        image_upload_authorized:profile.image_upload_authorized,max_answer_retries:0,require_retry_control:true,on_update:onUpdate,...(persist?{persist:()=>persist()}: {})});
     const run=async(resume:boolean,parentSignal:AbortSignal)=>{
       const abort=()=>child.pause('知识点父任务已暂停。');parentSignal.addEventListener('abort',abort,{once:true});
       try{parentSignal.throwIfAborted();await proxy.enableInteraction(childId);parentSignal.throwIfAborted();
-      for(;;){if(resume)await child.resume();else await child.run();parentSignal.throwIfAborted();const result=child.snapshot(),notice=result.notice??'';
-      const unavailable=!/429|quota|额度|credential|permission|401|403/i.test(notice)&&/Provider is temporarily unavailable|configured model is unavailable|request timed out|service unavailable|HTTP 5\d\d/i.test(notice);
-      if(result.state!=='PAUSED'||!unavailable||modelIndex+1>=models.length||budget.remaining<=0)return;
-      modelIndex++;this.#modelId=models[modelIndex]!;child.replaceSolver(new VercelAiSolverProvider(profile,this.#modelId,key,budget,undefined,120000,true),this.#modelId);
-      modelChanged(this.#modelId,'模型服务持续不可用，按授权切换至 '+this.#modelId+'；总调用预算保留。');resume=true;
-      }}finally{parentSignal.removeEventListener('abort',abort);await proxy.disableInteraction();}
+      if(resume)await child.resume();else await child.run();parentSignal.throwIfAborted();
+      }finally{parentSignal.removeEventListener('abort',abort);await proxy.disableInteraction();}
     };
-    return {run:s=>run(false,s),resume:s=>run(true,s),pause:r=>child.pause(r),switchStrategy:s=>child.switchStrategy(s),snapshot:()=>child.snapshot()};
+    return {run:s=>run(false,s),resume:s=>run(true,s),pause:r=>child.pause(r),snapshot:()=>child.snapshot()};
   }
 }
 
@@ -128,9 +132,9 @@ export async function previewKnowledge(tabId:number):Promise<KnowledgeCatalog>{
   if(!response?.ok)throw new Error(response?.error??'知识点目录读取失败。');return response.result as KnowledgeCatalog;
 }
 export function createKnowledgeRun(tabId:number,profile:ProviderProfile,key:string|undefined,budget:ModelCallBudget,
-  options:{session_id:string;catalog:KnowledgeCatalog;scope:string[];strategy:RunStrategy;on_update:(s:SessionRuntimeSnapshot)=>void;restore?:SessionRuntimeSnapshot}):{platform:KnowledgeTabPlatform;orchestrator:KnowledgePracticeOrchestrator}{
-  validateKnowledgeScope(options.catalog,options.scope);const models=courseModels(profile.model_catalog.models);if(!models.length)throw new Error('没有已配置的授权Gemini模型。');
-  const model=options.restore?.model_id??models[0]!;if(!models.includes(model))throw new Error('恢复模型已不在配置的授权Gemini列表中。');
+  options:{session_id:string;model_id:string;catalog:KnowledgeCatalog;scope:string[];strategy:RunStrategy;on_update:(s:SessionRuntimeSnapshot)=>void;restore?:SessionRuntimeSnapshot}):{platform:KnowledgeTabPlatform;orchestrator:KnowledgePracticeOrchestrator}{
+  validateKnowledgeScope(options.catalog,options.scope);
+  const model=options.restore?.model_id??options.model_id;if(!profile.model_catalog.models.includes(model))throw new Error('练习所选模型已不在Provider配置中。');
   const platform=new KnowledgeTabPlatform(tabId,options.session_id,options.catalog,model);let orchestrator:KnowledgePracticeOrchestrator;
   orchestrator=new KnowledgePracticeOrchestrator(platform,(point,update,signal)=>platform.makeChild(point,profile,key,budget,()=>orchestrator.snapshot().strategy,update,signal,(id,reason)=>orchestrator.modelChanged(id,reason)),
     {...options,provider_profile_id:profile.provider_profile_id,model_id:model,budget});return {platform,orchestrator};

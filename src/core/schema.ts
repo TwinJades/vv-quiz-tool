@@ -5,7 +5,7 @@ export const SCHEMA_VERSION = "1.0" as const;
 const idSchema = z.string().trim().min(1);
 const isoDateSchema = z.string().datetime({ offset: true });
 
-export const runStrategySchema = z.enum(["supervised", "unattended"]);
+export const runStrategySchema = z.literal("unattended");
 export type RunStrategy = z.infer<typeof runStrategySchema>;
 
 export const observationInputModeSchema = z.enum(["structured", "semantic_snapshot", "visual_snapshot"]);
@@ -441,16 +441,14 @@ export const providerProfileSchema = z
     image_upload_authorized: z.boolean(),
     native_web_search_model_ids: z.array(idSchema).optional(),
     model_batch_limits: z.record(idSchema, modelBatchLimitsSchema).optional(),
+    provider_batch_limits: modelBatchLimitsSchema.optional(),
   })
   .strict()
   .superRefine((profile, context) => {
     if (profile.capabilities.native_web_search &&
-      (profile.provider_type !== "anthropic" || !profile.native_web_search_model_ids?.length)) {
+      !['anthropic', 'openai_compatible'].includes(profile.provider_type)) {
       context.addIssue({ code: "custom", path: ["capabilities", "native_web_search"],
-        message: "Native search requires the Anthropic adapter and explicitly confirmed model ids." });
-    }
-    if (profile.native_web_search_model_ids?.some(id => !profile.model_catalog.models.includes(id))) {
-      context.addIssue({ code: "custom", path: ["native_web_search_model_ids"], message: "Search model ids must belong to this model catalog." });
+        message: "Native search requires a supported Provider adapter." });
     }
   });
 export type ProviderProfile = z.infer<typeof providerProfileSchema>;

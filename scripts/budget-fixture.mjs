@@ -17,7 +17,7 @@ export async function runBudgetCases({ name, port, profiles, control, cdp, exten
   const panelId = (await cdp.send('Target.createTarget', { url: `chrome-extension://${extensionId}/tasks.html` })).targetId;
   await pause(200);
   result.budget = [];
-  const cases = ['default', 'retry'].flatMap(kind => ['supervised', 'unattended'].map(strategy => ({ id: `${kind}-${strategy}`, kind, strategy })));
+  const cases = ['default', 'retry'].map(kind => ({ id: `${kind}-unattended`, kind, strategy: 'unattended' }));
   await Promise.all(cases.map(async ({ id, kind, strategy }, index) => {
     const item = { id, kind, strategy, passed: false, error: null, request_limit_omitted: kind === 'default' };
     result.budget.push(item);

@@ -25,7 +25,7 @@ const options = { session_id: "s", strategy: "unattended" as const, observation_
 afterEach(() => { vi.useRealTimers(); document.body.innerHTML = ""; });
 
 describe("dynamic timer close-out", () => {
-  it.each(["supervised", "unattended"] as const)("closes %s while a required image fetch hangs and ignores its late payload", async strategy => {
+  it.each(["unattended"] as const)("closes %s while a required image fetch hangs and ignores its late payload", async strategy => {
     vi.useFakeTimers(); const website = mount(120); const platform = new PagePlatform(document);
     document.querySelector("fieldset")!.insertAdjacentHTML("afterbegin", '<img src="https://example.test/diagram.png" width="16" height="16">');
     let mediaSignal: AbortSignal | undefined; let fetches = 0; let solves = 0; let release!: () => void;

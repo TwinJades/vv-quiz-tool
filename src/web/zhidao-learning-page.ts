@@ -96,6 +96,8 @@ export class ZhidaoLearningPage {
   }
   async execute(request:CoursePageRequest,signal:AbortSignal):Promise<CoursePageResult>{
     signal.throwIfAborted();if(request.operation==='catalog')return this.catalog();
+    if(request.operation==='bind')return true;
+    if(request.operation==='children')return this.catalog().tasks;
     if(request.operation==='directory'){
       const nav=readZhidaoNavigation(this.document);
       if(nav?.stage==='directory'){if(nav.course_id!==request.course_id)throw new Error('课程改变。');return true;}
@@ -127,21 +129,20 @@ export class ZhidaoLearningPage {
     const controls=this.player(course_id,task);
     switch(request.operation){
       case 'video':{const v=controls.snapshot();
-        if(Array.from(this.document.querySelectorAll('.videoNameBox .radio-view,.videoNameBox [role="dialog"],.videoNameBox input[type="radio"]')).some(visible))
-          throw new Error('视频出现尚未映射的弹题，暂停并等待核对。');
         if(!v.paused&&!v.ended&&!(v.muted||v.volume===0))throw new Error('静音状态已失效。');
         return {course_id,task_id:task.id,video_id:task.id,observed_at:v.observed_at,duration:v.duration,position:v.position,rate:v.rate,
           paused:v.paused,buffering:v.buffering,seeking:v.seeking,ended:v.ended,visible:v.visible,popup:null} satisfies VideoSnapshot;}
       case 'speed_target':{const root=this.document.querySelector<HTMLElement>('.videoNameBox >.video-js');root?.dispatchEvent(new this.document.defaultView!.MouseEvent('mousemove',{bubbles:true}));
         const captions=Array.from(this.document.querySelectorAll<HTMLElement>('.videoNameBox .controlsBar >.speedBox >span')).filter(visible);
-        if(captions.length===0)return null;if(captions.length!==1)throw new Error('倍速控件不唯一。');
-        const r=captions[0]!.getBoundingClientRect();const geometry=captureVisualGeometry(this.document,null);geometry.region={x:0,y:0,width:geometry.viewport.width,height:geometry.viewport.height};
+        if(captions.length>1)throw new Error('倍速控件不唯一。');
+        const target=captions[0]??root;if(!target||!visible(target))throw new Error('播放器悬停目标不可见。');
+        const r=target.getBoundingClientRect();const geometry=captureVisualGeometry(this.document,null);geometry.region={x:0,y:0,width:geometry.viewport.width,height:geometry.viewport.height};
         return {point:{x:r.x+r.width/2,y:r.y+r.height/2},captured_at:Date.now(),geometry};}
       case 'mute':await controls.mute(signal);return true;
       case 'speed':await controls.highestAllowedSpeed(this.document.querySelector('.videoNameBox .controlsBar >.speedBox >span')!==null,signal);return true;
       case 'play':await controls.play(signal);return true;
       case 'pause':await controls.pause(signal);return controls.snapshot().paused;
-      case 'quiz':case 'rewatch':throw new Error('当前视频范围没有纳入练习或已确认的弹题规则。');
+      case 'quiz':case 'rewatch':case 'retry':case 'record':throw new Error('当前视频范围没有纳入练习或已确认的弹题规则。');
     }
   }
 }

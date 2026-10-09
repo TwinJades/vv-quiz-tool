@@ -1,74 +1,49 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ModelCallBudget } from '../../src/core/call-budget';
-import { CourseQuizService } from '../../src/extension/course-platform';
-import type { CourseTabPlatform } from '../../src/extension/course-platform';
-import type { LearningTask, QuizBoundary } from '../../src/core/course';
-import type { ProviderProfile } from '../../src/core/schema';
+import {describe,expect,it} from 'vitest';
+import {courseFailureIsLocal} from '../../src/core/course';
+import {courseResumeUrl,courseCatalogMatchesUrl} from '../../src/extension/course-record';
+import {courseSnapshotHasIdentity,courseSurfaceFingerprint} from '../../src/web/course-surface';
+import type {CourseSurfaceSnapshot} from '../../src/web/course-surface';
+import type {CourseCatalog} from '../../src/core/course';
+import {publicMediaIdentity} from '../../src/web/public-course-url';
 
-const fakes=vi.hoisted(()=>({outcomes:[] as string[],models:[] as string[],replacements:[] as string[],budgets:[] as unknown[]}));
-vi.mock('../../src/provider/solver-provider',()=>({VercelAiSolverProvider:class {
-  constructor(_profile:unknown,model:string,_key:unknown,budget:unknown){fakes.models.push(model);fakes.budgets.push(budget);}
-}}));
-vi.mock('../../src/core/orchestrator',()=>({QuizOrchestrator:class {
-  state='CREATED';notice:string|null=null;
-  constructor(_platform:unknown,_solver:unknown,_verifier:unknown,private options:{model_call_budget:ModelCallBudget}){}
-  async run(){this.options.model_call_budget.consume();const result=fakes.outcomes.shift()??'COMPLETE';this.state=result==='COMPLETE'?'COMPLETE':'PAUSED';this.notice=this.state==='PAUSED'?result:null;}
-  async resume(){await this.run();}
-  snapshot(){return {state:this.state,notice:this.notice,progress:{retried:0},summary:{visible_score:'46%'}};}
-  pause(){this.state='PAUSED';} switchStrategy(){}
-  replaceSolver(_solver:unknown,id:string){fakes.replacements.push(id);}
-}}));
-
-const task:LearningTask={id:'v',lesson_id:'l',chapter_id:'c',title:'fixture',kind:'video',order:0,status:'in_progress',prerequisites:[]};
-const boundary:QuizBoundary={id:'popup',course_id:'course',task_id:'v',kind:'video_popup',rules:{scored:false,retry_allowed:true,remaining_attempts:3,requires_pass:false,requires_rewatch:false}};
-const profile:ProviderProfile={schema_version:'1.0',provider_profile_id:'p',display_name:'Fixture',provider_type:'openai_compatible',base_url:'https://fixture.invalid/v1',secret_ref:'unused',model_catalog:{source:'manual',models:['gemini-3.1-pro','other-model','gemini-3.8-flash','gemini-3.7-flash'],refreshed_at:null},capabilities:{image_input:false,structured_output:true,native_web_search:false},image_upload_authorized:false};
-function setup(limit=10){
-  const state:{completed:boolean;feedback:'correct'|'incorrect'|null;visible_score:string|null}={completed:false,feedback:null,visible_score:null};
-  const parent={quizRequest:vi.fn(async()=>state),rewatch:vi.fn(async()=>true)};
-  const budget=new ModelCallBudget(limit);
-  return {parent,state,budget,service:new CourseQuizService(parent as unknown as CourseTabPlatform,profile,undefined,budget,[task])};
-}
-afterEach(()=>{fakes.outcomes=[];fakes.models=[];fakes.replacements=[];fakes.budgets=[];});
-describe('course quiz reconciliation, retries and authorized model fallback',()=>{
-  it('reconciles a completed submission without another solver or action',async()=>{
-    const f=setup();f.state.completed=true;
-    expect(await f.service.run(boundary,'unattended',new AbortController().signal)).toMatchObject({status:'completed',submission_confirmed:true});
-    expect(fakes.models).toEqual([]);expect(f.budget.used).toBe(0);
+describe('course failure and persisted navigation policies',()=>{
+  it.each(['课程视频播放器尚未加载。','视频连续两分钟没有有效播放进展。','平台任务完成记录仍未确认。'])('keeps a local task issue for %s',message=>{
+    expect(courseFailureIsLocal(message)).toBe(true);
   });
-  it('falls back through only configured authorized models while preserving one budget',async()=>{
-    const f=setup();fakes.outcomes=['Provider is temporarily unavailable. HTTP 503.','The configured model is unavailable.','COMPLETE'];
-    f.parent.quizRequest.mockResolvedValueOnce({...f.state}).mockResolvedValue({...f.state,completed:true});
-    const notice=vi.fn();f.service.onModelChange(notice);
-    expect(await f.service.run(boundary,'unattended',new AbortController().signal)).toMatchObject({status:'completed'});
-    expect(fakes.models).toEqual(['gemini-3.8-flash','gemini-3.7-flash','gemini-3.1-pro']);
-    expect(fakes.budgets.every(b=>b===f.budget)).toBe(true);expect(f.budget.used).toBe(3);expect(notice).toHaveBeenCalledTimes(2);
+  it.each(['登录失效。','当前网页未授权。','Provider rejected the local configuration.','Model call limit of 300 has been reached.','当前视频身份已改变。','会话保存失败。'])('pauses for %s',message=>{
+    expect(courseFailureIsLocal(message)).toBe(false);
   });
-  it('keeps an unconfirmed submission pending and reconciles it without another model',async()=>{
-    const f=setup();fakes.outcomes=['COMPLETE'];
-    expect(await f.service.run(boundary,'unattended',new AbortController().signal)).toMatchObject({status:'paused',submission_confirmed:false});
-    expect(fakes.models).toHaveLength(1);expect(f.budget.used).toBe(1);
-    f.state.completed=true;
-    expect(await f.service.run(boundary,'unattended',new AbortController().signal)).toMatchObject({status:'completed',submission_confirmed:true});
-    expect(fakes.models).toHaveLength(1);expect(f.budget.used).toBe(1);
+  it('retains public navigation identities and removes credential parameters',()=>{
+    expect(courseResumeUrl('https://mooc1.chaoxing.com/mycourse/studentstudy?courseId=265936720&clazzid=153460518&chapterId=1214865778&token=discarded'))
+      .toBe('https://mooc1.chaoxing.com/mycourse/studentstudy?courseId=265936720&clazzid=153460518&chapterId=1214865778');
   });
-  it('does not report rewatching when the platform cannot confirm the rewind',async()=>{
-    const f=setup();f.state.feedback='incorrect';
-    f.parent.rewatch.mockResolvedValue(false);
-    await expect(f.service.run({...boundary,rules:{...boundary.rules,requires_rewatch:true}},'unattended',new AbortController().signal)).rejects.toThrow(/尚未确认/);
-    expect(fakes.models).toEqual([]);expect(f.budget.used).toBe(0);
+  it('保留正常导航所需参数，拒绝范围外网站地址',()=>{
+    expect(courseResumeUrl('https://study.zhihuishu.com/course?recruitAndCourseId=public&unitId=lesson&mode=video&access_token=removed')).toBe('https://study.zhihuishu.com/course?recruitAndCourseId=public&unitId=lesson&mode=video');
+    expect(()=>courseResumeUrl('https://example.com/course')).toThrow();
   });
-  it.each(['Provider is temporarily unavailable. HTTP 429.','Provider rejected the local configuration.','permission denied','invalid structured answer'])('does not switch models for %s',async reason=>{
-    const f=setup();fakes.outcomes=[reason];expect(await f.service.run(boundary,'supervised',new AbortController().signal)).toMatchObject({status:'paused'});
-    expect(fakes.models).toEqual(['gemini-3.8-flash']);expect(f.budget.used).toBe(1);
+  it('公开课程和班级身份要求完整匹配，重复矛盾参数不能授权',()=>{
+    const snapshot:CourseSurfaceSnapshot={capture_id:'capture',url:'https://mooc1.chaoxing.com/mycourse/studentstudy?courseId=265936720&clazzid=153460518',title:'',visible_text:'',native:false,elements:[]};
+    expect(courseSnapshotHasIdentity(snapshot,'265936720','153460518')).toBe(true);
+    expect(courseSnapshotHasIdentity(snapshot,'2659367','153460518')).toBe(false);
+    expect(courseSnapshotHasIdentity(snapshot,'265936720','1534605')).toBe(false);
+    expect(courseSnapshotHasIdentity({...snapshot,url:snapshot.url+'&courseId=another'},'265936720','153460518')).toBe(false);
+    const catalog:CourseCatalog={course_id:'265936720',context_id:'153460518',platform:'chaoxing',title:'',revision:'',complete:true,tasks:[],rules:{visibility_required:null,speed_allowed:null},diagnostics:[]};
+    expect(courseCatalogMatchesUrl(snapshot.url,catalog)).toBe(true);
+    expect(courseCatalogMatchesUrl(snapshot.url.replace('153460518','153460519'),catalog)).toBe(false);
   });
-  it('does not switch when the shared budget is exhausted',async()=>{
-    const f=setup(1);fakes.outcomes=['Provider is temporarily unavailable. HTTP 503.'];
-    expect(await f.service.run(boundary,'unattended',new AbortController().signal)).toMatchObject({status:'paused'});expect(fakes.models).toHaveLength(1);
+  it('媒体身份保留公开资源编号，播放签名变化不改变资源身份',()=>{
+    const a=publicMediaIdentity('https://video.chaoxing.com/video.mp4?objectId=77&sign=secret&expires=123');
+    expect(a).toBe('https://video.chaoxing.com/video.mp4?objectId=77');
+    expect(publicMediaIdentity('https://video.chaoxing.com/video.mp4?objectId=77&sign=renewed&expires=456')).toBe(a);
+    expect(publicMediaIdentity('https://video.chaoxing.com/video.mp4?objectId=78')).not.toBe(a);
+    expect(publicMediaIdentity('blob:https://video.chaoxing.com/temporary')).toBeNull();
   });
-  it('does not act when cancelled or attempts are exhausted',async()=>{
-    const f=setup();const controller=new AbortController();controller.abort();
-    await expect(f.service.run(boundary,'unattended',controller.signal)).rejects.toMatchObject({name:'AbortError'});
-    await expect(f.service.run({...boundary,rules:{...boundary.rules,remaining_attempts:0}},'unattended',new AbortController().signal)).rejects.toThrow(/剩余/);
-    expect(fakes.models).toEqual([]);expect(f.parent.rewatch).not.toHaveBeenCalled();
+  it('字幕和播放计时变化保留观察缓存，弹题与平台记录变化重新识别',()=>{
+    const element={element_id:'player',parent_id:null,tag:'video',text:'',classes:[],role:null,input_type:null,clickable:false,disabled:false,selected:false,attributes:{}};
+    const snapshot:CourseSurfaceSnapshot={capture_id:'before',url:'https://study.zhihuishu.com/course?courseId=77',title:'课程',native:false,visible_text:'00:01',elements:[element,{...element,element_id:'caption',parent_id:'player',tag:'div',classes:['vjs-text-track-display'],text:'字幕内容'}]};
+    const fingerprint=courseSurfaceFingerprint(snapshot);
+    expect(courseSurfaceFingerprint({...snapshot,capture_id:'after',visible_text:'00:02',intent:'task',elements:[element,{...snapshot.elements[1]!,element_id:'another-caption',text:'下一段字幕'}]})).toBe(fingerprint);
+    expect(courseSurfaceFingerprint({...snapshot,elements:[...snapshot.elements,{...element,element_id:'popup',tag:'button',text:'提交答案',clickable:true}]})).not.toBe(fingerprint);
+    expect(courseSurfaceFingerprint({...snapshot,elements:[...snapshot.elements,{...element,element_id:'record',tag:'span',text:'任务已完成'}]})).not.toBe(fingerprint);
   });
 });

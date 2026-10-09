@@ -9,7 +9,7 @@ function fixture(){
   const adapter:KnowledgeAdapter={catalog:vi.fn(async()=>catalog),prepare:vi.fn(async()=> 'practice' as const),returnToDirectory:vi.fn(async()=>{}),pausePlayback:vi.fn(async()=>{})};
   const make=vi.fn(async()=>{
     let state:SessionRuntimeSnapshot['state']='CREATED';
-    const child:PracticeChild={run:async(signal)=>{signal.throwIfAborted();budget.consume();state='COMPLETE';},resume:async(signal)=>{signal.throwIfAborted();budget.consume();state='COMPLETE';},pause:()=>{state='PAUSED';},switchStrategy:()=>{},
+    const child:PracticeChild={run:async(signal)=>{signal.throwIfAborted();budget.consume();state='COMPLETE';},resume:async(signal)=>{signal.throwIfAborted();budget.consume();state='COMPLETE';},pause:()=>{state='PAUSED';},
       snapshot:()=>({session_id:'child',state,strategy:'unattended',provider_profile_id:'p',model_id:'gemini-3.8-flash-high',observation_input_mode:'structured',model_calls:{used:budget.used,limit:budget.limit},progress:{total:1,answered:1,guessed:0,retried:0,skipped:0,failed:0},notice:null,summary:null})};
     return child;
   });

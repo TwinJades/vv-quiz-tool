@@ -67,6 +67,7 @@ export interface PlatformState {
   field_values: Record<string, string>;
   feedback: "correct" | "incorrect" | "partial" | null;
   feedback_text?: string;
+  question_graded?: boolean;
   visible_score?: string;
   /** Explicit whole-session passing result; single-question feedback is separate. */
   session_passed?: boolean | null;

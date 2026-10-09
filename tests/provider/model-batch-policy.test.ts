@@ -12,7 +12,7 @@ const profile: ProviderProfile = {
 const limits = (p: ProviderProfile, id = "small") => new VercelAiSolverProvider(providerProfileSchema.parse(p), id, undefined, new ModelCallBudget()).batchLimits();
 const question = (id: string): QuestionFrame => ({ schema_version: "1.0", session_id: "s", question_id: id, observation_id: "o", type: "single_choice", stem: { text: "Choose A", format: "plain_text", media: [] }, options: [{ id: "a", text: "A", media: [] }], blanks: [], constraints: { min_selections: 1, max_selections: 1 }, provenance: { text_source: "dom", untrusted_content: true } });
 
-describe("selected model batch policy", () => {
+describe("Provider batch policy", () => {
   it("retains conservative limits for existing profiles without model metadata", () => {
     expect(limits(profile)).toEqual({ max_questions: 5, max_estimated_tokens: 12000, max_images: 4 });
   });
@@ -20,11 +20,11 @@ describe("selected model batch policy", () => {
     const p = { ...profile, model_batch_limits: {}, model_catalog: { ...profile.model_catalog, input_token_limits: {} } };
     expect(limits(p, "constructor")).toEqual({ max_questions: 5, max_estimated_tokens: 12000, max_images: 4 });
   });
-  it("uses only the selected model override and actually splits its page inventory", () => {
-    const p = { ...profile, model_batch_limits: { small: { max_questions: 2, max_estimated_tokens: 6000, max_images: 1 } } };
+  it("uses shared Provider limits to split inventories for every model", () => {
+    const p = { ...profile, provider_batch_limits: { max_questions: 2, max_estimated_tokens: 6000, max_images: 1 } };
     const questions = Array.from({ length: 6 }, (_, i) => question(`q${i}`));
     expect(planBatches(questions, undefined, 1, limits(p, "small")).map(b => b.question_ids)).toEqual([["q0", "q1"], ["q2", "q3"], ["q4", "q5"]]);
-    expect(planBatches(questions, undefined, 1, limits(p, "large")).map(b => b.questions.length)).toEqual([5, 1]);
+    expect(planBatches(questions, undefined, 1, limits(p, "large")).map(b => b.questions.length)).toEqual([2, 2, 2]);
   });
   it("reserves context room from actual input metadata without enlarging a stricter override", () => {
     const p = { ...profile, model_catalog: { ...profile.model_catalog, input_token_limits: { small: 4096, large: 1000000 } } };

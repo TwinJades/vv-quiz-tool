@@ -1,11 +1,23 @@
-param([switch]$Apply)
+param([switch]$Apply, [string]$SelectionFile, [string]$RunDirectory)
 
 $ErrorActionPreference = 'Stop'
 $vvWorkspace = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $vvRuntime = (Resolve-Path -LiteralPath (Join-Path $vvWorkspace '.browser-regression-runtime')).Path.TrimEnd('\')
 $vvPrefix = $vvRuntime + '\'
-$vvRunPattern = '^(background|provider-mv3|site-audit|h5p-grading-probe|capture-probe|canvas-result-probe|canvas-surface-probe)-'
+$vvRunPattern = '^(background|provider-mv3|site-audit|h5p-grading-probe|capture-probe|canvas-result-probe|canvas-surface-probe|manual-ready)-'
 $vvChildren = @('profile', 'chrome', 'edge', 'extension')
+$vvRetiredRuns = @()
+$vvRetiredPaths = @()
+if ($SelectionFile) {
+    $vvSelection = Get-Content -LiteralPath $SelectionFile -Raw | ConvertFrom-Json
+    $vvRetiredRuns = @($vvSelection.retired_runs)
+    $vvRetiredPaths = @($vvSelection.retired_paths)
+    foreach ($vvName in $vvRetiredRuns) {
+        if ($vvName -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]+$' -or $vvName -eq 'chrome-cft') {
+            throw "Invalid retired run: $vvName"
+        }
+    }
+}
 
 function Assert-VVTarget([string]$Path) {
     $vvFull = [IO.Path]::GetFullPath($Path)
@@ -27,37 +39,76 @@ function Test-VVProcessPath($Processes, [string]$Path) {
     })
 }
 
-# Fail closed if the process inventory cannot be read. Never close a user app.
+# 无法读取进程时终止；清理工具不关闭任何应用。
 $vvProcesses = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('chrome.exe', 'msedge.exe', 'node.exe') })
 $vvSkipped = [Collections.Generic.List[object]]::new()
 $vvTargets = [Collections.Generic.List[object]]::new()
 $vvEvidence = [Collections.Generic.List[object]]::new()
 $vvBefore = [long](Get-ChildItem -LiteralPath $vvRuntime -File -Recurse -Force | Measure-Object Length -Sum).Sum
-$vvRuns = @(Get-ChildItem -LiteralPath $vvRuntime -Directory -Force | Where-Object Name -match $vvRunPattern)
+$vvRuns = @(Get-ChildItem -LiteralPath $vvRuntime -Directory -Force | Where-Object { $_.Name -match $vvRunPattern -or $_.Name -in $vvRetiredRuns })
+if ($RunDirectory) {
+    if ($SelectionFile) { throw 'RunDirectory cannot be combined with SelectionFile.' }
+    $vvSelectedRun = Assert-VVTarget $RunDirectory
+    if ([IO.Path]::GetDirectoryName($vvSelectedRun) -ne $vvRuntime -or [IO.Path]::GetFileName($vvSelectedRun) -notmatch $vvRunPattern) { throw 'Unknown owned test run.' }
+    $vvRuns = @($vvRuns | Where-Object { $_.FullName -eq $vvSelectedRun })
+}
 
 foreach ($vvRun in $vvRuns) {
     if (Test-VVProcessPath $vvProcesses $vvRun.FullName) {
         $vvSkipped.Add(@{ path = $vvRun.FullName; reason = 'in_use' }); continue
     }
-    if (Test-Path -LiteralPath (Join-Path $vvRun.FullName 'KEEP_RUNTIME.md')) {
+    if ((Test-Path -LiteralPath (Join-Path $vvRun.FullName 'KEEP_RUNTIME.md')) -and $vvRun.Name -notin $vvRetiredRuns) {
         $vvSkipped.Add(@{ path = $vvRun.FullName; reason = 'explicitly_retained' }); continue
     }
     foreach ($vvFile in Get-ChildItem -LiteralPath $vvRun.FullName -File -Force) {
         $vvEvidence.Add(@{ path = $vvFile.FullName; bytes = $vvFile.Length; sha256 = (Get-FileHash -LiteralPath $vvFile.FullName -Algorithm SHA256).Hash })
     }
-    foreach ($vvChild in Get-ChildItem -LiteralPath $vvRun.FullName -Directory -Force | Where-Object Name -in $vvChildren) {
+    foreach ($vvChild in Get-ChildItem -LiteralPath $vvRun.FullName -Directory -Force | Where-Object {
+        $_.Name -in $vvChildren -or ($vvRun.Name -in $vvRetiredRuns -and $_.Name -match '^(profile|extension)(-.+)?$|^acceptance-profile$|^solver-probe-build$')
+    }) {
         $vvFull = Assert-VVTarget $vvChild.FullName
         $vvContents = @(Get-ChildItem -LiteralPath $vvFull -Recurse -Force)
         if ($vvContents | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }) {
             $vvSkipped.Add(@{ path = $vvFull; reason = 'contains_reparse_point' }); continue
         }
-        $vvTargets.Add(@{ path = $vvFull; kind = 'directory'; bytes = [long](($vvContents | Where-Object { -not $_.PSIsContainer }) | Measure-Object Length -Sum).Sum })
+        $vvTargets.Add(@{ path = $vvFull; kind = 'directory'; process_path = $vvRun.FullName; bytes = [long](($vvContents | Where-Object { -not $_.PSIsContainer }) | Measure-Object Length -Sum).Sum })
     }
 }
 
-# Keep the single installed test browser; recycle only its redundant download.
+# 明确选择的退休构建独立检查，活动课程可以保留使用中的其他构建。
+foreach ($vvRelative in $vvRetiredPaths) {
+    $vvParts = $vvRelative.Replace('/', '\').Split('\')
+    if ($vvParts.Count -ne 2 -or $vvParts[0] -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]+$' -or
+        $vvParts[1] -notmatch '^extension(-[a-zA-Z0-9_.-]+)?$') { throw "Invalid retired build: $vvRelative" }
+    $vvPath = Join-Path $vvRuntime $vvRelative
+    if (-not (Test-Path -LiteralPath $vvPath)) { continue }
+    $vvFull = Assert-VVTarget $vvPath
+    if (Test-VVProcessPath $vvProcesses $vvFull) {
+        $vvSkipped.Add(@{ path = $vvFull; reason = 'in_use' }); continue
+    }
+    if ($vvTargets | Where-Object path -eq $vvFull) { continue }
+    $vvContents = @(Get-ChildItem -LiteralPath $vvFull -Recurse -Force)
+    if ($vvContents | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }) {
+        $vvSkipped.Add(@{ path = $vvFull; reason = 'contains_reparse_point' }); continue
+    }
+    $vvTargets.Add(@{ path = $vvFull; kind = 'directory'; process_path = $vvFull; bytes = [long](($vvContents | Where-Object { -not $_.PSIsContainer }) | Measure-Object Length -Sum).Sum })
+}
+
+# 核验退休场内全部保留证据，包括嵌套的迟到响应与错误隔离报告。
+$vvEvidence.Clear()
+$vvEvidenceRuns = @($vvTargets | Where-Object kind -eq 'directory' | ForEach-Object { [IO.Path]::GetDirectoryName($_.path) } | Sort-Object -Unique)
+foreach ($vvEvidenceRun in $vvEvidenceRuns) {
+    foreach ($vvFile in Get-ChildItem -LiteralPath $vvEvidenceRun -File -Recurse -Force) {
+        if ($vvTargets | Where-Object { $vvFile.FullName.StartsWith($_.path + '\', [StringComparison]::OrdinalIgnoreCase) }) { continue }
+        $vvRelativeFile = $vvFile.FullName.Substring($vvEvidenceRun.Length + 1)
+        if ($vvRelativeFile -match '^(profile|extension|chrome|edge)([^\\]*)\\|^global-speed-[^\\]+\\|^acceptance-profile\\') { continue }
+        $vvEvidence.Add(@{ path = $vvFile.FullName; bytes = $vvFile.Length; sha256 = (Get-FileHash -LiteralPath $vvFile.FullName -Algorithm SHA256).Hash })
+    }
+}
+
+# 保留共用浏览器程序，只回收重复下载的压缩包。
 $vvZip = Join-Path $vvRuntime 'chrome-win64.zip'
-if ((Test-Path -LiteralPath $vvZip) -and (Test-Path -LiteralPath (Join-Path $vvRuntime 'chrome-cft/chrome-win64/chrome.exe'))) {
+if (-not $RunDirectory -and (Test-Path -LiteralPath $vvZip) -and (Test-Path -LiteralPath (Join-Path $vvRuntime 'chrome-cft/chrome-win64/chrome.exe'))) {
     $vvFull = Assert-VVTarget $vvZip
     $vvTargets.Add(@{ path = $vvFull; kind = 'file'; bytes = (Get-Item -LiteralPath $vvFull).Length })
 }
@@ -80,9 +131,9 @@ try {
     $vvIndex = 0
     foreach ($vvTarget in $vvTargets) {
         $vvFull = Assert-VVTarget $vvTarget.path
-        # Recheck just before moving each item; stop if a browser appeared.
+        # 每项回收前重新检查进程，拒绝正在使用的资料。
         $vvCurrent = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('chrome.exe', 'msedge.exe', 'node.exe') })
-        $vvRunPath = if ($vvTarget.kind -eq 'directory') { [IO.Path]::GetDirectoryName($vvFull) } else { $vvFull }
+        $vvRunPath = if ($vvTarget.process_path) { $vvTarget.process_path } else { $vvFull }
         if (Test-VVProcessPath $vvCurrent $vvRunPath) {
             throw "Target became active; stopped cleanup: $vvRunPath"
         }

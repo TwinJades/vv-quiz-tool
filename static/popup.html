@@ -9,15 +9,19 @@
   <body class="popup-page">
     <main>
       <header class="popup-header">
-        <div><span class="eyebrow">VV 1.0</span><h1>自动答题</h1></div>
-        <button id="open-options" class="icon-button" type="button" aria-label="打开设置">设置</button>
-        <button id="open-tasks" class="icon-button" type="button">所有任务</button>
+        <div class="popup-identity"><span id="extension-version" class="eyebrow"></span><h1>VV 自动答题工具</h1></div>
+        <div class="header-actions">
+          <button id="open-tasks" class="header-task-button" type="button">所有任务</button>
+          <div id="popup-language-slot"></div>
+          <button id="open-options" class="icon-button settings-button" type="button" aria-label="打开设置" title="打开设置">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.7 4.3 10.4 2h3.2l.7 2.3 2.1 1.2 2.3-.5 1.6 2.8-1.6 1.8v2.4l1.6 1.8-1.6 2.8-2.3-.5-2.1 1.2-.7 2.3h-3.2l-.7-2.3-2.1-1.2-2.3.5L3.7 14l1.6-1.8V9.8L3.7 8l1.6-2.8 2.3.5Z"/><circle cx="12" cy="11" r="3"/></svg>
+          </button>
+        </div>
       </header>
       <section class="panel compact">
         <label>Provider<select id="provider"></select></label>
         <label>模型<select id="model"></select></label>
         <div class="split">
-          <label>策略<select id="strategy"><option value="supervised">监督自动</option><option value="unattended">无人值守</option></select></label>
           <label>调用上限<input id="call-limit" type="number" min="1" value="300"></label>
         </div>
         <div class="input-mode">
@@ -29,24 +33,20 @@
           <p id="input-mode-description" class="input-mode-description">开始后首次模型请求发送当前页面语义快照；识别结果经本地验证后进入答题。</p>
         </div>
         <button id="start" class="primary" type="button">启动当前测验</button>
-        <label class="check"><input id="native-search" type="checkbox" disabled>本场允许 Provider 原生网页搜索</label>
-        <p class="muted" id="native-search-description">仅明确支持的模型可开启；必要题目内容会发送给所选 Provider 的搜索功能。</p>
       </section>
       <section class="panel compact status-panel">
-        <details id="course-mode"><summary>学习通／知到课程模式（实验）</summary>
-          <p class="muted">先自行登录并进入课程，再读取目录和明确选择范围。当前为课程核心实验入口，两平台真实页面结构仍待适配；可先生成只读结构资料。</p>
-          <button id="preview-course" type="button">读取当前课程（只读）</button>
-          <button id="preview-practices" type="button">读取知到知识点练习范围（只读）</button>
-          <button id="inspect-course" type="button">生成只读结构资料</button>
-          <button id="export-course-inspection" type="button" disabled>导出当前资料 JSON</button>
-          <p id="course-inspection-status" class="muted">仅采集已打开的页面；不会点击、滚动、播放、作答或提交。资料可能包含可见姓名，分享前请检查。</p>
-          <textarea id="course-inspection" rows="5" readonly hidden aria-label="只读课程结构资料，可全选复制"></textarea>
+        <details id="course-mode"><summary>学习通／知到课程学习</summary>
+          <p class="muted">登录并打开课程，加载目录后选择范围，开始自动学习。</p>
+          <button id="preview-course" type="button">加载当前课程</button>
+          <button id="preview-practices" type="button">仅加载知到知识点练习</button>
+          <p class="muted">视频加速由外部 Global Speed 插件设置。安装并设置后，VV 保留实际速度。</p>
+          <p class="muted"><a href="https://chromewebstore.google.com/detail/global-speed-video-speed/jpbjcnkcffbooppibceonlgknpkniiff" target="_blank" rel="noopener noreferrer">Chrome 安装 Global Speed</a> · <a href="https://microsoftedge.microsoft.com/addons/detail/global-speed/mjhlabbcmjflkpjknnicihkfnmbdfced?hl=en-EN" target="_blank" rel="noopener noreferrer">Edge 安装 Global Speed</a></p>
           <p id="course-preview" class="muted"></p>
           <label>本次范围<select id="course-range" disabled><option value="">请先读取目录</option></select></label>
           <div id="course-tasks"></div>
-          <p class="muted">视频范围与知识点练习范围分别运行。练习模式正常进入两步去提升，只处理选定知识点的首次练习；已有记录单列，不自动重做。不含独立作业、讨论、见面课和期末考试；模型按3.8 Flash→3.7 Flash→3.1 Pro授权顺序，共享上方调用上限。</p>
-          <p class="muted">播放前通过正常控件静音并确认。仅使用课程允许的播放器倍速；播放结束后仍须核对平台学习记录。</p>
-          <button id="start-course" type="button" disabled>启动选定课程范围</button>
+          <p class="muted">处理选定范围内的视频、弹题与关联测验，保留已有有效记录。文档、独立作业、讨论和期末考试由用户处理。使用上方所选模型，每门课程独立计算调用次数。</p>
+          <p class="muted">运行时静音；视频结束后核对平台学习记录，再继续下一课时。</p>
+          <button id="start-course" type="button" disabled>开始学习</button>
         </details>
         <div class="status-heading"><span>会话状态</span><strong id="session-status">未启动</strong></div>
         <p id="session-detail" class="muted">打开一个逐题测验后启动。</p>
@@ -57,7 +57,6 @@
           <button id="stop" type="button" disabled>停止</button>
           <button id="clear" type="button" disabled>清除</button>
         </div>
-        <button id="apply-strategy" type="button" disabled>从下一动作应用当前策略</button>
       </section>
       <p class="privacy">页面、图片和模型输出均按不可信数据处理。遇到验证码、登录失效或监考提示会停止。</p>
     </main>

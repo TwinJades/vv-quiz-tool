@@ -36,7 +36,6 @@ describe('independent EasyCPA acceptance configuration', () => {
   it('fails closed for missing or ambiguous client keys and unsupported YAML', () => {
     for (const text of [sample.replace('access:', 'other:'), sample + 'access:\n    api-keys:\n        - "other-secret"\n',
       sample.replace('        - "local-fixture-secret"', '        - "one"\n        - "two"'),
-      sample.replace('        - "local-fixture-secret"', '        - &alias "local-fixture-secret"'),
       sample.replace('        - "local-fixture-secret"', '        - ""'),
       sample.replace('        - "local-fixture-secret"', '        - "bad\\nsecret"')]) {
       expect(() => parseEasyCpaAcceptanceConfig(text, models)).toThrow('Unsupported EasyCPA');
@@ -45,6 +44,9 @@ describe('independent EasyCPA acceptance configuration', () => {
   it('supports generated single-quoted client strings without treating YAML escapes as code', () => {
     const text = sample.replace('"local-fixture-secret"', "'local-fixture-secret''suffix'");
     expect(parseEasyCpaAcceptanceConfig(text, models).secret).toBe("local-fixture-secret'suffix");
+  });
+  it('accepts valid YAML indentation and plain client strings',()=>{
+    expect(parseEasyCpaAcceptanceConfig(sample.replace('"local-fixture-secret"','local-fixture-secret').replaceAll('    ','  '),models).secret).toBe('local-fixture-secret');
   });
   it('rejects another port, TLS, duplicate port and unapproved model ids with redacted errors', () => {
     for (const [text, ids] of [[sample.replace('8317', '18080'), models],
