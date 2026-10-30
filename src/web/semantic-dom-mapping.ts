@@ -112,6 +112,21 @@ function valid(question: MappedQuestion): boolean {
 }
 
 export class SemanticDomMapping {
+  captureCourseNodes(nodes:HTMLElement[]):SemanticElement[] {
+    this.#nodes.clear();
+    const unique=[...new Set(nodes)].filter(node=>!isExplicitlyHidden(node));
+    for(const node of unique)if(!this.#courseIds.has(node))this.#courseIds.set(node,`course_element_${++this.#courseCounter}`);
+    return unique.map(node=>{
+      const element_id=this.#courseIds.get(node)!,text=directText(node);
+      this.#nodes.set(element_id,{element:node,text});
+      let parent=node.parentElement;
+      while(parent&&!unique.includes(parent))parent=parent.parentElement;
+      return {element_id,parent_id:parent?this.#courseIds.get(parent)!:null,tag:node.tagName.toLowerCase(),text,
+        classes:[...node.classList],role:node.getAttribute('role'),input_type:node.getAttribute('type'),
+        clickable:node.matches('a,button,[onclick],[role=button]')||node.ownerDocument.defaultView?.getComputedStyle(node).cursor==='pointer',
+        disabled:disabled(node),selected:false};
+    });
+  }
   element(id:string):HTMLElement {
     const captured=this.#nodes.get(id),element=captured?.element;
     if(!element?.isConnected||isExplicitlyHidden(element)||directText(element)!==captured!.text)throw new Error('PAGE_CHANGED: semantic element is unavailable or changed.');

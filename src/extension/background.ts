@@ -16,9 +16,8 @@ import type { CourseInspectionBundle } from '../web/course-inspection';
 import {createKnowledgeRun,KnowledgeTabPlatform,previewKnowledge} from './knowledge-practice-platform';
 declare const __VV_BUILD_ID__: string;
 import type {KnowledgePracticeOrchestrator} from '../core/knowledge-practice';
-import {recordTestEvent} from './test-hooks';
 import {hasActiveDebuggerTransport} from './visual-transport';
-import {COURSE_RECORD_PREFIX,courseResumeUrl,savedCourseMatches,courseCatalogMatchesUrl} from './course-record';
+import {COURSE_RECORD_PREFIX,courseResumeUrl,savedCourseMatches,courseCatalogMatchesUrl,persistCourseRecord} from './course-record';
 import type {SavedCourseRecord} from './course-record';
 import type {CourseCatalog} from '../core/course';
 
@@ -39,24 +38,30 @@ const courseUrls=new Map<number,string>();
 interface PreparedCourse {id:string;tab_id:number;provider_profile_id:string;model_id:string;budget:ModelCallBudget;catalog:CourseCatalog;platform:CourseTabPlatform}
 const preparedCourses=new Map<number,PreparedCourse>();
 const preparationRuns=new Map<number,{controller:AbortController;platform:CourseTabPlatform;id:string}>();
+const preparationControllers=new Map<number,AbortController>();
 const startupControllers=new Map<number,AbortController>();
 const PREPARATION_PREFIX='vv-course-preparation:';
+const PREPARATION_PAUSE_PREFIX='vv-course-preparation-pause:';
 interface StoredPreparation {id:string;provider_profile_id:string;model_id:string;model_call_limit:number;used:number;catalog?:CourseCatalog;url:string;updated_at:number;loaded?:number;title?:string;phase?:'loading'|'ready'|'paused';notice?:string}
 async function storedPreparation(tabId:number):Promise<StoredPreparation|undefined>{
   const frame=await chrome.webNavigation.getFrame({tabId,frameId:0});if(!frame?.url)return undefined;
+  const pausedKey=PREPARATION_PAUSE_PREFIX+tabId,pausedStorage=await chrome.storage.session.get(pausedKey),paused=pausedStorage[pausedKey] as StoredPreparation|undefined;
+  if(paused?.url===courseResumeUrl(frame.url))return paused;
   const url=courseResumeUrl(frame.url),records=await chrome.storage.local.get(null);
   const matches=Object.entries(records).filter(([key,value])=>key.startsWith(PREPARATION_PREFIX)&&((value as StoredPreparation).url===url||Boolean((value as StoredPreparation).catalog&&courseCatalogMatchesUrl(frame.url,(value as StoredPreparation).catalog!)))).map(([,value])=>value as StoredPreparation).sort((a,b)=>b.updated_at-a.updated_at);
   return matches[0];
 }
 function preparationView(prepared:StoredPreparation){return {preparation_id:prepared.id,catalog:prepared.catalog,provider_profile_id:prepared.provider_profile_id,model_id:prepared.model_id,model_calls:{used:prepared.used,limit:prepared.model_call_limit},loaded:prepared.loaded??prepared.catalog?.tasks.length??0,title:prepared.title??prepared.catalog?.title??'',phase:prepared.phase??(prepared.catalog?'ready':'paused'),notice:prepared.notice??null};}
 async function restorePreparation(tabId:number):Promise<PreparedCourse|undefined>{
-  if(preparedCourses.has(tabId))return preparedCourses.get(tabId);
-  const saved=await storedPreparation(tabId);if(!saved?.catalog)return undefined;
+  const saved=await storedPreparation(tabId);if(!saved?.catalog||saved.phase==='paused'||saved.phase==='loading')return undefined;
+  const cached=preparedCourses.get(tabId);
+  if(cached?.id===saved.id)return cached;
+  preparedCourses.delete(tabId);
   if(!Number.isInteger(saved.used)||saved.used<0||saved.used>saved.model_call_limit)throw new Error('课程准备预算无效。');
   const profile=await providerManager.get(saved.provider_profile_id);if(!profile||!profile.model_catalog.models.includes(saved.model_id))throw new Error('课程准备所用Provider或模型已被移除。');
   const budget=new ModelCallBudget(saved.model_call_limit);if(saved.used)budget.reserve(saved.used).settle(saved.used);
   budget.setPersistence(async used=>{saved.used=used;saved.updated_at=Date.now();await chrome.storage.local.set({[PREPARATION_PREFIX+saved.id]:saved});});
-  const solver=new VercelAiSolverProvider(profile,saved.model_id,await providerManager.getApiKey(profile),budget,undefined,25000,true);
+  const solver=new VercelAiSolverProvider(profile,saved.model_id,await providerManager.getApiKey(profile),budget,undefined,120000,true);
   const platform=new CourseTabPlatform(tabId,saved.id,saved.catalog.course_id,saved.catalog,(snapshot,signal)=>solver.recognizeCourse(snapshot,signal));
   const value={id:saved.id,tab_id:tabId,provider_profile_id:saved.provider_profile_id,model_id:saved.model_id,budget,catalog:saved.catalog,platform};preparedCourses.set(tabId,value);return value;
 }
@@ -110,15 +115,7 @@ async function saveSessionSnapshot(tabId: number, snapshot: SessionRuntimeSnapsh
   if(managed?.snapshot.session_id===captured.session_id)captured.model_calls.used=Math.max(captured.model_calls.used,managed.budget.used+managed.budget.reserved);
   const write=previous.then(async()=>{
     await chrome.storage.session.set({ [sessionSnapshotKey(tabId)]: captured });
-    if(captured.course?.checkpoint){
-      const stored=await chrome.storage.session.get('vv-start-request:'+tabId),request=stored['vv-start-request:'+tabId] as StartSessionRequest|undefined;
-      if(!request)throw new Error('课程保存缺少原始任务配置。');
-      const old=await chrome.storage.local.get(COURSE_RECORD_PREFIX+captured.session_id),record=old[COURSE_RECORD_PREFIX+captured.session_id] as SavedCourseRecord|undefined;
-      const value=courseUrls.get(tabId)??record?.url??(await chrome.webNavigation.getFrame({tabId,frameId:0}))?.url;
-      const url=value?courseResumeUrl(value):undefined;
-      if(!url)throw new Error('课程保存缺少可恢复页面地址。');
-      await chrome.storage.local.set({[COURSE_RECORD_PREFIX+captured.session_id]:{snapshot:captured,request,url,updated_at:Date.now()} satisfies SavedCourseRecord});
-    }
+    if(captured.course?.checkpoint)await persistCourseRecord(tabId,captured,courseUrls.get(tabId));
   });
   snapshotWrites.set(tabId,write);
   await write;
@@ -250,7 +247,6 @@ async function notifyAttention(tabId: number, session: ManagedSession): Promise<
     iconUrl: NOTIFICATION_ICON,
     ...notice,
   });
-  recordTestEvent('notification',{id,type:'basic',iconUrl:NOTIFICATION_ICON,...notice});
 }
 
 async function startSession(request: StartSessionRequest,restore?:SessionRuntimeSnapshot,signal:AbortSignal=new AbortController().signal): Promise<SessionRuntimeSnapshot> {
@@ -316,7 +312,7 @@ async function startSession(request: StartSessionRequest,restore?:SessionRuntime
     const frame=await chrome.webNavigation.getFrame({tabId:request.tab_id,frameId:0});if(!frame?.url)throw new Error('课程页面已关闭。');courseUrls.set(request.tab_id,frame.url);
     const initial:SessionRuntimeSnapshot=restore??{session_id:sessionId,state:'WAIT_READY',strategy:request.strategy,observation_input_mode:'structured',provider_profile_id:profile.provider_profile_id,model_id:request.model_id,
       model_calls:{used:budget.used,limit:budget.limit},progress:{total:request.course.scope.length,answered:0,guessed:0,retried:0,skipped:0,failed:0},notice:'正在核对课程页面。',summary:null,
-      course:{phase:'OBSERVE_COURSE',course_id:catalog.course_id,title:catalog.title,scope:request.course.scope,current_task_id:null,estimate_seconds:null,estimate_frozen:true,video:{ended:false,progress_recorded:false},results:[],tasks:catalog.tasks,excluded:[],checkpoint:{catalog,completed:[],children:[],pending_quiz:null}}};
+      course:{phase:'OBSERVE_COURSE',course_id:catalog.course_id,title:catalog.title,scope:request.course.scope,current_task_id:null,estimate_seconds:null,estimate_frozen:true,video:{ended:false,progress_recorded:false},results:[],tasks:catalog.tasks,excluded:[],checkpoint:{format_version:2,catalog,completed:[],children:[],pending_quiz:null}}};
     startupFailures.set(request.tab_id,initial);await saveSessionSnapshot(request.tab_id,initial);
     if(catalog.course_id!==request.course.course_id||catalog.platform!==request.course.platform||catalog.revision!==request.course.revision)throw new Error('课程预览已改变，请重新读取并选择范围。');
     let managed: ManagedSession;
@@ -487,43 +483,72 @@ async function handleRequest(
   if (request.type === 'VV_GET_BUILD') return { build_id: __VV_BUILD_ID__, strategy: 'unattended' };
   if(request.type==='VV_GET_COURSE_PREPARATION'){
     const saved=await storedPreparation(request.tab_id);if(!saved)return null;
+    if(preparationControllers.has(request.tab_id)){const loading={...saved,phase:'loading' as const};delete loading.catalog;delete loading.notice;return preparationView(loading);}
     if(saved.phase==='loading'&&![...preparationRuns.values()].some(run=>run.id===saved.id))return preparationView({...saved,phase:'paused',notice:'课程加载尚未完成。请点击加载当前课程接续已有预算。'});
     return preparationView(saved);
   }
   if(request.type==='VV_CANCEL_COURSE_PREPARATION'){
-    const preparing=preparationRuns.get(request.tab_id);if(preparing){preparing.controller.abort(new Error('用户取消课程加载。'));await preparing.platform.disableInteraction();}
-    return {cancelled:Boolean(preparing)};
+    const controller=preparationControllers.get(request.tab_id);
+    controller?.abort(new Error('用户取消课程加载。'));
+    preparedCourses.delete(request.tab_id);
+    const preparing=preparationRuns.get(request.tab_id);if(preparing)await preparing.platform.disableInteraction();
+    return {cancelled:Boolean(controller)};
   }
   if(request.type==='VV_CLEAR_SAVED_COURSE'){
     if([...sessions.values()].some(session=>session.snapshot.session_id===request.session_id))throw new Error('请先停止并清除正在使用的课程任务。');
     await chrome.storage.local.remove(COURSE_RECORD_PREFIX+request.session_id);return {cleared:true};
   }
   if(request.type==='VV_PREPARE_COURSE'){
+    if(startingTabs.has(request.tab_id))throw new Error('当前标签正在加载或启动任务，请等待完成。');
+    startingTabs.add(request.tab_id);
+    const controller=new AbortController();preparationControllers.set(request.tab_id,controller);
+    preparedCourses.delete(request.tab_id);
+    let previousPreparation:StoredPreparation|undefined,preparationSaved=false;
+    try{
+    previousPreparation=await storedPreparation(request.tab_id);
     const active=await visibleSessionSnapshot(request.tab_id);
-    if(active&&!['COMPLETE','CANCELLED','FAILED'].includes(active.state)||startingTabs.has(request.tab_id))throw new Error('当前标签已有任务，请继续或清除该任务后加载课程。');
+    controller.signal.throwIfAborted();
+    if(active&&!['COMPLETE','CANCELLED','FAILED'].includes(active.state))throw new Error('当前标签已有任务，请继续或清除该任务后加载课程。');
     const profile=await providerManager.get(request.provider_profile_id);
     if(!profile||!profile.model_catalog.models.includes(request.model_id))throw new Error('请先选择已配置的Provider和模型。');
-    if(!profile.capabilities.structured_output)throw new Error('课程识别需要支持结构化输出的模型。');
     const frame=await chrome.webNavigation.getFrame({tabId:request.tab_id,frameId:0});if(!frame?.url)throw new Error('当前课程页面已关闭。');
-    const old=await storedPreparation(request.tab_id),compatible=old?.provider_profile_id===request.provider_profile_id&&old.model_id===request.model_id&&old.model_call_limit===request.model_call_limit;
+    const old=previousPreparation,compatible=old?.provider_profile_id===request.provider_profile_id&&old.model_id===request.model_id&&old.model_call_limit===request.model_call_limit;
     if(old&&[...preparationRuns.values()].some(run=>run.id===old.id))throw new Error('这门课程正在加载，请等待加载完成。');
-    if(compatible&&old.catalog){preparedCourses.delete(request.tab_id);return preparationView(old);}
-    const id=compatible?old!.id:crypto.randomUUID(),budget=new ModelCallBudget(request.model_call_limit);
-    if(compatible&&old!.used)budget.reserve(old!.used).settle(old!.used);
+    const previousRecord=old?(await chrome.storage.local.get(COURSE_RECORD_PREFIX+old.id))[COURSE_RECORD_PREFIX+old.id] as SavedCourseRecord|undefined:undefined;
+    const id=compatible&&!previousRecord?old!.id:crypto.randomUUID(),budget=new ModelCallBudget(request.model_call_limit);
+    const used=compatible?Math.max(old!.used,previousRecord?.snapshot.model_calls.used??0):0;
+    if(used)budget.reserve(used).settle(used);
     const key=PREPARATION_PREFIX+id,saved:StoredPreparation={id,provider_profile_id:request.provider_profile_id,model_id:request.model_id,model_call_limit:request.model_call_limit,used:budget.used,url:courseResumeUrl(frame.url),updated_at:Date.now(),phase:'loading',loaded:0};
     budget.setPersistence(async used=>{saved.used=used;saved.updated_at=Date.now();await chrome.storage.local.set({[key]:saved});});
-    const reader=new VercelAiSolverProvider(profile,request.model_id,await providerManager.getApiKey(profile),budget,undefined,25000,true);
+    const reader=new VercelAiSolverProvider(profile,request.model_id,await providerManager.getApiKey(profile),budget,undefined,120000,true);
     const platform=new CourseTabPlatform(request.tab_id,id,'loading',undefined,(snapshot,signal)=>reader.recognizeCourse(snapshot,signal));
-    startingTabs.add(request.tab_id);
-    const controller=new AbortController();preparationRuns.set(request.tab_id,{controller,platform,id});
+    controller.signal.throwIfAborted();
+    preparationRuns.set(request.tab_id,{controller,platform,id});
     try{
       await chrome.storage.local.set({[key]:saved});
+      preparationSaved=true;
+      await chrome.storage.session.remove(PREPARATION_PAUSE_PREFIX+request.tab_id);
+      controller.signal.throwIfAborted();
       const catalog=await platform.prepare(controller.signal,async progress=>{saved.loaded=progress.loaded;saved.title=progress.title;saved.updated_at=Date.now();await chrome.storage.local.set({[key]:saved});});controller.signal.throwIfAborted();
+      await platform.disableInteraction();controller.signal.throwIfAborted();
+      const current=await chrome.webNavigation.getFrame({tabId:request.tab_id,frameId:0});controller.signal.throwIfAborted();
+      if(!current?.url)throw new Error('课程加载结束时页面已关闭。');
+      saved.catalog=catalog;saved.phase='ready';saved.used=budget.used;saved.updated_at=Date.now();saved.url=courseResumeUrl(current.url);
+      await chrome.storage.local.set({[key]:saved});controller.signal.throwIfAborted();
       preparedCourses.set(request.tab_id,{id,tab_id:request.tab_id,provider_profile_id:request.provider_profile_id,model_id:request.model_id,budget,catalog,platform});
-      saved.catalog=catalog;saved.phase='ready';saved.used=budget.used;saved.updated_at=Date.now();const current=await chrome.webNavigation.getFrame({tabId:request.tab_id,frameId:0});if(current?.url)saved.url=courseResumeUrl(current.url);await chrome.storage.local.set({[key]:saved});
       return preparationView(saved);
-    }catch(error){saved.phase='paused';saved.notice=publicError(error);await chrome.storage.local.set({[key]:saved});throw error;}
-    finally{preparationRuns.delete(request.tab_id);startingTabs.delete(request.tab_id);await platform.disableInteraction();}
+    }catch(error){preparedCourses.delete(request.tab_id);delete saved.catalog;saved.phase='paused';saved.notice=publicError(error);await chrome.storage.local.set({[key]:saved});await platform.disableInteraction();throw error;}
+    finally{if(preparationRuns.get(request.tab_id)?.controller===controller)preparationRuns.delete(request.tab_id);}
+    }catch(error){
+      if(controller.signal.aborted&&!preparationSaved&&previousPreparation){
+        const paused:StoredPreparation={...previousPreparation,id:crypto.randomUUID(),phase:'paused',notice:publicError(error),updated_at:Date.now()};
+        delete paused.catalog;
+        await chrome.storage.session.set({[PREPARATION_PAUSE_PREFIX+request.tab_id]:paused});
+      }
+      throw error;
+    }finally{
+      if(preparationControllers.get(request.tab_id)===controller){preparationControllers.delete(request.tab_id);startingTabs.delete(request.tab_id);}
+    }
   }
   if(request.type==='VV_OPEN_SAVED_COURSE'){
     const key=COURSE_RECORD_PREFIX+request.session_id,stored=await chrome.storage.local.get(key),record=stored[key] as SavedCourseRecord|undefined;
@@ -535,10 +560,6 @@ async function handleRequest(
     return tab;
   }
   if (request.type === "VV_GET_TASKS") return taskPanelSnapshot();
-  if (request.type === 'VV_PREVIEW_COURSE') {
-    const platform = new CourseTabPlatform(request.tab_id,crypto.randomUUID(),'preview');
-    return platform.preview(new AbortController().signal);
-  }
   if(request.type==='VV_INSPECT_COURSE'){
     await requireCurrentWebsite(request.tab_id);
     const available=await chrome.webNavigation.getAllFrames({tabId:request.tab_id});
@@ -597,7 +618,22 @@ async function handleRequest(
     const snapshot=startupFailures.get(request.tab_id);if(snapshot){snapshot.state=request.type==='VV_STOP_SESSION'?'CANCELLED':'PAUSED';snapshot.notice='课程启动已取消，断点保留。';await saveSessionSnapshot(request.tab_id,snapshot);return snapshot;}
     return null;
   }
+  if ((request.type === 'VV_STOP_SESSION' || request.type === 'VV_PAUSE_SESSION') && !session) {
+    const snapshot = await visibleSessionSnapshot(request.tab_id);
+    if (!snapshot) return null;
+    queue.cancelQueued(request.tab_id);
+    await removePendingStart(request.tab_id);
+    snapshot.state = request.type === 'VV_STOP_SESSION' ? 'CANCELLED' : 'PAUSED';
+    snapshot.notice = request.type === 'VV_STOP_SESSION' ? '用户停止课程。' : '用户暂停课程。';
+    if (startupFailures.has(request.tab_id)) startupFailures.set(request.tab_id, snapshot);
+    await saveSessionSnapshot(request.tab_id, snapshot);
+    await updateBadge(request.tab_id, snapshot);
+    return snapshot;
+  }
   if (request.type === "VV_CLEAR_SESSION" && !session) {
+    startupControllers.get(request.tab_id)?.abort(new Error('用户清除任务。'));
+    queue.cancelQueued(request.tab_id);
+    await loadSessionSnapshot(request.tab_id);
     startupFailures.delete(request.tab_id);
     await removePendingStart(request.tab_id);
     await removeSessionSnapshot(request.tab_id);
@@ -615,7 +651,7 @@ async function handleRequest(
       try {return await startSession({...requestToResume,model_id:recovered.model_id},recovered,controller.signal);}
       catch(error){
         const snapshot=startupFailures.get(request.tab_id)??recovered;
-        if(!['PAUSED','CANCELLED'].includes(snapshot.state)){snapshot.state='PAUSED';snapshot.notice=publicError(error);await saveSessionSnapshot(request.tab_id,snapshot);}
+        if(snapshot.state!=='CANCELLED'){snapshot.state='PAUSED';snapshot.notice=publicError(error);await saveSessionSnapshot(request.tab_id,snapshot);}
         throw error;
       }
       finally {startingTabs.delete(request.tab_id);startupControllers.delete(request.tab_id);}
@@ -654,7 +690,10 @@ async function handleRequest(
     }
     queue.cancelQueued(request.tab_id);
     session.orchestrator.stop();
+    await session.platform.disableInteraction();
     sessions.delete(request.tab_id);
+    startupFailures.delete(request.tab_id);
+    await removePendingStart(request.tab_id);
     await removeSessionSnapshot(request.tab_id);
     await chrome.action.setBadgeText({ tabId: request.tab_id, text: "" });
     return null;
@@ -694,6 +733,7 @@ async function pauseWithoutWebsitePermission(tabId: number, url: string): Promis
 // tabs.onUpdated omits URL for ungranted hosts without the broad tabs permission.
 // The already-required webNavigation permission supplies the actual main URL.
 function checkMainNavigation(details: { tabId: number; frameId: number; url: string }): void {
+  if(details.frameId===0)preparedCourses.delete(details.tabId);
   if(details.frameId===0&&sessions.get(details.tabId)?.snapshot.course)courseUrls.set(details.tabId,details.url);
   if (details.frameId !== 0 || !sessions.has(details.tabId)) return;
   latestMainNavigation.set(details.tabId, details.url);
@@ -713,6 +753,7 @@ chrome.permissions.onRemoved.addListener(() => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   startupControllers.get(tabId)?.abort(new Error('课程标签已关闭。'));
+  preparationControllers.get(tabId)?.abort(new Error('课程标签已关闭。'));
   preparationRuns.get(tabId)?.controller.abort(new Error('课程标签已关闭。'));preparedCourses.delete(tabId);
   latestMainNavigation.delete(tabId);
   queue.cancelQueued(tabId);

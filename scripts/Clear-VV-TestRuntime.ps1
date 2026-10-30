@@ -1,4 +1,4 @@
-param([switch]$Apply, [string]$SelectionFile, [string]$RunDirectory)
+﻿param([switch]$Apply, [string]$SelectionFile, [string]$RunDirectory)
 
 $ErrorActionPreference = 'Stop'
 $vvWorkspace = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -79,7 +79,7 @@ foreach ($vvRun in $vvRuns) {
 foreach ($vvRelative in $vvRetiredPaths) {
     $vvParts = $vvRelative.Replace('/', '\').Split('\')
     if ($vvParts.Count -ne 2 -or $vvParts[0] -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]+$' -or
-        $vvParts[1] -notmatch '^extension(-[a-zA-Z0-9_.-]+)?$') { throw "Invalid retired build: $vvRelative" }
+        $vvParts[1] -notmatch '^(?:extension(-[a-zA-Z0-9_.-]+)?|previous)$') { throw "Invalid retired build: $vvRelative" }
     $vvPath = Join-Path $vvRuntime $vvRelative
     if (-not (Test-Path -LiteralPath $vvPath)) { continue }
     $vvFull = Assert-VVTarget $vvPath
@@ -113,7 +113,7 @@ if (-not $RunDirectory -and (Test-Path -LiteralPath $vvZip) -and (Test-Path -Lit
     $vvTargets.Add(@{ path = $vvFull; kind = 'file'; bytes = (Get-Item -LiteralPath $vvFull).Length })
 }
 
-$vvPlannedBytes = [long]($vvTargets | Measure-Object bytes -Sum).Sum
+$vvPlannedBytes = [long]($vvTargets | ForEach-Object { $_.bytes } | Measure-Object -Sum).Sum
 $vvSummary = @{ apply = [bool]$Apply; before_bytes = $vvBefore; target_count = $vvTargets.Count; planned_bytes = $vvPlannedBytes; skipped = @($vvSkipped.ToArray()); retained_evidence_files = $vvEvidence.Count }
 Write-Output ($vvSummary | ConvertTo-Json -Depth 4 -Compress)
 if (-not $Apply) { return }
@@ -161,5 +161,5 @@ try {
     $vvRecord.after_bytes = [long](Get-ChildItem -LiteralPath $vvRuntime -File -Recurse -Force | Measure-Object Length -Sum).Sum
     $vvRecord.finished_at = [DateTime]::UtcNow.ToString('o')
     Save-VVRecord
-    Write-Output (@{ report = $vvRecordPath; recycled_count = $vvRecord.recycled.Count; recycled_bytes = [long]($vvRecord.recycled | Measure-Object bytes -Sum).Sum; before_gib = [math]::Round($vvBefore/1GB,3); after_gib = [math]::Round($vvRecord.after_bytes/1GB,3); evidence_verified = $vvRecord.verified; errors = $vvRecord.errors } | ConvertTo-Json -Depth 4 -Compress)
+    Write-Output (@{ report = $vvRecordPath; recycled_count = $vvRecord.recycled.Count; recycled_bytes = [long]($vvRecord.recycled | ForEach-Object { $_.bytes } | Measure-Object -Sum).Sum; before_gib = [math]::Round($vvBefore/1GB,3); after_gib = [math]::Round($vvRecord.after_bytes/1GB,3); evidence_verified = $vvRecord.verified; errors = $vvRecord.errors } | ConvertTo-Json -Depth 4 -Compress)
 }

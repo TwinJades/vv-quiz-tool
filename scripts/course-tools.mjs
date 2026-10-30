@@ -3,10 +3,12 @@ import {readFile,writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {CdpClient,cdpJson} from './cdp-client.mjs';
 import {ownedBrowserConnection,ownedExtensionIds} from './owned-browser.mjs';
+import {verifyRelease} from './verify-release.mjs';
 
 const root=resolve(import.meta.dirname,'..');
 const command=process.argv[2];
 if(!['inspect','status','verify'].includes(command))throw new Error('需要指定inspect、status或verify，操作均只读。');
+if(command==='verify')await verifyRelease();
 const option=process.argv.find(argument=>argument.startsWith('--connection='));
 const connectionPath=resolve(root,option?.slice('--connection='.length)??'.browser-regression-runtime/course-login-20261004-040551/connection-login-ready.json');
 const connection=await ownedBrowserConnection(connectionPath);
@@ -51,9 +53,9 @@ if(command==='verify'){
     if(actual.build.build_id!==buildInfo.build_id||buildInfo.test_build!==false)throw new Error('浏览器加载的扩展与正式dist构建不一致。');
     for(const target of pages){
       const tab=actual.tabs.filter(tab=>tab.url===target.url);if(tab.length!==1)throw new Error('课程标签身份不唯一。');
-      const result=await extension.evaluate(`chrome.runtime.sendMessage({type:'VV_PREVIEW_COURSE',tab_id:${tab[0].id}})`);
+      const result=await extension.evaluate(`chrome.runtime.sendMessage({type:'VV_GET_COURSE_PREPARATION',tab_id:${tab[0].id}})`);
       if(!result.ok)throw new Error(result.error);
-      const catalog=result.result;
+      const catalog=result.result?.catalog;if(!catalog)throw new Error('请先在正式扩展中加载课程，再核对本次准备会话。');
       if(!catalog.complete||catalog.diagnostics.length||!catalog.tasks.length||catalog.tasks.some(task=>task.kind!=='lesson')||new Set(catalog.tasks.map(task=>task.id)).size!==catalog.tasks.length)throw new Error('正式课程入口没有返回完整的本次课时范围。');
       production.push({tab_id:tab[0].id,catalog});
     }

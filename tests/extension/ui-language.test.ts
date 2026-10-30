@@ -1,8 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { describeNotice, t } from '../../src/extension/ui-language';
+import { describeNotice, runtimeStateLabel, t } from '../../src/extension/ui-language';
 import { SessionAttentionNotifications } from '../../src/extension/attention-notifications';
 
 describe('interface languages', () => {
+  it('课程运行显示实际播放阶段，暂停和排队仍显示控制状态',()=>{
+    expect(runtimeStateLabel({state:'WAIT_READY',course:{phase:'PLAYING'}})).toBe('正在播放');
+    expect(runtimeStateLabel({state:'WAIT_READY',course:{phase:'BUFFERING'}})).toBe('正在缓冲');
+    expect(runtimeStateLabel({state:'PAUSED',course:{phase:'PLAYING'}})).toBe('已暂停');
+    expect(runtimeStateLabel({state:'QUEUED',course:{phase:'READY'}})).toBe('排队中');
+    expect(runtimeStateLabel({state:'WAIT_READY'})).toBe('等待页面就绪');
+  });
   it('explains budget preflight and stopping in both languages', () => {
     expect(describeNotice('Model call limit of 1 has been reached.', 'zh-CN').text).toBe('本场模型调用额度（1 次）不足以启动下一次请求，运行已暂停。');
     expect(describeNotice('Model call limit of 3 has been reached.', 'en').text).toBe('The session model call budget (3 calls) cannot cover the next request. Execution is paused.');

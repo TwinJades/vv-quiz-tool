@@ -12,25 +12,16 @@ import {
   type QuestionFrame,
   type ReadinessResult,
 } from "../core";
-import { dispatchValueEvents, elementText, fnv1a, isExplicitlyHidden, labelText, normalizedText, requireClickable, isElementType } from "./dom-utils";
-import {recordTestEvent} from '../extension/test-hooks';
+import { elementText, fnv1a, isExplicitlyHidden, labelText, normalizedText, requireClickable, isElementType } from "./dom-utils";
+import {collectContexts,queryAllDeep} from './dom-contexts';
+import {setDomSelected,setDomValue} from './dom-actions';
+import type {DomTarget,TargetIdentity} from './dom-actions';
+import {readQuestionFeedback} from './dom-result';
 import { SeparationTrial, cleanedVisibleText } from "./separation-trial";
 import type { InitialSemanticSnapshot, InitialSemanticReading } from "./initial-snapshot";
 import { SemanticDomMapping, semanticRoots, semanticQuestion, semanticOptionType, semanticOptionLabel, semanticSelected } from './semantic-dom-mapping';
 import type { LocalStructure, SeparationRoles, SeparationSnapshot } from "./separation-trial";
 import { ZHIDAO_CHOICE_SELECTOR, ZHIDAO_NEXT_SELECTOR, isZhidaoChoice, isZhidaoNext, readZhidaoPractice, resolveZhidaoPracticeSubmit, zhidaoRadioRoot, zhidaoPracticeRoot, zhidaoSelected, zhidaoStem } from './zhidao-practice';
-
-interface TargetIdentity {
-  role: "option" | "blank" | "submit" | "session_submit" | "next" | "retry" | "candidate";
-  question_fingerprint: string;
-  input_name: string;
-  input_value: string;
-  text_digest: string;
-}
-
-type DomTarget =
-  | { kind: "element"; element: HTMLElement; identity: TargetIdentity }
-  | { kind: "select_option"; element: HTMLSelectElement; value: string; identity: TargetIdentity };
 
 interface TargetResolution {
   target?: DomTarget;
@@ -44,7 +35,6 @@ interface MediaSource {
 }
 
 const QUESTION_ROOT_SELECTORS = [
-  "[data-vv-question]",
   "[data-question]",
   "[data-question-id]",
   ".quiz-question",
@@ -163,38 +153,6 @@ function h5pChoiceIdentity(document: Document, control: HTMLElement, index: numb
   return JSON.stringify({ text, images });
 }
 
-function collectContexts(document: Document): ParentNode[] {
-  const contexts: ParentNode[] = [document];
-  const queue: ParentNode[] = [document];
-  let visitedElements = 0;
-  while (queue.length > 0 && visitedElements < 10_000 && contexts.length < 64) {
-    const context = queue.shift()!;
-    for (const element of Array.from(context.querySelectorAll<HTMLElement>("*"))) {
-      visitedElements += 1;
-      if (element.shadowRoot) {
-        contexts.push(element.shadowRoot);
-        queue.push(element.shadowRoot);
-      }
-      if (isElementType(element,'iframe')) {
-        try {
-          if (element.contentDocument) {
-            contexts.push(element.contentDocument);
-            queue.push(element.contentDocument);
-          }
-        } catch {
-          // Cross-origin frames are handled through permission pause/reinjection.
-        }
-      }
-      if (visitedElements >= 10_000) break;
-    }
-  }
-  return contexts;
-}
-
-function queryAllDeep<T extends Element>(document: Document, selector: string): T[] {
-  return collectContexts(document).flatMap((context) => Array.from(context.querySelectorAll<T>(selector)));
-}
-
 function candidateRoots(document: Document): HTMLElement[] {
   const mapped = semanticRoots(document);
   if (mapped.length) return mapped;
@@ -275,7 +233,7 @@ function questionRootScore(root: HTMLElement): number {
   const textControls = root.querySelectorAll(
     "input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']",
   ).length;
-  const questionMarker = root.matches("[data-vv-question], [data-question], [data-question-id], .quiz-question, .question, .question-card, fieldset") ? 30 : 0;
+  const questionMarker = root.matches("[data-question], [data-question-id], .quiz-question, .question, .question-card, fieldset") ? 30 : 0;
   const submitControl = root.querySelector("button[type='submit'], input[type='submit']") ? 10 : 0;
   const nearbyText = [root.previousElementSibling, root.previousElementSibling?.previousElementSibling, root.parentElement]
     .map((element) => elementText(element ?? null))
@@ -775,9 +733,9 @@ export class DomWebAdapter implements PlatformAdapter {
       try {
         requireClickable(target.element);
         if (action.kind === "set_selected") {
-          this.#setSelected(target, action.value);
+          setDomSelected(target, action.value,supportedInput,selectedChoice);
         } else if (action.kind === "set_value") {
-          this.#setValue(target, action.value);
+          setDomValue(target, action.value);
         } else {
           if (target.kind !== "element") throw new Error("Control target is invalid.");
           target.element.click();
@@ -791,7 +749,6 @@ export class DomWebAdapter implements PlatformAdapter {
         });
       }
     }
-    recordTestEvent('dom-execute',{kind:'execute',actions:plan.actions.map(action=>({kind:action.kind,target:action.target_id})),fingerprint:locatorMap.question_fingerprint,result:results});
     return results;
   }
 
@@ -853,9 +810,6 @@ export class DomWebAdapter implements PlatformAdapter {
       .filter(element => !this.courseScope || this.courseScope.contains(element))
       .map(elementText)
       .join(" ");
-    const strongPageFeedback = pageText.match(
-      /(?:your answer is (?:correct|incorrect)|回答(?:正确|错误)|答(?:对|错)了?)/i,
-    )?.[0] ?? "";
     // H5P replaces Check after grading and disables the answer controls. The
     // detached Check node cannot supply its old parent; Next still binds this
     // visible question, rather than an unrelated editable form on the page.
@@ -863,29 +817,10 @@ export class DomWebAdapter implements PlatformAdapter {
       .map(id=>this.#targets.get(id)?.element.closest<HTMLElement>('.h5p-question'))
       .find(root=>root?.isConnected && !isExplicitlyHidden(root));
     const feedbackRoot = boundH5pRoot ?? this.#activeRoot();
-    const localGrading = feedbackRoot && !isExplicitlyHidden(feedbackRoot)
-      ? Array.from(feedbackRoot.querySelectorAll<HTMLElement>('.h5p-question-feedback.h5p-question-visible, .h5p-question-scorebar.h5p-question-visible'))
-          .filter(element=>!isExplicitlyHidden(element))
-          .map(element=>elementText(element.querySelector('.h5p-joubelui-score-bar-progress') ?? element)).join(' ')
-      : '';
     // H5P announces the new grade immediately, while its animated scorebar can
     // still display the previous attempt. Only use the current question's live
     // grade while grading is visible; unrelated page announcements are excluded.
-    const liveGrading = localGrading && feedbackRoot
-      ? Array.from(feedbackRoot.querySelectorAll<HTMLElement>('.h5p-hidden-read[aria-live]'))
-          .filter(element=>!isExplicitlyHidden(element)).map(elementText).join(' ')
-      : '';
-    const pointsPattern = /\byou got\s+(\d+)\s+(?:out\s+)?of\s+(\d+)\s+points?\b/i;
-    const points = liveGrading.match(pointsPattern) ?? localGrading.match(pointsPattern);
-    const pointFeedback: PlatformState['feedback'] = points && Number(points[2])>0 && Number(points[1])<=Number(points[2])
-      ? Number(points[1])===Number(points[2]) ? 'correct' : Number(points[1])===0 ? 'incorrect' : 'partial'
-      : null;
-    const feedbackEvidence = `${feedbackText} ${strongPageFeedback} ${localGrading}`;
-    const feedback = pointFeedback ?? (/\bcorrect\b|回答正确|答对/i.test(feedbackEvidence)
-      ? "correct"
-      : /\bincorrect\b|\bwrong\b|回答错误|答错/i.test(feedbackEvidence)
-        ? "incorrect"
-        : null);
+    const {localGrading,pointFeedback,feedbackEvidence,feedback}=readQuestionFeedback(feedbackRoot,pageText,feedbackText);
     const editableAnswerTarget = [...this.#targets.values()].some(target => {
       if (target.identity.role !== 'option' && target.identity.role !== 'blank') return false;
       return !isExplicitlyHidden(target.element) && supportedInput(target.element);
@@ -939,7 +874,6 @@ export class DomWebAdapter implements PlatformAdapter {
         scoredResult ||
         (!gradedQuestionSet && !editableAnswerTarget && this.#fingerprintCurrentQuestion()==='missing' && /quiz complete|test complete|interview complete|your results?|测验完成|测试完成|答题完成|已交卷/i.test(pageText)),
     };
-    recordTestEvent('dom-state',{kind:'state',fingerprint:result.fingerprint,feedback:result.feedback,feedback_text:result.feedback_text??'',score:result.visible_score??null,can_retry:result.can_retry,has_next:result.has_next,has_session_submit:result.has_session_submit??false,completed:result.completed,field_ids:Object.keys(result.field_values)});
     return result;
   }
 
@@ -1168,6 +1102,7 @@ export class DomWebAdapter implements PlatformAdapter {
           : "fill_blank";
     const stemText = type === "fill_blank" ? blankQuestionStem(root, textControls, stem.text) : stem.text;
     const options: QuestionFrame["options"] = [];
+    const optionImages = new Set<HTMLImageElement>();
     const blanks: QuestionFrame["blanks"] = [];
     const targets: LocatorMap["targets"] = {};
     const shuffledChoices = root.matches('.h5p-multichoice') && type !== 'fill_blank';
@@ -1219,7 +1154,9 @@ export class DomWebAdapter implements PlatformAdapter {
         const label = optionLabel(ownerDocument, control) || `Option ${index + 1}`;
         const labelElement = control.closest("label") ??
           (control.id ? ownerDocument.querySelector(`label[for='${CSS.escape(control.id)}']`) : null);
-        const media = [...new Set([...(isElementType(control,'img') ? [control] : []), ...Array.from((labelElement ?? control).querySelectorAll<HTMLImageElement>("img"))])]
+        const images = [...new Set([...(isElementType(control,'img') ? [control] : []), ...Array.from((labelElement ?? control).querySelectorAll<HTMLImageElement>("img"))])].filter(image=>!isExplicitlyHidden(image));
+        for(const image of images)optionImages.add(image);
+        const media = images
           .map((image) => imageMedia(image, this.#mediaSources, "option_image"))
           .filter((item): item is MediaRef => item !== null);
         options.push({ id, text: label, media });
@@ -1254,7 +1191,7 @@ export class DomWebAdapter implements PlatformAdapter {
     // A newly visible H5P Finish is a session control even after Check disappears.
     if (submit?.matches('button.h5p-question-finish') || semanticQuestion(root)?.controls.some(control => control.element === submit && control.role === 'session_submit')) submit = null;
     if (!submit && !this.rootOverride && !this.courseScope && candidateRoots(this.#document).length === 1) {
-      const container = root.closest("form, main, [role='main'], [data-vv-quiz], .quiz") ?? root.parentElement;
+      const container = root.closest("form, main, [role='main'], .quiz") ?? root.parentElement;
       const questionForm = root.closest("form");
       const external = queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
         .filter(element => container?.contains(element) && !root.contains(element) &&
@@ -1295,13 +1232,10 @@ export class DomWebAdapter implements PlatformAdapter {
     }
 
     const stemImages = Array.from(root.querySelectorAll<HTMLImageElement>("img"))
-      .filter((image) => !image.closest("label"))
+      .filter((image) => !isExplicitlyHidden(image)&&!image.closest("label")&&!optionImages.has(image))
       .map((image) => imageMedia(image, this.#mediaSources, "question_diagram"))
       .filter((item): item is MediaRef => item !== null);
-    const fingerprintSource = JSON.stringify({ type, stemText,
-      options: shuffledChoices ? [...choiceIdentities].sort() : options.map((option) => [option.text,option.media.map(media=>this.#mediaSources.get(media.temporary_handle)?.source_url)]),
-      images:Array.from(root.querySelectorAll<HTMLImageElement>('img')).filter(image=>!isExplicitlyHidden(image)&&!image.closest('label')).map(image=>[image.currentSrc||image.src,image.alt]),blanks: blanks.length });
-    const questionFingerprint = fnv1a(fingerprintSource);
+    const questionFingerprint = this.#questionFingerprint(root);
     for (const target of this.#targets.values()) target.identity.question_fingerprint = questionFingerprint;
     const questionId = `q_${questionFingerprint}`;
     const question: QuestionFrame = {
@@ -1334,54 +1268,6 @@ export class DomWebAdapter implements PlatformAdapter {
       targets,
     };
     return { question, locator_map: locatorMap };
-  }
-
-  #setSelected(target: DomTarget, value: boolean): void {
-    if (!supportedInput(target.element)) throw new Error("Target is disabled.");
-    if (target.kind === "select_option") {
-      if (value && target.element.value !== target.value) {
-        target.element.value = target.value;
-        dispatchValueEvents(target.element);
-      }
-      return;
-    }
-    const element = target.element;
-    if (isZhidaoChoice(element)) {
-      // This is a radio widget: selecting the desired option clears its peer.
-      // Do not click an already selected peer to "clear" it before that click.
-      if (value && !zhidaoSelected(element)) element.click();
-      return;
-    }
-    if (element.tagName === "INPUT" && ["radio", "checkbox"].includes((element as HTMLInputElement).type)) {
-      const input = element as HTMLInputElement;
-      if (input.disabled) throw new Error("Target is disabled.");
-      if (input.checked !== value) input.click();
-      return;
-    }
-    const current = selectedChoice(element);
-    if (semanticOptionType(element) === 'single_choice' && !value) return;
-    if (current !== value) element.click();
-  }
-
-  #setValue(target: DomTarget, value: string): void {
-    if (target.kind !== "element") throw new Error("Text target is invalid.");
-    const element = target.element;
-    if (element.tagName === "INPUT" || element.tagName === "TEXTAREA") {
-      const input = element as HTMLInputElement | HTMLTextAreaElement;
-      if (input.disabled || input.readOnly) throw new Error("Target is not editable.");
-      input.focus();
-      const prototype = input.tagName==='TEXTAREA' ? input.ownerDocument.defaultView!.HTMLTextAreaElement.prototype : input.ownerDocument.defaultView!.HTMLInputElement.prototype;
-      const setter=Object.getOwnPropertyDescriptor(prototype,'value')?.set;
-      if(!setter)throw new Error('TARGET_UNAVAILABLE: native input setter is unavailable.');
-      setter.call(input,value);
-      dispatchValueEvents(input);
-    } else if (element.isContentEditable) {
-      element.focus();
-      element.textContent = value;
-      dispatchValueEvents(element);
-    } else {
-      throw new Error("Target is not a supported text field.");
-    }
   }
 
   #findButton(pattern: RegExp, within: ParentNode = this.#document, includeDisabled = false): HTMLElement | null {
@@ -1439,6 +1325,10 @@ export class DomWebAdapter implements PlatformAdapter {
       }
       return "missing";
     }
+    return this.#questionFingerprint(root);
+  }
+
+  #questionFingerprint(root:HTMLElement):string {
     const baseStem = semanticStem(root.ownerDocument, root).text;
     const radioControls = choiceControls(root, 'radio');
     const checkboxControls = choiceControls(root, 'checkbox');
@@ -1449,22 +1339,27 @@ export class DomWebAdapter implements PlatformAdapter {
         ? "multiple_choice"
         : "fill_blank";
     const textControls = type === "fill_blank"
-      ? Array.from(root.querySelectorAll<HTMLElement>("input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']"))
+      ? semanticQuestion(root)?.blanks ?? Array.from(root.querySelectorAll<HTMLElement>("input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']"))
           .filter((element) => !isExplicitlyHidden(element) && (supportedInput(element) || hasVisibleQuestionSetGrade(root)))
       : [];
     const stem = type === "fill_blank" ? blankQuestionStem(root, textControls, baseStem) : baseStem;
     const options = select
       ? Array.from(select.options)
           .filter((option) => !option.disabled && option.value !== "")
-          .map((option) => normalizedText(option.text))
+          .map((option) => [normalizedText(option.text),[]])
       : (radioControls.length > 0 ? radioControls : checkboxControls)
-          .map((element, index) => optionLabel(root.ownerDocument, element) || `Option ${index + 1}`);
+          .map((element, index) => {
+            const labelElement=element.closest('label')??(element.id?root.ownerDocument.querySelector(`label[for='${CSS.escape(element.id)}']`):null);
+            const images=[...new Set([...(isElementType(element,'img')?[element]:[]),...(labelElement??element).querySelectorAll<HTMLImageElement>('img')])].filter(image=>!isExplicitlyHidden(image));
+            return [optionLabel(root.ownerDocument, element) || `Option ${index + 1}`,images.map(image=>image.currentSrc||image.src)];
+          });
     const blanks = textControls.length;
     const fingerprintOptions = root.matches('.h5p-multichoice')
       ? (radioControls.length > 0 ? radioControls : checkboxControls)
           .map((control, index) => h5pChoiceIdentity(root.ownerDocument, control, index)).sort()
       : options;
-    return fnv1a(JSON.stringify({ type, stemText: stem, options: fingerprintOptions, blanks }));
+    const images=Array.from(root.querySelectorAll<HTMLImageElement>('img')).filter(image=>!isExplicitlyHidden(image)&&!image.closest('label')).map(image=>[image.currentSrc||image.src,image.alt]);
+    return fnv1a(JSON.stringify({ type, stemText: stem, options: fingerprintOptions, images, blanks }));
   }
 
   #readTimer(): number | null {

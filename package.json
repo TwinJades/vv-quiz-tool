@@ -11,7 +11,8 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "verify:release": "node scripts/verify-release.mjs",
-    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "check": "pnpm typecheck && pnpm test && pnpm check:entrypoints && pnpm build && pnpm verify:release",
+    "check:entrypoints": "node scripts/check-entrypoints.mjs",
     "test": "vitest run --config vitest.logic.config.ts",
     "typecheck": "tsc --noEmit"
   },

@@ -1,12 +1,35 @@
 import {describe,expect,it} from 'vitest';
 import {courseFailureIsLocal} from '../../src/core/course';
 import {courseResumeUrl,courseCatalogMatchesUrl} from '../../src/extension/course-record';
-import {courseSnapshotHasIdentity,courseSurfaceFingerprint} from '../../src/web/course-surface';
+import {courseSnapshotHasIdentity,courseSurfaceFingerprint,directoryCourseReading,courseSurfaceSchema} from '../../src/web/course-surface';
 import type {CourseSurfaceSnapshot} from '../../src/web/course-surface';
 import type {CourseCatalog} from '../../src/core/course';
 import {publicMediaIdentity} from '../../src/web/public-course-url';
 
 describe('course failure and persisted navigation policies',()=>{
+  it('uses a visible same-site course link when the outer URL has no identity',()=>{
+    const snapshot:CourseSurfaceSnapshot={capture_id:'capture',url:'https://mooc1.chaoxing.com/course',title:'课程',native:false,visible_text:'课程',elements:[
+      {element_id:'link',parent_id:null,tag:'a',text:'课时',classes:[],role:null,input_type:null,clickable:true,disabled:false,selected:false,attributes:{href:'https://mooc1.chaoxing.com/mycourse/studentstudy?courseId=11&clazzid=33'}}
+    ]};
+    expect(courseSnapshotHasIdentity(snapshot,'11','33')).toBe(true);
+    expect(courseSnapshotHasIdentity(snapshot,'11','44')).toBe(false);
+    expect(courseSnapshotHasIdentity({...snapshot,url:'https://mooc1.chaoxing.com/course?courseId=22'},'11','33')).toBe(false);
+    expect(courseSnapshotHasIdentity({...snapshot,elements:[{...snapshot.elements[0]!,attributes:{href:'https://unrelated.example/course?courseId=11&clazzid=33'}}]},'11','33')).toBe(false);
+  });
+  it('keeps directory navigation independent from incomplete resource observations',()=>{
+    const reading={capture_id:'capture',stage:'directory',course_id:'11',context_id:'33',title:'课程',current_lesson_id:null,current_resource_id:'pending',
+      directory_root_id:'directory',lessons:[],expand_ids:[],more_id:null,previous_id:null,scroll_root_id:null,busy:false,total:null,
+      resources_complete:false,resources_total:null,resources:[],controls:[{id:'back',role:'back'},{id:'player',role:'play'}],
+      video_root_id:'missing-player',quiz_root_id:'missing-quiz',record_ids:['missing-record'],submission_ids:['missing-submit'],passed:null,
+      quiz_rules:{scored:null,retry_allowed:null,remaining_attempts:null,requires_pass:null,requires_rewatch:null},speed_allowed:null,visibility_required:null};
+    const original=courseSurfaceSchema.parse(reading),directory=directoryCourseReading(original);
+    expect(directory.controls).toEqual([{id:'back',role:'back'}]);
+    expect(directory.video_root_id).toBeNull();
+    expect(directory.record_ids).toEqual([]);
+    expect(directory.current_resource_id).toBeNull();
+    expect(original.video_root_id).toBe('missing-player');
+    expect(courseSurfaceSchema.parse(directory)).toEqual(directory);
+  });
   it.each(['课程视频播放器尚未加载。','视频连续两分钟没有有效播放进展。','平台任务完成记录仍未确认。'])('keeps a local task issue for %s',message=>{
     expect(courseFailureIsLocal(message)).toBe(true);
   });

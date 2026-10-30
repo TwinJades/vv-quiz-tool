@@ -255,7 +255,6 @@ export class QuizOrchestrator {
   #stepTimings = new Map<string, { calls: number; total_ms: number; max_ms: number }>();
   #pageAnswers = new Map<string, { answer: AnswerResult; guessed: boolean }>();
   #submissionPending=false;
-  #operationPending=false;
   #submissionStep:string|null=null;
   readonly #wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly #timer: SessionTimer;
@@ -300,7 +299,7 @@ export class QuizOrchestrator {
       progress: { ...this.#progress },
       notice: this.#notice,
       summary: this.#summary,
-      checkpoint:{last_outcome:this.#lastSequentialOutcome,answers:[...this.#pageAnswers],submission_pending:this.#submissionPending||this.#operationPending||this.platform.hasPendingSubmission?.()===true,answer_retry_counts:[...(this.options.answer_retry_counts??new Map())]},
+      checkpoint:{last_outcome:this.#lastSequentialOutcome,answers:[...this.#pageAnswers],submission_pending:this.#submissionPending||this.platform.hasPendingSubmission?.()===true,answer_retry_counts:[...(this.options.answer_retry_counts??new Map())]},
       timer_remaining_seconds: this.#timer.remaining() === null ? null : Math.ceil(this.#timer.remaining()!),
       ...(this.platform.visualMetrics ? { visual_metrics: this.platform.visualMetrics() } : {}),
       timings: [...timings].map(([stage, value]) => ({
@@ -379,8 +378,8 @@ export class QuizOrchestrator {
   async #readState(signal: AbortSignal): Promise<PlatformState> {
     const state = await this.platform.readState(signal);
     signal.throwIfAborted();
-    if(state.completed){this.#submissionPending=false;this.#operationPending=false;}
-    else if(this.#submissionStep==='execute_submit'&&(state.question_graded||state.feedback!==null)){this.#submissionPending=false;this.#operationPending=false;}
+    if(state.completed)this.#submissionPending=false;
+    else if(this.#submissionStep==='execute_submit'&&(state.question_graded||state.feedback!==null))this.#submissionPending=false;
     this.#timer.observe(state.timer_remaining_seconds);
     return state;
   }
@@ -492,14 +491,13 @@ export class QuizOrchestrator {
     try {
       this.#controller?.signal.throwIfAborted();
       const writing=step.startsWith('execute_')||step==='close_out_submit',submitting=step==='execute_submit'||step==='execute_session_submit'||step==='close_out_submit';
-      if(writing){this.#operationPending=true;if(submitting){this.#submissionPending=true;this.#submissionStep=step;}await this.options.persist?.(this.snapshot());}
+      if(writing){if(submitting){this.#submissionPending=true;this.#submissionStep=step;}await this.options.persist?.(this.snapshot());}
       this.#controller?.signal.throwIfAborted();
       const value = await action();
       this.#controller?.signal.throwIfAborted();
       if(writing&&Array.isArray(value)){
         const results=value as ActionResult[];
-        if(results.length&&results.every(result=>result.status==='failed')){this.#operationPending=false;if(submitting)this.#submissionPending=false;}
-        else if(!submitting&&results.length&&results.every(result=>result.status==='succeeded'))this.#operationPending=false;
+        if(submitting&&results.length&&results.every(result=>result.status==='failed'))this.#submissionPending=false;
       }
       return value;
     }
@@ -707,7 +705,7 @@ export class QuizOrchestrator {
     try {
       while (!signal.aborted) {
         this.#notice = null;
-        if (this.platform.hasPendingSubmission?.()||this.#submissionPending||this.#operationPending) {
+        if (this.platform.hasPendingSubmission?.()||this.#submissionPending) {
           this.#setState("VERIFY");
           const terminal = await this.#timeStep("read_pending_submission", () => this.#readState(signal));
           signal.throwIfAborted();

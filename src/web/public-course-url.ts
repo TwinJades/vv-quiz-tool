@@ -8,6 +8,6 @@ export function publicCourseUrl(value:string):string {
 export function publicMediaIdentity(value:string):string|null {
   const url=new URL(value);if(!['http:','https:'].includes(url.protocol))return null;
   const publicUrl=new URL(publicCourseUrl(value));
-  for(const key of [...publicUrl.searchParams.keys()])if(/expires?|timestamp|^x-(?:amz|oss)-|^policy$|^_(?:t|ts)?$|^ts?$|^deadline$/i.test(key))publicUrl.searchParams.delete(key);
-  publicUrl.hash='';return publicUrl.href;
+  for(const key of [...publicUrl.searchParams.keys()])if(/expires?|timestamp|^x-(?:amz|oss)-|^policy$|^_(?:t|ts)?$|^ts?$|^deadline$|^ws(?:secret|time)$|^auth_key$/i.test(key))publicUrl.searchParams.delete(key);
+  publicUrl.searchParams.sort();publicUrl.hash='';return publicUrl.href;
 }

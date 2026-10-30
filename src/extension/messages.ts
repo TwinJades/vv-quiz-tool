@@ -11,20 +11,20 @@ import type { ZhidaoResultReading } from '../web/zhidao-result';
 
 export type ContentRequest =
   | {type:'VV_COURSE_FRAME_RECT';child_url:string}
-  | {type:'VV_CAPTURE_COURSE_SURFACE';session_id:string;context?:import('../web/course-surface').CourseFrameContext}
+  | {type:'VV_CAPTURE_COURSE_SURFACE';session_id:string;context?:import('../web/course-surface').CourseFrameContext;intent?:import('../web/course-surface').CourseSurfaceSnapshot['intent']}
   | {type:'VV_COURSE_EMBEDDED_FRAMES';session_id:string}
   | {type:'VV_PAUSE_COURSE_MEDIA';course_id:string;context_id:string|null;session_id:string;interaction_epoch:string;context?:import('../web/course-surface').CourseFrameContext}
   | {type:'VV_APPLY_COURSE_SURFACE';session_id:string;reading:import('../web/course-surface').CourseSurfaceReading}
   | {type:'VV_EXPAND_COURSE_SURFACE';session_id:string;interaction_epoch:string;direction?:'next'|'previous'}
   | {type:'VV_CHAOXING_QUESTION_GEOMETRY';question_id:string}
   | {type:'VV_COURSE_SUBMISSION';phase:'arm'|'confirm'|'cancel'}
-  | {type:'VV_SUBMIT_CHAOXING';course_id:string;lesson_id:string;task_id:string;quiz_index:number;session_id:string;interaction_epoch:string}
+  | {type:'VV_SUBMIT_CHAOXING';course_id:string;lesson_id:string;task_id:string;resource_id:string;session_id:string;interaction_epoch:string}
   | {type:'VV_KNOWLEDGE_PAGE';request:import('../web/knowledge-practice-page').KnowledgePageRequest;session_id?:string;interaction_epoch?:string}
   | { type: 'VV_READ_ZHIDAO_RESULT' }
   | { type: "VV_CAPTURE_INITIAL_SEMANTIC"; binding: InteractionBinding }
   | { type: "VV_APPLY_INITIAL_SEMANTIC"; binding: InteractionBinding; reading: InitialSemanticReading }
   | { type: 'VV_INSPECT_COURSE_PAGE' }
-  | { type: 'VV_COURSE'; request: CoursePageRequest; session_id?: string; interaction_epoch?: string }
+  | { type: 'VV_COURSE'; request: CoursePageRequest; session_id: string; interaction_epoch: string }
   | { type: 'VV_COURSE_QUIZ'; course_id: string; task: LearningTask; boundary: QuizBoundary; parent_session_id: string; interaction_epoch: string; request: ContentRequest }
   | { type: "VV_WAIT_READY" }
   | { type: "VV_OBSERVE"; session_id: string; mode: ObservationInputMode }
@@ -97,7 +97,6 @@ export type ExtensionRequest =
   | { type: 'VV_GET_BUILD' }
   | {type:'VV_PREVIEW_PRACTICES';tab_id:number}
   | { type: 'VV_INSPECT_COURSE'; tab_id: number }
-  | { type: 'VV_PREVIEW_COURSE'; tab_id: number }
   | StartSessionRequest
   | ArmSessionStartRequest
   | { type: "VV_USER_INTERACTION"; session_id: string; epoch: string }

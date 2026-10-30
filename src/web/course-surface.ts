@@ -18,7 +18,13 @@ export const courseSurfaceSchema=z.object({
   speed_allowed:z.boolean().nullable(),visibility_required:z.boolean().nullable(),
 }).strict();
 export type CourseSurfaceReading=z.infer<typeof courseSurfaceSchema>;
+export function directoryCourseReading(reading:CourseSurfaceReading):CourseSurfaceReading {
+  return {...reading,resources:[],resources_complete:false,resources_total:null,current_resource_id:null,
+    video_root_id:null,quiz_root_id:null,record_ids:[],submission_ids:[],passed:null,
+    controls:reading.controls.filter(control=>control.role==='directory'||control.role==='back')};
+}
 export interface CourseSurfaceSnapshot {
+  native_reading?:CourseSurfaceReading;
   intent?:'directory'|'resources'|'task';
   parent_course?:CourseFrameContext;
   active_task?:Pick<import('../core/course').LearningTask,'id'|'lesson_id'|'kind'|'title'>;
@@ -36,8 +42,15 @@ export function courseSnapshotHasIdentity(snapshot:CourseSurfaceSnapshot,courseI
   const url=new URL(snapshot.url),courseKeys=['courseId','courseid','recruitAndCourseId'],contextKeys=['clazzid','classId'];
   const courses=courseKeys.flatMap(key=>url.searchParams.getAll(key)),contexts=contextKeys.flatMap(key=>url.searchParams.getAll(key));
   const attributes=snapshot.elements.map(element=>element.attributes);
-  const course= courses.length?courses.every(id=>id===courseId):url.pathname.split('/').includes(courseId)||attributes.some(value=>[value.courseid,value['data-course-id']].includes(courseId));
-  const context=contextId===null?contexts.length===0:contexts.length?contexts.every(id=>id===contextId):url.pathname.split('/').includes(contextId)||attributes.some(value=>value.clazzid===contextId);
+  const links=attributes.flatMap(value=>{
+    if(!value.href||!URL.canParse(value.href,url.href))return [];
+    const link=new URL(value.href,url.href);
+    return link.origin===url.origin&&courseKeys.some(key=>link.searchParams.get(key)===courseId)?[link]:[];
+  });
+  const linked=links.some(link=>courseKeys.flatMap(key=>link.searchParams.getAll(key)).every(id=>id===courseId)&&
+    (contextId===null?contextKeys.every(key=>!link.searchParams.has(key)):contextKeys.some(key=>link.searchParams.get(key)===contextId)&&contextKeys.flatMap(key=>link.searchParams.getAll(key)).every(id=>id===contextId)));
+  const course= courses.length?courses.every(id=>id===courseId):url.pathname.split('/').includes(courseId)||attributes.some(value=>[value.courseid,value['data-course-id']].includes(courseId))||linked;
+  const context=contextId===null?contexts.length===0:contexts.length?contexts.every(id=>id===contextId):url.pathname.split('/').includes(contextId)||attributes.some(value=>value.clazzid===contextId)||linked;
   return course&&context;
 }
 

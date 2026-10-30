@@ -5,9 +5,9 @@ import {ModelCallBudget} from '../../src/core/call-budget';
 import {projectCourseFrame} from '../../src/web/frame-projection';
 
 const parent:LearningTask={id:'lesson',lesson_id:'lesson',chapter_id:'chapter',title:'lesson',kind:'lesson',status:'not_started',order:0,prerequisites:[]};
-const first:LearningTask={...parent,id:'video-a',kind:'video',order:0};
-const second:LearningTask={...parent,id:'video-b',kind:'video',order:1};
-const quiz:LearningTask={...parent,id:'quiz',kind:'lesson_quiz',order:2,prerequisites:[first.id]};
+const first:LearningTask={...parent,id:'video-a',resource_id:'media-a',kind:'video',order:0};
+const second:LearningTask={...parent,id:'video-b',resource_id:'media-b',kind:'video',order:1};
+const quiz:LearningTask={...parent,id:'quiz',resource_id:'work-a',kind:'lesson_quiz',order:2,prerequisites:[first.id]};
 const catalog:CourseCatalog={course_id:'course',platform:'chaoxing',title:'course',revision:'revision',complete:true,diagnostics:[],rules:{speed_allowed:null,visibility_required:null},tasks:[parent,{...parent,id:'done',lesson_id:'done',status:'completed'},{...parent,id:'document',kind:'excluded'}]};
 const record:CourseVerification={task_id:first.id,media_ended:true,progress_recorded:true,submission_confirmed:false,completed:true,passed:null,pending_grading:false,visible_score:null};
 

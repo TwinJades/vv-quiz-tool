@@ -8,7 +8,7 @@ import { validateCourseScope,courseScopeForSelection } from '../core/course';
 import type { CourseCatalog } from '../core/course';
 import {validateKnowledgeScope} from '../core/knowledge-practice';
 import type {KnowledgeCatalog} from '../core/knowledge-practice';
-import { hasUiTranslation, initializeUiLanguage, showNotice, stateLabel, t } from './ui-language';
+import { hasUiTranslation, initializeUiLanguage, showNotice, stateLabel, runtimeStateLabel, t } from './ui-language';
 declare const __VV_BUILD_ID__: string;
 document.documentElement.dataset.vvBuild = __VV_BUILD_ID__;
 document.querySelector('#extension-version')!.textContent = `v${chrome.runtime.getManifest().version}`;
@@ -71,7 +71,7 @@ function courseScope():string[] {
 }
 function renderCourseScope():void {
   const ids=courseScope();const container=document.querySelector('#course-tasks')!;container.replaceChildren();
-  for(const task of courseCatalog?.tasks.filter(t=>ids.includes(t.id))??[]){const p=document.createElement('p');p.textContent=`${task.title} · ${stateLabel(task.kind)} · ${stateLabel(task.status)}`;container.append(p);}
+  for(const task of courseCatalog?.tasks.filter(t=>ids.includes(t.id))??[]){const p=document.createElement('p');p.textContent=`${task.title} · ${stateLabel(task.kind)} · ${task.status==='not_started'?t('未完成'):stateLabel(task.status)}`;container.append(p);}
   for(const point of knowledgeCatalog?.points.filter(p=>ids.includes(p.id))??[]){const p=document.createElement('p');p.textContent=point.title+' · '+t('练习记录进入后逐项核对');container.append(p);}
   courseStart.disabled=ids.length===0||hasLiveSession;
 }
@@ -245,8 +245,8 @@ function renderSession(snapshot: SessionRuntimeSnapshot | null): void {
   hasLiveSession=Boolean(snapshot&&!['COMPLETE','CANCELLED','FAILED'].includes(snapshot.state));
   const active = snapshot && !["COMPLETE", "CANCELLED", "FAILED", "PAUSED"].includes(snapshot.state);
   statusText.dataset.kind = snapshot?.state === "FAILED" ? "error" : snapshot?.state === "PAUSED" ? "warning" : "";
-  statusText.textContent = snapshot ? stateLabel(snapshot.state) : t("未启动");
-  showNotice(detailText,snapshot?.notice ?? "打开一个逐题测验后启动。");
+  statusText.textContent = snapshot ? runtimeStateLabel(snapshot) : t("未启动");
+  showNotice(detailText,displayedError || snapshot?.notice || (snapshot ? '' : "打开一个逐题测验后启动。"));
   progressText.textContent = snapshot
     ? t('已答 {{answered}} · 猜答 {{guessed}} · 重试 {{retried}} · 调用 {{used}}/{{limit}}',{...snapshot.progress,used:snapshot.model_calls.used,limit:snapshot.model_calls.limit})
     : "";

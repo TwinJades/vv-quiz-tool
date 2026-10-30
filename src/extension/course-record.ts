@@ -6,6 +6,19 @@ import {publicCourseUrl} from '../web/public-course-url';
 export const COURSE_RECORD_PREFIX='vv-course-record:';
 export interface SavedCourseRecord {snapshot:SessionRuntimeSnapshot;request:StartSessionRequest;url:string;updated_at:number}
 
+export async function persistCourseRecord(tabId:number,snapshot:SessionRuntimeSnapshot,preferredUrl?:string):Promise<void>{
+  const checkpoint=snapshot.course?.checkpoint;if(!checkpoint)throw new Error('课程保存缺少断点。');
+  if(!Number.isInteger(snapshot.model_calls.used)||snapshot.model_calls.used<0||snapshot.model_calls.used>snapshot.model_calls.limit)throw new Error('课程保存预算计数无效。');
+  const stored=await chrome.storage.session.get('vv-start-request:'+tabId),request=stored['vv-start-request:'+tabId] as StartSessionRequest|undefined;
+  if(!request||request.provider_profile_id!==snapshot.provider_profile_id)throw new Error('课程保存缺少原始任务配置。');
+  const key=COURSE_RECORD_PREFIX+snapshot.session_id,previous=await chrome.storage.local.get(key),record=previous[key] as SavedCourseRecord|undefined;
+  const value=preferredUrl??record?.url??(await chrome.webNavigation.getFrame({tabId,frameId:0}))?.url;
+  if(!value)throw new Error('课程保存缺少可恢复页面地址。');
+  const url=courseResumeUrl(value);
+  if(!courseCatalogMatchesUrl(url,checkpoint.catalog))throw new Error('课程保存地址与课程、班级身份不一致。');
+  await chrome.storage.local.set({[key]:{snapshot:structuredClone(snapshot),request,url,updated_at:Date.now()} satisfies SavedCourseRecord});
+}
+
 export function courseResumeUrl(value:string):string {
   const url=new URL(value);
   if(url.protocol!=='https:'||!(url.hostname==='chaoxing.com'||url.hostname.endsWith('.chaoxing.com')||url.hostname==='zhihuishu.com'||url.hostname.endsWith('.zhihuishu.com')))throw new Error('课程恢复地址未授权。');

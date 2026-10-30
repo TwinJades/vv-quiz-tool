@@ -1,6 +1,7 @@
 import { isExplicitlyHidden, normalizedText, fnv1a } from './dom-utils';
 import { readChaoxingPracticeReview } from './chaoxing-practice';
 import {publicMediaIdentity} from './public-course-url';
+import {chaoxingFrameResourceId} from './course-resource-identity';
 
 export interface ChaoxingLearningReading {
   course_id: string;
@@ -16,12 +17,12 @@ export interface ChaoxingLearningReading {
   excluded_resources?:Array<{index:number;title:string}>;
   cross_origin_resources?:boolean;
   /** Page markers and media ended deliberately remain independent. */
-  videos: Array<{ index: number; task_recorded: boolean | null; media: {
+  videos: Array<{ index: number; resource_id:string|null;title:string|null; task_recorded: boolean | null; media: {
     source_fingerprint:string;
     position: number; duration: number | null; rate: number; paused: boolean;
     ended: boolean; seeking: boolean; ready_state: number; muted: boolean; volume: number;
   } | null }>;
-  quizzes: Array<{ index: number; task_recorded: boolean | null; status: 'pending' | 'submitted' | 'unknown';
+  quizzes: Array<{ index: number; resource_id:string|null;title:string|null; task_recorded: boolean | null; status: 'pending' | 'submitted' | 'unknown';
     visual_text_required: boolean; submission_confirmed: boolean;score:number|null;attempt:number|null }>;
   diagnostics: string[];
 }
@@ -90,7 +91,7 @@ export function readChaoxingLearningPage(document: Document): ChaoxingLearningRe
       const video=media.length===1 ? media[0]! : null;
       const source=video&&(video.currentSrc||video.src),sourceUrl=source?new URL(source,child!.location.href):null;
       const publicSource=sourceUrl?publicMediaIdentity(sourceUrl.href):null;
-      reading.videos.push({index:reading.videos.length,task_recorded:jobRecorded(frame),media:video ? {
+      reading.videos.push({index:reading.videos.length,resource_id:chaoxingFrameResourceId(frame,'video'),title:normalizedText(frame.title||video?.getAttribute('title'))||null,task_recorded:jobRecorded(frame),media:video ? {
         position:video.currentTime,duration:Number.isFinite(video.duration)?video.duration:null,rate:video.playbackRate,
         paused:video.paused,ended:video.ended,seeking:video.seeking,ready_state:video.readyState,muted:video.muted,volume:video.volume,
         source_fingerprint:publicSource?fnv1a(publicSource):'',
@@ -107,7 +108,7 @@ export function readChaoxingLearningPage(document: Document): ChaoxingLearningRe
           id(u,'courseId')===course&&id(u,'knowledgeid')===lesson)work=candidate;}catch{ /* unavailable */ }
       const body=work ? normalizedText(work.body?.innerText ?? work.body?.textContent) : '';
       const review=work ? readChaoxingPracticeReview(work) : null;
-      reading.quizzes.push({index:reading.quizzes.length,task_recorded:jobRecorded(frame),
+      reading.quizzes.push({index:reading.quizzes.length,resource_id:chaoxingFrameResourceId(frame,'quiz'),title:normalizedText(frame.title)||null,task_recorded:jobRecorded(frame),
         status:review?'submitted':/章节测验\s+待完成/.test(body)?'pending':'unknown',
         visual_text_required:Boolean(work&&Array.from(work.querySelectorAll('.font-cxsecret')).some(e=>!isExplicitlyHidden(e))),
         submission_confirmed:Boolean(review),score:review?.score??null,attempt:review?.attempt??null});

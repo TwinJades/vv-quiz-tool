@@ -112,7 +112,7 @@ export interface CourseQuizRunner {
 }
 export interface CourseQuizCheckpoint {boundary_id:string;task_id:string;snapshot:SessionRuntimeSnapshot;retries?:number;retry_pending?:boolean}
 export interface CourseRuntime {
-  checkpoint?:{catalog:CourseCatalog;completed:string[];children:LearningTask[];pending_quiz:QuizBoundary|null;quiz_child?:CourseQuizCheckpoint|null;issues?:CourseTaskIssue[];excluded_tasks?:string[];quiz_retries?:Array<[string,number]>;quiz_retry_pending?:string|null;popup_retries?:Array<[string,number]>};
+  checkpoint?:{format_version?:number;catalog:CourseCatalog;completed:string[];children:LearningTask[];pending_quiz:QuizBoundary|null;quiz_child?:CourseQuizCheckpoint|null;issues?:CourseTaskIssue[];excluded_tasks?:string[];quiz_retries?:Array<[string,number]>;quiz_retry_pending?:string|null;popup_retries?:Array<[string,number]>};
   phase: string;
   course_id: string;
   title: string;
@@ -139,6 +139,8 @@ export function courseRecordConfirms(task:LearningTask,record:CourseVerification
 export function validateCourseResources(parent:LearningTask,children:LearningTask[]):void {
   const ids=new Set(children.map(child=>child.id));
   if(!children.length||ids.size!==children.length||children.some(child=>child.lesson_id!==parent.lesson_id||child.chapter_id!==parent.chapter_id||child.kind==='lesson'||child.kind!=='excluded'&&child.status==='unknown'))throw new Error('课时资源身份、状态或归属不完整。');
+  const executable=children.filter(child=>child.kind!=='excluded');
+  if(executable.some(child=>!child.resource_id?.trim())||new Set(executable.map(child=>child.resource_id)).size!==executable.length)throw new Error('可执行资源的公开编号缺失或重复。');
   for(const child of children)if(child.prerequisites.some(id=>id===child.id||!ids.has(id)))throw new Error('课时资源前置条件引用了范围外任务。');
   const visited=new Set<string>(),active=new Set<string>();
   const visit=(id:string):void=>{
@@ -206,6 +208,7 @@ export function validateCourseScope(catalog: CourseCatalog, ids: string[]): void
   for (const id of ids) {
     const task = catalog.tasks.find(t => t.id === id);
     if (!task || task.kind === 'excluded' || task.status === 'unknown'&&task.kind!=='lesson') throw new Error('范围含未知、考试或不支持任务：' + id);
+    if(task.kind!=='lesson'&&!task.resource_id?.trim())throw new Error('选定资源缺少公开编号：'+task.title);
   }
 }
 
@@ -290,7 +293,7 @@ export class CourseOrchestrator {
       provider_profile_id:this.options.provider_profile_id,model_id:this.options.model_id,model_calls:{used:this.options.budget.used,limit:this.options.budget.limit},
       progress:{total:selected.length,answered:selected.filter(t=>t.status==='completed').length,guessed:this.#runtime.results.reduce((n,r)=>n+(r.result.guessed??0),0),retried:this.#runtime.results.reduce((n,r)=>n+r.result.retried,0),skipped:this.#excludedTasks.size,failed:this.#issues.size},
       notice:this.#notice,summary:this.#summary,course:structuredClone({...this.#runtime,estimate_seconds:this.#estimate.seconds,estimate_frozen:this.#estimate.frozen,
-        excluded:[...new Set([...this.#runtime.excluded,...this.#excludedTasks])],issues:[...this.#issues.values()],checkpoint:{catalog:{...this.options.catalog,resource_discovery:[...this.#discovery.values()]},completed:[...this.#completed],children:this.#children,pending_quiz:this.#pendingQuiz,quiz_child:this.quizzes.childCheckpoint?.()??null,issues:[...this.#issues.values()],excluded_tasks:[...this.#excludedTasks],quiz_retries:this.quizzes.retryCheckpoint?.()??[],quiz_retry_pending:this.quizzes.retryPendingCheckpoint?.()??null,popup_retries:this.quizzes.popupRetryCheckpoint?.()??[]}})};
+        excluded:[...new Set([...this.#runtime.excluded,...this.#excludedTasks])],issues:[...this.#issues.values()],checkpoint:{format_version:2,catalog:{...this.options.catalog,resource_discovery:[...this.#discovery.values()]},completed:[...this.#completed],children:this.#children,pending_quiz:this.#pendingQuiz,quiz_child:this.quizzes.childCheckpoint?.()??null,issues:[...this.#issues.values()],excluded_tasks:[...this.#excludedTasks],quiz_retries:this.quizzes.retryCheckpoint?.()??[],quiz_retry_pending:this.quizzes.retryPendingCheckpoint?.()??null,popup_retries:this.quizzes.popupRetryCheckpoint?.()??[]}})};
   }
   modelChanged(id: string, reason: string): void { this.options.model_id=id; this.#notice=reason; this.#emit(); }
   checkpointUpdated():void{this.#emit();}
@@ -528,7 +531,7 @@ export class CourseOrchestrator {
         const children=await this.adapter.children(task,signal);signal.throwIfAborted();
         validateCourseResources(task,children);
         this.#discovery.set(task.lesson_id,{lesson_id:task.lesson_id,state:'complete',count:children.length});
-        if(this.#children.length&&this.#children[0]!.lesson_id===task.lesson_id&&(JSON.stringify(this.#children.map(child=>[child.id,child.kind]))!==JSON.stringify(children.map(child=>[child.id,child.kind]))||this.#children.some(child=>child.resource_fingerprint&&children.find(fresh=>fresh.id===child.id)?.resource_fingerprint&&child.resource_fingerprint!==children.find(fresh=>fresh.id===child.id)?.resource_fingerprint)))throw new Error('恢复时课时资源清单改变。');
+        if(this.#children.length&&this.#children[0]!.lesson_id===task.lesson_id&&(JSON.stringify(this.#children.filter(child=>child.kind!=='excluded').map(child=>[child.id,child.kind]).sort())!==JSON.stringify(children.filter(child=>child.kind!=='excluded').map(child=>[child.id,child.kind]).sort())||this.#children.some(child=>child.resource_fingerprint&&children.find(fresh=>fresh.id===child.id)?.resource_fingerprint&&child.resource_fingerprint!==children.find(fresh=>fresh.id===child.id)?.resource_fingerprint)))throw new Error('恢复时课时资源清单改变。');
         for(const child of children){const previous=this.#children.find(item=>item.id===child.id);if(previous?.resource_fingerprint&&!child.resource_fingerprint)child.resource_fingerprint=previous.resource_fingerprint;}
         this.#children=children;this.#emit();
         if(!children.some(child=>child.kind!=='excluded')){this.#excludedTasks.add(task.id);this.#children=[];await this.adapter.returnToCatalog(signal);this.#emit();return;}
