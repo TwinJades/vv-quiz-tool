@@ -2,7 +2,6 @@ import { assertVisualFreshness, fingerprintVisualTiles, insideRect } from "../co
 import type { VisualCapture, VisualFrame, VisualGeometry } from "../core/visual";
 import type { InteractionBinding, NativeInputTicket } from "./interaction-guard";
 import { activeWebsiteFrame, requireCurrentWebsite } from './website-access';
-import {recordTestEvent} from './test-hooks';
 
 export interface NormalHoverTarget {
   point: { x: number; y: number };
@@ -180,8 +179,6 @@ export class VisualTransport {
       const viewport_context = !this.#viewportContextSent && geometry.isolated_canvas &&
         (left !== 0 || top !== 0 || width !== bitmap.width || height !== bitmap.height)
         ? { data: raw, width: bitmap.width, height: bitmap.height } : undefined;
-      recordTestEvent('pixels',{data,session_id:sessionId,at:Date.now(),width,height,geometry});
-      if(viewport_context)recordTestEvent('pixels',{...viewport_context,session_id:sessionId,at:Date.now(),purpose:'initial_viewport_context',geometry:{...geometry,region:{x:0,y:0,width:viewport_context.width,height:viewport_context.height}}});
       this.#viewportContextSent = true;
       return { frame: { visual_frame_id: crypto.randomUUID(), session_id: sessionId, observation_id: observationId,
         surface_id: `tab_${this.tabId}`, captured_at: Date.now(), geometry, zoom, width, height, ...(pixel_tiles ? {pixel_tiles} : {}),
@@ -260,23 +257,22 @@ export class VisualTransport {
   /** A locally resolved normal control can require CSS :hover. This separate
    * path never clicks, captures/uploads pixels, emulates focus, produces frames
    * or changes page visibility. No model-provided CDP commands are accepted. */
-  hoverNormalControl(target: NormalHoverTarget, signal: AbortSignal): Promise<void> {
-    target = structuredClone(target);
-    const assertBinding = () => {
-      signal.throwIfAborted();
-      const binding = this.binding();
-      if (!binding?.enabled || binding.session_id !== target.session_id || binding.epoch !== target.interaction_epoch)
-        throw new Error('USER_INTERACTION: normal hover belongs to an inactive session.');
-      if (!Number.isFinite(target.captured_at) || Date.now() < target.captured_at || Date.now() - target.captured_at > 5000)
-        throw new Error('TARGET_UNAVAILABLE: normal hover observation expired.');
-    };
+  hoverNormalControl(resolveTarget: () => Promise<NormalHoverTarget>, signal: AbortSignal): Promise<void> {
     return serializedOperation(async () => {
-      assertBinding();
-      await requireCurrentWebsite(this.tabId); assertBinding();
+      signal.throwIfAborted();
+      await requireCurrentWebsite(this.tabId);
       if (!await chrome.permissions.contains({ permissions: ['debugger'] })) throw new Error('正常倍速菜单悬停需要已授权的debugger网页控制权限。');
+      await this.#attach(signal);
+      const target=structuredClone(await resolveTarget());
+      const assertBinding = (checkFreshness=true) => {
+        signal.throwIfAborted();
+        const binding = this.binding();
+        if (!binding?.enabled || binding.session_id !== target.session_id || binding.epoch !== target.interaction_epoch)
+          throw new Error('USER_INTERACTION: normal hover belongs to an inactive session.');
+        if (checkFreshness&&(!Number.isFinite(target.captured_at) || Date.now() < target.captured_at || Date.now() - target.captured_at > 5000))
+          throw new Error(`TARGET_UNAVAILABLE: normal hover observation expired; age_ms=${Date.now()-target.captured_at}.`);
+      };
       assertBinding();
-      await this.#attach(signal); assertBinding();
-      await requireCurrentWebsite(this.tabId); assertBinding();
       const current = await this.geometry(); assertBinding();
       if (current.blocker || current.url !== target.geometry.url || current.time_origin !== target.geometry.time_origin ||
         JSON.stringify(current.viewport) !== JSON.stringify(target.geometry.viewport) ||
@@ -286,7 +282,7 @@ export class VisualTransport {
         target.point.x < 0 || target.point.y < 0 || target.point.x >= current.viewport.width || target.point.y >= current.viewport.height)
         throw new Error('TARGET_UNAVAILABLE: normal hover page or control geometry changed.');
       await this.#send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: target.point.x, y: target.point.y }, signal);
-      assertBinding();
+      assertBinding(false);
     });
   }
 

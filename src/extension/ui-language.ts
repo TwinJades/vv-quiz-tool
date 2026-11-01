@@ -27,6 +27,10 @@ export function stateLabel(state: string): string {
   return STATE_LABELS[state] ? t(`state.${state}`) : state;
 }
 
+export function runtimeStateLabel(snapshot:{state:string;course?:{phase:string}}):string {
+  return stateLabel(snapshot.course&&!['PAUSED','COMPLETE','FAILED','CANCELLED','QUEUED'].includes(snapshot.state)?snapshot.course.phase:snapshot.state);
+}
+
 export function describeNotice(message: string, language?: UiLanguage): {text: string; details?: string} {
   if (!message) return {text:''};
   if (translations.exists(message, {lng:language ?? translations.language})) return {text:t(message, {}, language)};
@@ -64,13 +68,14 @@ export function showNotice(element: HTMLElement, message: string): void {
   else notices.delete(element);
   element.toggleAttribute('data-vv-notice',Boolean(message));
   const previous = element.nextElementSibling;
-  if (previous?.getAttribute('data-notice-details') === element.id) previous.remove();
-  if (!notice.details) return;
-  const details = document.createElement('details');
+  const existing = previous instanceof HTMLDetailsElement && previous.getAttribute('data-notice-details') === element.id ? previous : null;
+  if (!notice.details) { existing?.remove(); return; }
+  const details = existing ?? document.createElement('details');
   details.dataset.noticeDetails = element.id;
   const summary = document.createElement('summary'); summary.textContent = t('技术详情');
   const content = document.createElement('pre'); content.textContent = notice.details;
-  details.append(summary, content); element.after(details);
+  details.replaceChildren(summary, content);
+  if (!existing) element.after(details);
 }
 
 export async function initializeUiLanguage(onChange: () => void | Promise<void>): Promise<void> {

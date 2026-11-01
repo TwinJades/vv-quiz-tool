@@ -1,6 +1,6 @@
 import type { ExtensionRequest, TaskPanelSnapshot } from "./messages";
 import { requestCurrentWebsite } from "./website-access";
-import { hasUiTranslation, initializeUiLanguage, showNotice, stateLabel, t } from './ui-language';
+import { hasUiTranslation, initializeUiLanguage, showNotice, stateLabel, runtimeStateLabel, t } from './ui-language';
 
 const tasks = document.querySelector<HTMLElement>("#tasks")!;
 const errorText = document.querySelector<HTMLElement>("#error")!;
@@ -51,6 +51,7 @@ async function refresh(): Promise<void> {
     const marker = JSON.stringify({ ...state, tasks: state.tasks.map(task => ({ ...task, snapshot: { ...task.snapshot, timings: undefined, steps: undefined } })) });
     if (marker === lastRenderMarker) return;
     lastRenderMarker = marker;
+    const expandedDetails = new Set(Array.from(tasks.querySelectorAll<HTMLDetailsElement>('details[open][data-notice-details]')).map(detail=>detail.dataset.noticeDetails));
     const cards = state.tasks.map(task => {
       const { snapshot, tab_id: tabId } = task;
       const terminal = ["COMPLETE", "FAILED", "CANCELLED"].includes(snapshot.state);
@@ -59,7 +60,7 @@ async function refresh(): Promise<void> {
       card.className = "panel task";
       card.dataset.paused = String(snapshot.state === "PAUSED" || snapshot.state === "FAILED");
       card.append(text("h2", task.title), text("p", task.url || t('标签 {{id}}',{id:tabId}), "muted"));
-      card.append(text("p", `${stateLabel(snapshot.state)}${queuedPosition >= 0 ? ' · '+t('排队第 {{position}} 场',{position:queuedPosition+1}) : ""}`, "state"));
+      card.append(text("p", `${runtimeStateLabel(snapshot)}${queuedPosition >= 0 ? ' · '+t('排队第 {{position}} 场',{position:queuedPosition+1}) : ""}`, "state"));
       if (!terminal && snapshot.timer_remaining_seconds !== null && snapshot.timer_remaining_seconds !== undefined) card.append(text("p", t('剩余约 {{seconds}} 秒',{seconds:snapshot.timer_remaining_seconds})+(snapshot.timer_remaining_seconds <= 60 ? ' · '+t('优先收尾') : ''), "muted"));
       card.append(text("p", `${task.provider_name} · ${snapshot.model_id}`));
       const progressValues={...snapshot.progress,used:snapshot.model_calls.used,limit:snapshot.model_calls.limit};
@@ -109,6 +110,7 @@ async function refresh(): Promise<void> {
       return card;
     });
     tasks.replaceChildren(...(cards.length ? cards : [text("p", "尚无测验任务。请在网站标签中启动 VV。", "muted")]));
+    for (const detail of tasks.querySelectorAll<HTMLDetailsElement>('details[data-notice-details]')) detail.open = expandedDetails.has(detail.dataset.noticeDetails);
   } catch (error) { showNotice(errorText,String((error as Error).message || error)); }
   finally { refreshing = false; }
 }

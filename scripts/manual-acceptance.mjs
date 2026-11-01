@@ -7,8 +7,10 @@ import { resolve } from "node:path";
 import { recommendations, updateInventory } from "./browser-acceptance-state.mjs";
 import { readEasyCpaAcceptanceConfig } from './read-easycpa-acceptance-config.mjs';
 import { providerProfileSchema } from '../src/core/schema.ts';
+import {verifyRelease} from './verify-release.mjs';
 
 const root = resolve(import.meta.dirname, "..");
+await verifyRelease();
 const runtime = resolve(root, ".browser-regression-runtime");
 const fresh = process.argv.includes('--fresh');
 const runStamp = new Date().toISOString().replaceAll(':', '-');
@@ -385,10 +387,13 @@ async function main() {
   await controller.evaluate('document.title="VV 记录连接（请保留）"');
   report.controller_target_id = options.id;
   const expectedBuild = JSON.parse(await readFile(resolve(root, 'dist/build-info.json'), 'utf8'));
+  const internalBuild=JSON.parse(await readFile(resolve(runtime,`build-${expectedBuild.build_id}`,'report.json'),'utf8'));
+  if(internalBuild.build_id!==expectedBuild.build_id||internalBuild.built_at!==expectedBuild.built_at||internalBuild.test_build!==false)throw new Error('正式构建的内部报告不匹配。');
   const loadedBuild = await extEval(`const response=await fetch(chrome.runtime.getURL('build-info.json'));if(!response.ok)throw new Error('扩展没有构建标识，请加载最新构建。');return response.json();`);
   const runningBuild = await extEval(`const response=await chrome.runtime.sendMessage({type:'VV_GET_BUILD'});if(!response?.ok||!response.result?.build_id)throw new Error('扩展后台没有当前构建标识，请重新加载最新扩展。');return response.result;`);
   if (loadedBuild.build_id !== expectedBuild.build_id || runningBuild.build_id !== expectedBuild.build_id || loadedBuild.strategy !== 'unattended') throw new Error('测试浏览器加载的扩展与当前构建不一致，请重新加载最新扩展。');
   report.extension_build = loadedBuild;
+  report.internal_build_report=resolve(runtime,`build-${expectedBuild.build_id}`,'report.json');
   if (fresh && process.env.VV_EASYCPA_CONFIG_PATH) {
     const accepted = await readEasyCpaAcceptanceConfig(process.env.VV_EASYCPA_CONFIG_PATH, ['gemini-3.8-flash-high', 'gemini-3.7-flash-high', 'gemini-3.1-pro-low']);
     const response = await fetch(`${accepted.profile.base_url}/models`, { headers: { Authorization: `Bearer ${accepted.secret}` }, signal: AbortSignal.timeout(10000) });

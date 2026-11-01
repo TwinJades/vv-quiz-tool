@@ -1,12 +1,11 @@
 import { normalizedText } from './dom-utils';
 import { isVisibleZhidaoPlayerElement, readZhidaoPlayer, type ZhidaoPlayerReading } from './zhidao-player';
+import { publicResourceId } from './course-resource-identity';
+import { publicMediaIdentity } from './public-course-url';
 
-export type ZhidaoNormalHover = (element: HTMLElement, signal: AbortSignal) => Promise<void>;
-
-/** A lease for one currently observed resource and media element. It is local
- * to this document, expires on resource/navigation changes, and is not a task
- * completion record or a stable platform resource ID. The caller still owns
- * website permission, course scope, interaction epoch and course rule checks. */
+/** 只绑定当前文档中已核验的卡片、公开资源编号和媒体身份。
+ * 课程、知识点、上下文或实际资源改变后失效；标题不作为全局唯一编号，
+ * 本地租约也不代表平台完成记录。权限、交互代次及课程规则仍由调用方核对。 */
 export class ZhidaoPlayerControls {
   readonly #video: HTMLVideoElement;
   readonly #root: HTMLElement;
@@ -17,8 +16,8 @@ export class ZhidaoPlayerControls {
   #buffering = false;
   readonly #events: Array<[string, EventListener]> = [];
 
-  constructor(private readonly document: Document, expected: ZhidaoPlayerReading,
-    private readonly normalHover?: ZhidaoNormalHover) {
+  constructor(private readonly document: Document, expected: ZhidaoPlayerReading, card: HTMLElement,
+    private readonly resourceId: string, private readonly mediaIdentity: string) {
     const current = readZhidaoPlayer(document);
     if (!current || Date.now() - expected.observed_at < 0 || Date.now() - expected.observed_at > 5000 ||
       current.course_id !== expected.course_id || current.point_id !== expected.point_id ||
@@ -27,13 +26,13 @@ export class ZhidaoPlayerControls {
     this.#expected = structuredClone(expected);
     const roots = document.querySelectorAll<HTMLElement>('.videoNameBox.able-player-container > .video-js');
     const cards = document.querySelectorAll<HTMLElement>('.resources-section .resources-list > .basic-info-video-card-container.active');
-    if (roots.length !== 1 || cards.length !== 1) throw new Error('播放器或活动资源不唯一。');
+    if (roots.length !== 1 || cards.length !== 1 || cards[0] !== card) throw new Error('播放器或活动资源不唯一。');
     this.#root = roots[0]!;
-    this.#card = cards[0]!;
+    this.#card = card;
     const media = this.#root.querySelectorAll<HTMLVideoElement>(':scope > video.vjs-tech');
     if (media.length !== 1 || media[0]!.id !== expected.element_id) throw new Error('媒体元素身份已改变。');
     this.#video = media[0]!;
-    this.#basis = this.resourceBasis(this.#card);
+    this.#basis = this.resourceBasis();
     this.assertCurrent();
     for (const event of ['waiting', 'stalled']) this.listen(event, () => { this.#buffering = true; });
     for (const event of ['playing', 'canplay', 'ended']) this.listen(event, () => { this.#buffering = false; });
@@ -42,7 +41,8 @@ export class ZhidaoPlayerControls {
   private listen(event: string, listener: EventListener): void {
     this.#video.addEventListener(event, listener); this.#events.push([event, listener]);
   }
-  private resourceBasis(card: HTMLElement): string {
+  private resourceBasis(): string {
+    const card = this.#card;
     if (!isVisibleZhidaoPlayerElement(card)) throw new Error('当前资源卡片不可见。');
     const section = card.closest('.resources-section');
     const titles = section?.querySelectorAll<HTMLElement>(':scope > .resources-detail-title');
@@ -52,7 +52,17 @@ export class ZhidaoPlayerControls {
     const info = normalizedText(infos.length === 1 && isVisibleZhidaoPlayerElement(infos[0]!) ? infos[0]!.innerText : '');
     if (!['必学资源', '选学资源'].includes(group) || !info || icons.length !== 1 || !/\s\d{2}:\d{2}:\d{2}$/.test(info))
       throw new Error('当前视频资源分区、标题或时长无法确认。');
-    return JSON.stringify([group, info]);
+    const links = Array.from(card.querySelectorAll<HTMLAnchorElement>('a[href]')).map(link => link.href);
+    const numbered = publicResourceId(card, 'video', links);
+    const raw = this.#video.currentSrc || this.#video.src;
+    const source = raw ? publicMediaIdentity(new URL(raw, this.document.location.href).href) : null;
+    if (!source || source !== this.mediaIdentity || (numbered ?? `media:${source}`) !== this.resourceId)
+      throw new Error('当前公开资源编号或媒体身份已改变。');
+    const wrapper = this.#root.closest('.videoNameBox')?.parentElement;
+    const wrapperId = wrapper ? publicResourceId(wrapper, 'video') : null;
+    // 标题仅描述当前卡片，不用于全局唯一性判断；没有卡片编号时，
+    // 仍固定已观察到的公开播放器包装层编号，编号变化使旧租约失效。
+    return JSON.stringify([group, info, numbered, wrapperId, source]);
   }
   private assertCurrent(signal?: AbortSignal): ZhidaoPlayerReading {
     signal?.throwIfAborted();
@@ -61,15 +71,11 @@ export class ZhidaoPlayerControls {
       current.course_id !== this.#expected.course_id || current.point_id !== this.#expected.point_id ||
       current.context_id !== this.#expected.context_id || current.element_id !== this.#video.id ||
       this.#root.querySelector(':scope > video.vjs-tech') !== this.#video || !this.#card.classList.contains('active') ||
-      this.resourceBasis(this.#card) !== this.#basis ||
+      this.resourceBasis() !== this.#basis ||
       (this.#expected.duration !== null && current.duration !== this.#expected.duration)) throw new Error('当前课程、资源或媒体已改变，停止播放器操作。');
     const cards = Array.from(this.document.querySelectorAll<HTMLElement>('.resources-section .resources-list > .basic-info-video-card-container')).filter(isVisibleZhidaoPlayerElement);
     const active = cards.filter(card => card.classList.contains('active'));
     if (active.length !== 1 || active[0] !== this.#card) throw new Error('活动视频资源已改变或不唯一。');
-    const matching = cards.filter(card => {
-      try { return this.resourceBasis(card) === this.#basis; } catch { return false; }
-    });
-    if (matching.length !== 1 || matching[0] !== this.#card) throw new Error('当前视频资源身份存在歧义。');
     return current;
   }
   snapshot(): ZhidaoPlayerReading & { buffering: boolean; visible: boolean } {

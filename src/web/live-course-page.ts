@@ -11,6 +11,7 @@ import {captureVisualGeometry} from './visual-geometry';
 import {isExplicitlyHidden,normalizedText} from './dom-utils';
 import {chaoxingLessonTasks,chaoxingResourceTasks} from './chaoxing-course-tasks';
 import {coursePopupIdentity} from './course-popup-identity';
+import {requireResourceId,resolveChaoxingResourceFrame,resourceTaskId} from './course-resource-identity';
 
 export class LiveCoursePage {
   #initial:CourseCatalog|null=null;
@@ -58,7 +59,8 @@ export class LiveCoursePage {
   }
   private current(task:LearningTask):void {
     const catalog=this.catalog();
-    if(!catalog.tasks.some(parent=>parent.lesson_id===task.lesson_id)||task.id.split(':')[1]!==catalog.course_id)throw new Error('任务不属于本次公开课程目录。');
+    if(!catalog.tasks.some(parent=>parent.lesson_id===task.lesson_id&&parent.chapter_id===task.chapter_id))throw new Error('任务不属于本次公开课程目录。');
+    if(task.kind!=='lesson'&&task.kind!=='excluded')requireResourceId(task);
   }
   private async waitForLesson(task:LearningTask,signal:AbortSignal):Promise<void>{
     const deadline=Date.now()+30000;
@@ -85,10 +87,11 @@ export class LiveCoursePage {
     const cards=Array.from(section.querySelectorAll<HTMLElement>('.resources-list >.basic-info-video-card-container')).filter(card=>!isExplicitlyHidden(card));
     const requiredVideos=cards.filter(card=>card.querySelector(':scope >.video-wrap >.icon-box.video'));
     if(requiredVideos.length&&!this.document.querySelector('video.vjs-tech')){
-      requiredVideos[0]!.click();const deadline=Date.now()+15000;
+      if(!requiredVideos[0]!.classList.contains('active'))requiredVideos[0]!.click();const deadline=Date.now()+15000;
       while(!this.document.querySelector('video.vjs-tech')&&Date.now()<deadline){signal.throwIfAborted();await new Promise<void>(resolve=>setTimeout(resolve,100));}
       if(!this.document.querySelector('video.vjs-tech'))throw new Error('必学视频正常入口后播放器尚未加载。');
     }
+    if(requiredVideos.length)await this.#zhidao!.discover(signal);
     const videos=requiredVideos.length?this.#zhidao!.catalog().tasks.filter(resource=>resource.kind==='video').map(resource=>({...resource,chapter_id:task.chapter_id})):[];
     const excluded=cards.filter(card=>!requiredVideos.includes(card)).map((card):LearningTask=>{
       const title=normalizedText(card.querySelector(':scope >.video-info')?.textContent);
@@ -97,7 +100,8 @@ export class LiveCoursePage {
     });
     const nav=readZhidaoNavigation(this.document)!;
     const noPractice=/免考知识点[，,\s]*无练习题/.test(normalizedText(this.document.body?.innerText))&&!nav.improve_available;
-    return [...videos,...excluded,...(noPractice?[]:[{...task,id:`${task.id}:practice`,kind:'lesson_quiz' as const,title:`${task.title} · 关联首次练习`,order:cards.length,status:'not_started' as const,prerequisites:videos.map(video=>video.id)}])];
+    const practiceId=`knowledge:${task.lesson_id}:practice`;
+    return [...videos,...excluded,...(noPractice?[]:[{...task,id:resourceTaskId(task.id,'lesson_quiz',practiceId),resource_id:practiceId,kind:'lesson_quiz' as const,title:`${task.title} · 关联首次练习`,order:cards.length,status:'not_started' as const,prerequisites:videos.map(video=>video.id)}])];
   }
   quizRoot(task:LearningTask):HTMLElement {
     this.current(task);const cx=readChaoxingLearningPage(this.document);
@@ -105,9 +109,7 @@ export class LiveCoursePage {
       const popup=this.popup(task);if(!popup)throw new Error('视频弹题已经解除。');return popup.root;
     }
     if(!cx||cx.lesson_id!==task.lesson_id)throw new Error('关联测验课时身份改变。');
-    const cards=this.document.querySelector<HTMLIFrameElement>('iframe#iframe')?.contentDocument;
-    const modules=Array.from(cards?.querySelectorAll<HTMLIFrameElement>('iframe')??[]).filter(frame=>!isExplicitlyHidden(frame)&&new URL(frame.src,cards!.location.href).pathname==='/ananas/modules/work/index.html');
-    const index=Number(task.id.split(':').at(-1)),work=modules[index]?.contentDocument?.querySelector<HTMLIFrameElement>('iframe#frame_content')?.contentDocument;
+    const work=resolveChaoxingResourceFrame(this.document,'quiz',requireResourceId(task)).contentDocument?.querySelector<HTMLIFrameElement>('iframe#frame_content')?.contentDocument;
     const reading=work&&(readChaoxingPractice(work)||readChaoxingPracticeReview(work));
     if(!reading||reading.course_id!==cx.course_id||reading.lesson_id!==task.lesson_id||!work?.body)throw new Error('关联测验公开身份未确认。');
     return work.body;
@@ -116,9 +118,7 @@ export class LiveCoursePage {
     let scope:HTMLElement|null=this.document.querySelector('.videoNameBox');
     const cx=readChaoxingLearningPage(this.document);
     if(cx){
-      const cards=this.document.querySelector<HTMLIFrameElement>('iframe#iframe')?.contentDocument;
-      const frames=Array.from(cards?.querySelectorAll<HTMLIFrameElement>('iframe')??[]).filter(frame=>new URL(frame.src,cards!.location.href).pathname==='/ananas/modules/video/index.html');
-      scope=frames[Number(task.id.split(':').at(-1))]?.contentDocument?.body??null;
+      scope=resolveChaoxingResourceFrame(this.document,'video',requireResourceId(task)).contentDocument?.body??null;
     }
     const roots=[...new Set(Array.from(scope?.querySelectorAll<HTMLElement>('.radio-view,[role=dialog],.vjs-modal-dialog')??[]).map(root=>root.matches('.radio-view')?root.closest<HTMLElement>('[role=dialog],.vjs-modal-dialog')??root.parentElement:root))]
       .filter((root):root is HTMLElement=>Boolean(root)&&!isExplicitlyHidden(root!)&&Boolean(root!.querySelector('input[type=radio],input[type=checkbox],[role=radio],[role=checkbox],.radio-view >li')));
@@ -149,7 +149,15 @@ export class LiveCoursePage {
       const point=this.#initial.tasks.find(task=>task.lesson_id===nav.point_id)!;
       const page=new KnowledgePracticePage(this.document);
       const base={course_id:this.#initial.course_id,context_id:this.#initial.context_id!,point:{id:point.lesson_id,title:point.title,order:point.order}};
-      page.execute({operation:'pause',...base},signal);page.execute({operation:'directory',...base},signal);
+      const readyDeadline=Date.now()+30000;
+      for(;;){
+        signal.throwIfAborted();const state=page.state({operation:'state',...base});
+        page.execute({operation:'pause',...base},signal);
+        if(state.navigation.ready)break;
+        if(Date.now()>=readyDeadline)throw new Error('知识点返回目录前导航尚未就绪。');
+        await new Promise<void>(resolve=>setTimeout(resolve,100));
+      }
+      page.execute({operation:'directory',...base},signal);
       const deadline=Date.now()+30000;
       while(Date.now()<deadline){signal.throwIfAborted();const directory=readZhidaoDirectory(this.document);if(directory?.course_id===base.course_id&&directory.context_id===base.context_id&&directory.points.length)return true;await new Promise<void>(resolve=>setTimeout(resolve,200));}
       throw new Error('返回目录后知识点清单尚未加载。');
@@ -157,7 +165,7 @@ export class LiveCoursePage {
     const {task}=request;this.current(task);
     const currentCx=readChaoxingLearningPage(this.document);
     if(task.kind==='video'&&currentCx?.lesson_id===task.lesson_id){
-      const media=currentCx.videos[Number(task.id.split(':').at(-1))]?.media;if(!media)throw new Error('实际视频资源尚未加载。');
+      const media=currentCx.videos.find(video=>video.resource_id===requireResourceId(task))?.media;if(!media)throw new Error('实际视频资源尚未加载。');
       const expected=this.#mediaBindings.get(task.id)??task.resource_fingerprint;
       if(media.source_fingerprint){if(expected&&expected!==media.source_fingerprint)throw new Error('实际视频资源身份与选定任务不一致。');this.#mediaBindings.set(task.id,media.source_fingerprint);}
     }
@@ -166,10 +174,10 @@ export class LiveCoursePage {
       if(!popup?.boundary.rules.requires_rewatch)throw new Error('当前弹题没有明确回看要求。');
       const controls=Array.from(popup.root.querySelectorAll<HTMLElement>('button,[role=button],a,input[type=button]')).filter(element=>!isExplicitlyHidden(element)&&!element.hasAttribute('disabled')&&element.getAttribute('aria-disabled')!=='true'&&/^(?:回看|重新观看|返回观看|回看后重答)$/.test(normalizedText(element.innerText||element.getAttribute('value'))));
       if(controls.length!==1)throw new Error('网站正常回看控件不唯一。');
-      const before=currentCx?currentCx.videos[Number(task.id.split(':').at(-1))]?.media?.position:this.document.querySelector<HTMLVideoElement>('.videoNameBox video')?.currentTime;
+      const before=currentCx?currentCx.videos.find(video=>video.resource_id===requireResourceId(task))?.media?.position:this.document.querySelector<HTMLVideoElement>('.videoNameBox video')?.currentTime;
       if(before===undefined||!Number.isFinite(before)||before<=0)throw new Error('回看前实际播放位置未知。');
       controls[0]!.click();const deadline=Date.now()+10000;
-      while(Date.now()<deadline){signal.throwIfAborted();const cx=readChaoxingLearningPage(this.document),position=cx?cx.videos[Number(task.id.split(':').at(-1))]?.media?.position:this.document.querySelector<HTMLVideoElement>('.videoNameBox video')?.currentTime;
+      while(Date.now()<deadline){signal.throwIfAborted();const cx=readChaoxingLearningPage(this.document),position=cx?cx.videos.find(video=>video.resource_id===requireResourceId(task))?.media?.position:this.document.querySelector<HTMLVideoElement>('.videoNameBox video')?.currentTime;
         if(position!==undefined&&position<before&&!this.popup(task))return true;await new Promise<void>(resolve=>setTimeout(resolve,100));}
       return false;
     }
@@ -179,7 +187,7 @@ export class LiveCoursePage {
     if(request.operation==='enter'){
       const cx=readChaoxingLearningPage(this.document);
       if(cx){this.#video!.selectLesson(task.lesson_id,this.catalog().tasks.find(parent=>parent.lesson_id===task.lesson_id)!.title,signal);await this.waitForLesson(task,signal);
-        if(task.kind==='video')this.#video!.selectVideo(Number(task.id.split(':').at(-1)),signal);return true;}
+        if(task.kind==='video')this.#video!.selectVideo(requireResourceId(task),signal);return true;}
       const nav=readZhidaoNavigation(this.document)!;
       if(nav.stage==='directory')new KnowledgePracticePage(this.document).execute({operation:'enter',course_id:request.course_id,context_id:this.#initial!.context_id!,point:{id:task.lesson_id,title:task.title,order:task.order}},signal);
       await this.waitForLesson(task,signal);
@@ -199,12 +207,12 @@ export class LiveCoursePage {
       return result;
     }
     if(task.kind==='chapter_quiz'){
-      const root=this.quizRoot(task),review=readChaoxingPracticeReview(root.ownerDocument),quiz=cx.quizzes[Number(task.id.split(':').at(-1))]!;
+      const root=this.quizRoot(task),review=readChaoxingPracticeReview(root.ownerDocument),quiz=cx.quizzes.find(quiz=>quiz.resource_id===requireResourceId(task))!;
       if(request.operation==='quiz')return {id:task.id,course_id:cx.course_id,task_id:task.id,kind:'chapter_quiz',rules:{scored:true,retry_allowed:false,remaining_attempts:review?0:1,requires_pass:false,requires_rewatch:false}} satisfies QuizBoundary;
       if(request.operation==='verify')return {task_id:task.id,media_ended:false,progress_recorded:quiz.task_recorded===true,submission_confirmed:Boolean(review),completed:Boolean(review)&&quiz.task_recorded===true,passed:null,pending_grading:false,visible_score:review?`${review.score}/${review.maximum}`:null} satisfies CourseVerification;
       throw new Error('章节测验不支持播放器操作。');
     }
-    this.#video??=new ChaoxingVideoPage(this.document,cx.course_id,cx.class_id);this.#video.selectVideo(Number(task.id.split(':').at(-1)),signal);
+    this.#video??=new ChaoxingVideoPage(this.document,cx.course_id,cx.class_id);this.#video.selectVideo(requireResourceId(task),signal);
     if(request.operation==='speed_target'){
       const point=this.#video.hoverPoint(signal),geometry=captureVisualGeometry(this.document,null);
       geometry.region={x:0,y:0,width:geometry.viewport.width,height:geometry.viewport.height};
@@ -213,7 +221,7 @@ export class LiveCoursePage {
     if(request.operation==='mute'){this.#video.mute(signal,request.tab_muted===true);return true;}
     if(request.operation==='speed')return true;
     if(request.operation==='play'){await this.#video.play(signal,request.hover_at??this.#inputAt,request.tab_muted===true);return true;}
-    if(request.operation==='pause'){this.#video.selectVideo(Number(task.id.split(':').at(-1)),signal);return this.#video.pause(signal);}
+    if(request.operation==='pause')return this.#video.pause(signal);
     const snapshot=this.#video.snapshot(),media=snapshot.media;if(!media)throw new Error('视频媒体尚未就绪。');
     if(request.operation==='video'){
       this.#inputAt=request.hover_at??0;

@@ -1,5 +1,5 @@
 import { cp, mkdir, readFile, writeFile,rename,lstat } from "node:fs/promises";
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { resolve,relative,isAbsolute,dirname } from "node:path";
 
 import { build } from "esbuild";
@@ -15,12 +15,13 @@ if(destination!==resolve(root,'dist')&&!destination.startsWith(resolve(root,'.br
 for(let path=destination;path!==dirname(root);path=dirname(path)){
   try{if((await lstat(path)).isSymbolicLink())throw new Error('Build path contains a reparse point.');}catch(error){if(error.code!=='ENOENT')throw error;}
 }
-const runDirectory=resolve(root,'.browser-regression-runtime',`build-${Date.now()}-${process.pid}`);
+const buildId=randomUUID();
+const runDirectory=resolve(root,'.browser-regression-runtime',`build-${buildId}`);
 const outputDirectory=resolve(runDirectory,'extension');
 await mkdir(outputDirectory, { recursive: true });
 await generateIcons(resolve(root, "static"));
 
-const buildId = await sourceFingerprint(root);
+const sourceHash=await sourceFingerprint(root);
 
 const common = {
   bundle: true,
@@ -28,7 +29,7 @@ const common = {
   sourcemap: false,
   minify: true,
   legalComments: "none",
-  define: { __VV_BUILD_ID__: JSON.stringify(buildId),__VV_TEST_BUILD__:process.env.VV_TEST_BUILD==='1'?'true':'false' },
+  define: { __VV_BUILD_ID__: JSON.stringify(buildId) },
 };
 
 await Promise.all([
@@ -79,11 +80,13 @@ const artifacts = {};
 for (const name of ['background.js', 'content.js', 'popup.js', 'tasks.js', 'options.js']) {
   artifacts[name] = createHash('sha256').update(await readFile(resolve(outputDirectory, name))).digest('hex');
 }
-await writeFile(resolve(outputDirectory, 'build-info.json'), JSON.stringify({ build_id: buildId, built_at: new Date().toISOString(), strategy: 'unattended',test_build:process.env.VV_TEST_BUILD==='1', artifacts }, null, 2));
+const pkg=JSON.parse(await readFile(resolve(root,'package.json'),'utf8'));
+const metadata={version:pkg.version,build_id:buildId,built_at:new Date().toISOString(),strategy:'unattended',test_build:false};
+await writeFile(resolve(outputDirectory, 'build-info.json'), JSON.stringify(metadata, null, 2));
 let existing=false;
 try {const stat=await lstat(destination);if(!stat.isDirectory()||stat.isSymbolicLink())throw new Error('Build destination is not an ordinary directory.');existing=true;}catch(error){if(error.code!=='ENOENT')throw error;}
 const previous=resolve(runDirectory,'previous');
 await mkdir(dirname(destination),{recursive:true});
 if(existing)await rename(destination,previous);
 try{await rename(outputDirectory,destination);}catch(error){if(existing)await rename(previous,destination);throw error;}
-await writeFile(resolve(runDirectory,'report.json'),JSON.stringify({build_id:buildId,destination,previous:existing?previous:null},null,2));
+await writeFile(resolve(runDirectory,'report.json'),JSON.stringify({...metadata,source_fingerprint:sourceHash,artifacts,destination,previous:existing?previous:null},null,2));

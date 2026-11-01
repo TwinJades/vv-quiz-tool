@@ -1,10 +1,11 @@
 import {isExplicitlyHidden,normalizedText} from './dom-utils';
 import {readChaoxingLearningPage} from './chaoxing-learning-page';
 import {ChaoxingPlayerControls} from './chaoxing-player-controls';
+import {resolveChaoxingResourceFrame} from './course-resource-identity';
 
 export class ChaoxingVideoPage {
   #controls:ChaoxingPlayerControls|null=null;
-  #selected=-1;
+  #selected:string|null=null;
   constructor(private readonly document:Document,private readonly courseId:string,private readonly classId:string){}
 
   reading(){
@@ -37,32 +38,33 @@ export class ChaoxingVideoPage {
     this.pauseAll(signal);
     const rows=Array.from(this.document.querySelectorAll<HTMLElement>('.posCatalog_select[id^="cur"]')).filter(row=>row.id===`cur${id}`&&!isExplicitlyHidden(row));
     if(rows.length!==1)throw new Error('正常课时入口不唯一。');
-    this.#controls=null;this.#selected=-1;
-    rows[0]!.click();
+    this.#controls=null;this.#selected=null;
+    const entry=rows[0]!.querySelector<HTMLElement>(':scope > .posCatalog_name');
+    if(!entry)throw new Error('课时标题入口尚未加载。');
+    entry.click();
   }
 
-  selectVideo(index:number,signal?:AbortSignal):void {
+  selectVideo(resourceId:string,signal?:AbortSignal):void {
     const reading=this.reading();
-    if(signal&&this.#selected!==index)for(const video of reading.videos)if(video.index!==index)new ChaoxingPlayerControls(this.document,reading,video.index).pause(signal);
-    if(this.#selected===index&&this.#controls){this.#controls.snapshot();return;}
-    this.#controls=new ChaoxingPlayerControls(this.document,reading,index);this.#selected=index;
+    if(signal&&this.#selected!==resourceId)for(const video of reading.videos)if(video.resource_id&&video.resource_id!==resourceId&&video.media&&!video.media.paused)new ChaoxingPlayerControls(this.document,reading,video.resource_id).pause(signal);
+    if(this.#selected===resourceId&&this.#controls){this.#controls.snapshot();return;}
+    this.#controls=new ChaoxingPlayerControls(this.document,reading,resourceId);this.#selected=resourceId;
   }
 
   private controls():ChaoxingPlayerControls {
-    if(!this.#controls||this.#selected<0)throw new Error('请先绑定当前视频。');
+    if(!this.#controls||!this.#selected)throw new Error('请先绑定当前视频。');
     this.#controls.snapshot();return this.#controls;
   }
 
   snapshot(){
     const reading=this.controls().snapshot();
-    const video=reading.videos[this.#selected]!;
-    const cards=this.document.querySelector<HTMLIFrameElement>('iframe#iframe')!.contentDocument!;
-    const frame=Array.from(cards.querySelectorAll<HTMLIFrameElement>('iframe')).filter(frame=>!isExplicitlyHidden(frame)&&new URL(frame.src,cards.location.href).pathname==='/ananas/modules/video/index.html')[this.#selected]!;
+    const video=reading.videos.find(video=>video.resource_id===this.#selected)!;
+    const frame=resolveChaoxingResourceFrame(this.document,'video',this.#selected!);
     const doc=frame.contentDocument!;
     const choices=Array.from(doc.querySelectorAll<HTMLElement>('input[type="radio"],input[type="checkbox"],[role="radio"],[role="checkbox"]')).filter(element=>!isExplicitlyHidden(element));
     const dialogs=Array.from(doc.querySelectorAll<HTMLElement>('[role="dialog"],.vjs-modal-dialog')).filter(element=>!isExplicitlyHidden(element));
     return {course_id:reading.course_id,class_id:reading.class_id,lesson_id:reading.lesson_id,title:reading.lesson_title,
-      index:this.#selected,video_count:reading.videos.length,observed_at:reading.observed_at,hidden:this.document.hidden,
+      resource_id:this.#selected,video_count:reading.videos.length,observed_at:reading.observed_at,hidden:this.document.hidden,
       focused:this.document.hasFocus(),task_recorded:video.task_recorded,media:video.media,
       blocked:choices.length>0||dialogs.length>0,visible_feedback:normalizedText(doc.body?.innerText).slice(0,500)};
   }
@@ -73,6 +75,6 @@ export class ChaoxingVideoPage {
   pause(signal:AbortSignal){return this.controls().pause(signal);}
   pauseAll(signal:AbortSignal):void {
     const reading=this.reading();
-    for(let index=0;index<reading.videos.length;index++)new ChaoxingPlayerControls(this.document,reading,index).pause(signal);
+    for(const video of reading.videos)if(video.media&&!video.media.paused){if(!video.resource_id)throw new Error('正在播放的视频缺少公开编号。');new ChaoxingPlayerControls(this.document,reading,video.resource_id).pause(signal);}
   }
 }

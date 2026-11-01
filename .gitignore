@@ -7,3 +7,4 @@ dist/
 .edge-real-regression-profile/
 .pnpm-store/
 /AGENTS.md
+.scratch/

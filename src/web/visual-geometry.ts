@@ -13,7 +13,7 @@ export function captureVisualGeometry(document: Document, blocker: string | null
   const y = canvas ? Math.max(0, canvas.y) : 0;
   // A diagram inside a clearly marked DOM question keeps semantic execution.
   // A standalone game canvas takes priority over unrelated settings/forms.
-  const markedQuestion = Array.from(document.querySelectorAll("[data-vv-question],[data-question],[data-question-id],.h5p-question,.quiz-question,.question-card,fieldset,[role='radiogroup']"))
+  const markedQuestion = Array.from(document.querySelectorAll("[data-question],[data-question-id],.h5p-question,.quiz-question,.question-card,fieldset,[role='radiogroup']"))
     .some(root => visible(root) && root.getBoundingClientRect().width>0 && root.getBoundingClientRect().height>0 &&
       Array.from(root.querySelectorAll("input,textarea,select,[role='radio'],[role='checkbox'],[contenteditable='true']")).some(visible));
   const canvasSurface = Boolean(canvas&&canvas.width*canvas.height>=40000&&!markedQuestion);

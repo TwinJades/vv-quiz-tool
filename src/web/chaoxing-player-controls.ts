@@ -1,26 +1,25 @@
 import {readChaoxingLearningPage, type ChaoxingLearningReading} from './chaoxing-learning-page';
 import {isExplicitlyHidden} from './dom-utils';
+import {resolveChaoxingResourceFrame,chaoxingFrameResourceId} from './course-resource-identity';
+import {projectCourseFrame} from './frame-projection';
 
 export class ChaoxingPlayerControls {
   readonly #video:HTMLVideoElement;
   readonly #playerDocument:Document;
   readonly #identity:string;
-  readonly #index:number;
-  readonly #count:number;
+  readonly #resourceId:string;
 
-  constructor(private readonly document:Document,expected:ChaoxingLearningReading,index=0){
+  constructor(private readonly document:Document,expected:ChaoxingLearningReading,resourceId:string){
     this.#identity=JSON.stringify([expected.course_id,expected.class_id,expected.lesson_id]);
-    this.#index=index;this.#count=expected.videos.length;
+    this.#resourceId=resourceId;
     const reading=readChaoxingLearningPage(document);
-    if(!reading||JSON.stringify([reading.course_id,reading.class_id,reading.lesson_id])!==this.#identity||reading.videos.length!==this.#count||
-      !Number.isInteger(index)||index<0||index>=this.#count)
+    if(!reading||JSON.stringify([reading.course_id,reading.class_id,reading.lesson_id])!==this.#identity||reading.videos.filter(video=>video.resource_id===resourceId).length!==1)
       throw new Error('当前课程、课时或播放器身份失配。');
     const cards=document.querySelector<HTMLIFrameElement>('iframe#iframe')?.contentDocument;
     if(!cards)throw new Error('课时页面尚未就绪。');
-    const frames=Array.from(cards.querySelectorAll<HTMLIFrameElement>('iframe')).filter(frame=>
-      !isExplicitlyHidden(frame)&&new URL(frame.src,cards.location.href).pathname==='/ananas/modules/video/index.html');
-    if(frames.length!==this.#count||!frames[index]!.contentDocument)throw new Error('播放器页面无法唯一确认。');
-    this.#playerDocument=frames[index]!.contentDocument;
+    const frame=resolveChaoxingResourceFrame(document,'video',resourceId);
+    if(!frame.contentDocument)throw new Error('播放器页面无法唯一确认。');
+    this.#playerDocument=frame.contentDocument;
     const videos=Array.from(this.#playerDocument.querySelectorAll<HTMLVideoElement>('video.vjs-tech')).filter(video=>!isExplicitlyHidden(video));
     if(videos.length!==1)throw new Error('视频无法唯一确认。');
     this.#video=videos[0]!;
@@ -28,8 +27,9 @@ export class ChaoxingPlayerControls {
 
   snapshot():ChaoxingLearningReading {
     const reading=readChaoxingLearningPage(this.document);
+    const frame=this.#playerDocument.defaultView?.frameElement as HTMLIFrameElement|null;
     if(!reading||JSON.stringify([reading.course_id,reading.class_id,reading.lesson_id])!==this.#identity||
-      reading.videos.length!==this.#count||!this.#video.isConnected||this.#playerDocument.defaultView?.frameElement?.ownerDocument!==
+      reading.videos.filter(video=>video.resource_id===this.#resourceId).length!==1||!this.#video.isConnected||!frame||frame.contentDocument!==this.#playerDocument||chaoxingFrameResourceId(frame,'video')!==this.#resourceId||frame.ownerDocument!==
       this.document.querySelector<HTMLIFrameElement>('iframe#iframe')?.contentDocument)
       throw new Error('课时或播放器已经改变，请重新观察页面。');
     return reading;
@@ -98,11 +98,13 @@ export class ChaoxingPlayerControls {
     signal.throwIfAborted();this.snapshot();
     const cardsFrame=this.document.querySelector<HTMLIFrameElement>('iframe#iframe')!;
     const videoFrame=this.#playerDocument.defaultView!.frameElement as HTMLIFrameElement;
-    const outer=cardsFrame.getBoundingClientRect(),inner=videoFrame.getBoundingClientRect(),media=this.#video.getBoundingClientRect();
-    const x0=outer.left+cardsFrame.clientLeft+inner.left+videoFrame.clientLeft;
-    const y0=outer.top+cardsFrame.clientTop+inner.top+videoFrame.clientTop;
-    const left=Math.max(0,x0+media.left),top=Math.max(0,y0+media.top);
-    const right=Math.min(this.document.defaultView!.innerWidth,x0+media.right),bottom=Math.min(this.document.defaultView!.innerHeight,y0+media.bottom);
+    const media=this.#video.getBoundingClientRect();
+    let projected={point:{x:media.x+media.width/2,y:media.y+media.height/2},region:{x:media.x,y:media.y,width:media.width,height:media.height}};
+    for(const frame of [videoFrame,cardsFrame]){
+      const rect=frame.getBoundingClientRect();projected=projectCourseFrame(projected.point,projected.region,{rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height},width:frame.offsetWidth,height:frame.offsetHeight,left:frame.clientLeft,top:frame.clientTop});
+    }
+    const left=Math.max(0,projected.region.x),top=Math.max(0,projected.region.y);
+    const right=Math.min(this.document.defaultView!.innerWidth,projected.region.x+projected.region.width),bottom=Math.min(this.document.defaultView!.innerHeight,projected.region.y+projected.region.height);
     if(right<=left||bottom<=top)throw new Error('播放器位于视口之外，无法正常悬停。');
     return {x:(left+right)/2,y:(top+bottom)/2,captured_at:Date.now()};
   }
