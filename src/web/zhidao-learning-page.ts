@@ -2,7 +2,7 @@ import type { CourseCatalog, CourseVerification, LearningTask, VideoSnapshot } f
 import type { CoursePageRequest, CoursePageResult } from './course-adapter';
 import { normalizedText } from './dom-utils';
 import { readZhidaoDirectory } from './zhidao-directory';
-import { readZhidaoNavigation, resolveZhidaoLearnerReturn } from './zhidao-navigation';
+import { isZhidaoPptLearner, readZhidaoNavigation, resolveZhidaoLearnerReturn } from './zhidao-navigation';
 import { readZhidaoPlayer, isVisibleZhidaoPlayerElement as visible } from './zhidao-player';
 import { ZhidaoPlayerControls } from './zhidao-player-controls';
 import { captureVisualGeometry } from './visual-geometry';
@@ -16,12 +16,12 @@ export class ZhidaoLearningPage {
   #point: string | null=null;
   #context: string | null=null;
   #controls: ZhidaoPlayerControls | null=null;
-  #media: HTMLVideoElement | null=null;
+  #lease: {card:HTMLElement;media:HTMLVideoElement;resourceId:string;source:string;course:string;point:string;context:string} | null=null;
   #cards=new Map<string,HTMLElement>();
   #identities=new WeakMap<HTMLElement,string>();
   #sources=new Map<string,string>();
   constructor(private readonly document:Document){}
-  close():void {this.#controls?.close();this.#controls=null;this.#media=null;}
+  close():void {this.#controls?.close();this.#controls=null;this.#lease=null;}
   handles():boolean {
     const nav=readZhidaoNavigation(this.document);
     return nav?.stage==='learner' && nav.ready || Boolean(this.#catalog&&nav?.stage==='directory');
@@ -39,24 +39,36 @@ export class ZhidaoLearningPage {
     const nav=readZhidaoNavigation(this.document);
     if(!nav?.ready||nav.stage!=='learner'||!nav.point_id)throw new Error('知识点资源页尚未加载。');
     const original=this.requiredCards().find(card=>card.classList.contains('active'));
-    const pause=()=>{for(const video of this.document.querySelectorAll<HTMLVideoElement>('.videoNameBox video'))video.pause();};
+    const originalIsVideo=Boolean(original?.querySelector(':scope >.video-wrap >.icon-box.video'));
+    const originalIsPpt=Boolean(original&&!originalIsVideo&&isZhidaoPptLearner(this.document));
+    const pause=()=>{for(const video of this.document.querySelectorAll<HTMLVideoElement>('.videoNameBox video.vjs-tech'))if(!video.paused)video.pause();};
     const check=()=>{signal.throwIfAborted();const current=readZhidaoNavigation(this.document);if(current?.course_id!==nav.course_id||current.context_id!==nav.context_id||current.point_id!==nav.point_id)throw new Error('资源发现期间课程身份已经改变。');};
     const capture=async(card:HTMLElement)=>{
       check();if(!card.isConnected||!visible(card))throw new Error('资源入口已改变，请重新加载课程。');
       pause();const oldMedia=this.document.querySelector<HTMLVideoElement>('.videoNameBox video');const oldSource=oldMedia?.currentSrc||oldMedia?.src;
-      const wasActive=card.classList.contains('active');if(!wasActive)card.click();
+      const wasActive=card.classList.contains('active');if(!wasActive){this.close();card.click();}
       await this.ready(()=>{check();pause();const media=this.document.querySelector<HTMLVideoElement>('.videoNameBox video');const source=media?.currentSrc||media?.src;
         return card.classList.contains('active')&&Boolean(media&&media.readyState>=1&&source&&(wasActive||media!==oldMedia||source!==oldSource));},signal);
       const media=this.document.querySelector<HTMLVideoElement>('.videoNameBox video')!;
       const source=publicMediaIdentity(new URL(media.currentSrc||media.src,this.document.location.href).href);
-      const id=publicResourceId(card,'video')??(source?`media:${source}`:null);
-      if(!id)throw new Error('必学视频缺少公开编号和稳定媒体地址。');
-      this.#identities.set(card,id);if(source)this.#sources.set(id,source);pause();
+      if(!source)throw new Error('必学视频缺少稳定媒体身份。');
+      const links=Array.from(card.querySelectorAll<HTMLAnchorElement>('a[href]')).map(link=>link.href);
+      const id=publicResourceId(card,'video',links)??`media:${source}`;
+      const expected=this.#sources.get(id);
+      if(expected&&expected!==source)throw new Error('资源发现期间视频媒体身份已经改变。');
+      this.#identities.set(card,id);this.#sources.set(id,source);pause();
     };
     signal.addEventListener('abort',pause,{once:true});
     try{
       for(const card of this.requiredCards().filter(card=>card.querySelector(':scope >.video-wrap >.icon-box.video'))){check();if(!this.cardId(card))await capture(card);}
-      if(original?.isConnected&&!original.classList.contains('active'))await capture(original);
+      if(original?.isConnected&&!original.classList.contains('active')){
+        if(originalIsVideo)await capture(original);
+        else if(originalIsPpt){
+          // PPT 只核对真实导航预览，不等待视频，也不生成媒体身份。
+          check();pause();this.close();original.click();
+          await this.ready(()=>{check();pause();return original.classList.contains('active')&&readZhidaoNavigation(this.document)?.ready===true&&isZhidaoPptLearner(this.document);},signal);
+        }else throw new Error('原活动资源类型尚未核对，无法恢复。');
+      }
       check();this.catalog();
     }finally{pause();signal.removeEventListener('abort',pause);}
   }
@@ -73,7 +85,7 @@ export class ZhidaoLearningPage {
     if(this.#catalog&&(nav.course_id!==this.#catalog.course_id||nav.point_id!==this.#point||nav.context_id!==this.#context))
       throw new Error('当前知识点已改变，请重新预览并选择范围。');
     const titles=Array.from(this.document.querySelectorAll<HTMLElement>('.videoNameBox.able-player-container')).filter(visible);
-    if(titles.length!==1)throw new Error('知到播放器范围不唯一。');
+    if(isZhidaoPptLearner(this.document)?titles.length!==0:titles.length!==1)throw new Error('知到资源预览范围不唯一。');
     const sections=Array.from(this.document.querySelectorAll<HTMLElement>('.resources-section')).filter(visible);
     const required=sections.filter(s=>normalizedText(s.querySelector(':scope >.resources-detail-title')?.textContent)==='必学资源');
     if(required.length!==1)throw new Error('必学资源分区缺失或不唯一。');
@@ -123,10 +135,17 @@ export class ZhidaoLearningPage {
     if(!card?.classList.contains('active')||!reading||!media)throw new Error('当前活动视频不属于所选任务。');
     const rawSource=media.currentSrc||media.src;if(!rawSource)throw new Error('活动视频媒体地址尚未加载。');
     const source=publicMediaIdentity(new URL(rawSource,this.document.location.href).href),resourceId=requireResourceId(task),expected=this.#sources.get(resourceId);
-    if(resourceId.startsWith('media:')&&resourceId!==`media:${source}`||expected&&expected!==source)throw new Error('活动播放器媒体与资源身份不一致。');
-    if(this.#media!==media||!this.#controls){this.#controls?.close();this.#media=media;this.#controls=new ZhidaoPlayerControls(this.document,reading,async()=>{
-      if(!readZhidaoPlayer(this.document)?.speed_menu_visible)throw new Error('正常倍速菜单没有展开。');
-    });}
+    if(!source||this.cardId(card)!==resourceId||resourceId.startsWith('media:')&&resourceId!==`media:${source}`||expected&&expected!==source)
+      throw new Error('活动播放器媒体与资源身份不一致。');
+    this.#sources.set(resourceId,source);
+    // 播放器可能复用同一媒体 DOM；卡片或资源身份改变时必须重建租约。
+    const lease=this.#lease;
+    if(!this.#controls||!lease||lease.media!==media||lease.card!==card||lease.resourceId!==resourceId||lease.source!==source||
+      lease.course!==reading.course_id||lease.point!==reading.point_id||lease.context!==reading.context_id){
+      this.close();
+      this.#controls=new ZhidaoPlayerControls(this.document,reading,card,resourceId,source);
+      this.#lease={card,media,resourceId,source,course:reading.course_id,point:reading.point_id,context:reading.context_id};
+    }
     return this.#controls;
   }
   private async ready(predicate:()=>boolean,signal:AbortSignal):Promise<void>{
@@ -147,7 +166,7 @@ export class ZhidaoLearningPage {
       if(!nav||nav.course_id!==request.course_id)throw new Error('课程改变。');
       const media=this.document.querySelector<HTMLVideoElement>('.videoNameBox video');
       if(media&&!media.paused&&!media.ended)throw new Error('离开学习页前视频尚未暂停。');
-      resolveZhidaoLearnerReturn(this.document,nav).click();this.#controls?.close();this.#controls=null;this.#media=null;
+      resolveZhidaoLearnerReturn(this.document,nav).click();this.close();
       await this.ready(()=>readZhidaoDirectory(this.document)?.course_id===request.course_id,signal);return true;
     }
     const {course_id,task}=request;
@@ -162,7 +181,7 @@ export class ZhidaoLearningPage {
       }
       const card=this.#cards.get(task.id);if(!card||!visible(card))throw new Error('所选视频卡片不存在。');
       if(!card.classList.contains('active')){
-        this.#controls?.close();this.#controls=null;this.#media=null;card.click();
+        this.close();card.click();
         await this.ready(()=>{
           if(!card.classList.contains('active')||!readZhidaoPlayer(this.document))return false;
           const media=this.document.querySelector<HTMLVideoElement>('.videoNameBox video'),raw=media?.currentSrc||media?.src;

@@ -80,7 +80,7 @@ export class CourseTabPlatform implements CourseAdapter {
     const deadline=Date.now()+30000;let snapshot:CourseSurfaceSnapshot;
     for(;;){
       signal.throwIfAborted();snapshot=await send<CourseSurfaceSnapshot>(this.tabId,frame,{type:'VV_CAPTURE_COURSE_SURFACE',session_id:this.sessionId,intent,...(context?{context}:{})},signal);
-      if(snapshot.native_reading||snapshot.elements.length>3&&(snapshot.visible_text.trim()||snapshot.elements.some(element=>element.tag==='video')))break;
+      if(snapshot.native_reading?(!snapshot.native_reading.busy||snapshot.native_reading.lessons.length>0||snapshot.native_reading.controls.length>0):snapshot.elements.length>3&&(snapshot.visible_text.trim()||snapshot.elements.some(element=>element.tag==='video')))break;
       if(Date.now()>=deadline)throw new Error('课程导航后实际页面未就绪。');await new Promise<void>(resolve=>setTimeout(resolve,200));
     }
     if(this.#activeTask)snapshot.active_task={id:this.#activeTask.id,lesson_id:this.#activeTask.lesson_id,kind:this.#activeTask.kind,title:this.#activeTask.title};
@@ -88,6 +88,10 @@ export class CourseTabPlatform implements CourseAdapter {
     const fingerprint=courseSurfaceFingerprint(snapshot),old=this.#surfaceCache.get(frame);
     const reusable=old?.fingerprint===fingerprint&&old.intent===intent;
     const reading=snapshot.native_reading??(reusable?{...old!.reading,capture_id:snapshot.capture_id}:await this.recognize(snapshot,signal));
+    if(snapshot.native_reading&&reading.title===`课程 ${reading.course_id}`){
+      const tab=await chrome.tabs.get(this.tabId);signal.throwIfAborted();
+      if(tab.title?.trim()&&tab.url&&courseSnapshotHasIdentity({capture_id:snapshot.capture_id,url:tab.url,title:tab.title,native:snapshot.native,visible_text:'',elements:[]},reading.course_id,reading.context_id))reading.title=tab.title.trim();
+    }
     if(this.#catalog&&(reading.course_id!==this.#catalog.course_id||reading.context_id!==(this.#catalog.context_id??null)))throw new Error('当前页面课程或班级身份已改变。');
     await send(this.tabId,frame,{type:'VV_APPLY_COURSE_SURFACE',session_id:this.sessionId,reading},signal);
     if(intent!=='directory'){
@@ -140,7 +144,10 @@ export class CourseTabPlatform implements CourseAdapter {
     while(Date.now()<deadline){
       const reading=await this.#surface(this.#frame,signal,undefined,'directory');signal.throwIfAborted();
       if(reading.current_lesson_id===task.lesson_id||reading.lessons.some(row=>row.id===task.lesson_id))return;
-      if(!reading.lessons.length)throw new Error('当前课程目录尚未显示选定课时。');
+      if(!reading.lessons.length){
+        if(reading.controls.some(control=>control.role==='directory'||control.role==='back')){await this.returnToCatalog(signal);continue;}
+        throw new Error('当前课程目录尚未显示选定课时。');
+      }
       if(direction==='previous'&&!reading.previous_id)direction='next';
       const signature=JSON.stringify(reading.lessons.map(row=>row.id));unchanged=signature===last?unchanged+1:0;last=signature;
       if(unchanged>10)throw new Error('课程分页没有继续加载。');
@@ -241,6 +248,7 @@ export class CourseTabPlatform implements CourseAdapter {
         if((await chrome.tabs.get(this.tabId)).status!=='complete'){await new Promise<void>(resolve=>setTimeout(resolve,200));continue;}
         await this.enableInteraction();
         const reading=await this.#surface(this.#frame,signal,undefined,!task||task.kind==='lesson'?'directory':'task');if(observed&&(reading.course_id!==observed.course_id||reading.context_id!==observed.context_id))throw new Error('正常导航后课程或班级身份已改变。');
+        if(task)await this.waitForTask(task,signal);
         return;
       }
       await new Promise<void>(resolve=>setTimeout(resolve,200));
@@ -295,6 +303,17 @@ export class CourseTabPlatform implements CourseAdapter {
     }
     throw new Error('课时资源定位超时。');
   }
+  private async waitForTask(task:LearningTask,signal:AbortSignal):Promise<void>{
+    const deadline=Date.now()+30000;
+    while(Date.now()<deadline){
+      signal.throwIfAborted();
+      const reading=await this.#surface(this.#frame,signal,undefined,task.kind==='lesson'?'directory':'task');
+      if(reading.current_lesson_id===task.lesson_id&&(task.kind==='lesson'||this.#catalog?.page_type!=='zhidao_shared'||reading.current_resource_id===requireResourceId(task)))return;
+      // Chrome 120 的计时器等待需要 Promise executor。
+      await new Promise<void>(resolve=>setTimeout(resolve,200));
+    }
+    throw new Error('课程导航后课时身份尚未就绪。');
+  }
   async enter(task:LearningTask,signal:AbortSignal):Promise<void>{
     this.#activeTask=task;
     if(task.kind==='lesson_quiz'||task.kind==='chapter_quiz'){
@@ -320,9 +339,23 @@ export class CourseTabPlatform implements CourseAdapter {
     const before=await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:this.#frame});
     try {
       await this.#page({operation:'enter',course_id:this.courseId,task},signal);
-      const deadline=Date.now()+30000;
-      while(Date.now()<deadline){signal.throwIfAborted();const reading=await this.#surface(this.#frame,signal,undefined,task.kind==='lesson'?'directory':'task');if(reading.current_lesson_id===task.lesson_id&&(task.kind==='lesson'||this.#catalog?.page_type!=='zhidao_shared'||reading.current_resource_id===requireResourceId(task)))return;await new Promise<void>(resolve=>setTimeout(resolve,200));}
-      throw new Error('课程导航后课时身份尚未就绪。');
+      await this.waitForTask(task,signal);
+      if(task.kind==='lesson'&&this.#catalog?.page_type==='zhidao_ai'){
+        const selected=await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:this.#frame});signal.throwIfAborted();
+        if(!selected?.documentId)throw new Error('知到课时页面文档身份缺失。');
+        const url=new URL(selected.url),path=url.pathname.split('/').filter(Boolean);
+        if(url.origin!=='https://ai-smart-course-student-pro.zhihuishu.com'||path.length!==4||path[0]!=='learnPage'||path[1]!==this.courseId||path[2]!==task.lesson_id||path[3]!==this.#catalog.context_id)throw new Error('知到实际课时入口与选定范围不一致。');
+        // 完整导航释放网站遗留的播放器实例，避免新课时复用已移除的媒体。
+        await chrome.tabs.update(this.tabId,{url:selected.url});signal.throwIfAborted();
+        const deadline=Date.now()+30000;
+        for(;;){
+          const frame=await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:this.#frame});signal.throwIfAborted();
+          if(frame?.documentId&&frame.documentId!==selected.documentId&&(await chrome.tabs.get(this.tabId)).status==='complete')break;
+          if(Date.now()>=deadline)throw new Error('知到课时完整导航尚未完成。');
+          await new Promise<void>(resolve=>setTimeout(resolve,100));
+        }
+        await this.enableInteraction();await this.waitForTask(task,signal);
+      }
     }
     catch(error){await this.reconcileNavigation(before,task,error,signal);}
   }
@@ -371,7 +404,21 @@ export class CourseTabPlatform implements CourseAdapter {
     }
     this.#surfaceCache.clear();return true;
   }
-  async verify(task:LearningTask,signal:AbortSignal):Promise<CourseVerification>{await this.#authorize(signal);return this.quizResults.get(task.id)??this.#page({operation:'verify',course_id:this.courseId,task},signal);}
+  async verify(task:LearningTask,signal:AbortSignal):Promise<CourseVerification>{
+    await this.#authorize(signal);
+    const cached=this.quizResults.get(task.id);if(cached)return cached;
+    const record=await this.#page<CourseVerification>({operation:'verify',course_id:this.courseId,task},signal);
+    if(record.task_id!==task.id)throw new Error('平台记录不属于当前任务。');
+    if(task.kind!=='video')return record;
+    const parent=await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:this.#frame});signal.throwIfAborted();
+    const target=await this.resourceFrame('video',task,signal);
+    if(target===this.#frame)return record;
+    const video=await send<VideoSnapshot>(this.tabId,target,{type:'VV_COURSE',request:{operation:'video',course_id:this.courseId,task},session_id:this.sessionId,interaction_epoch:this.#epoch},signal);
+    const frame=await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:target});
+    const currentParent=await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:this.#frame});signal.throwIfAborted();
+    if(!parent?.documentId||currentParent?.documentId!==parent.documentId||!frame?.documentId||this.#resourceBindings.get(target)?.document_id!==frame.documentId||video.course_id!==this.courseId||video.task_id!==task.id||!video.video_id||Date.now()-video.observed_at>5000||Date.now()<video.observed_at||task.resource_fingerprint&&video.resource_fingerprint!==task.resource_fingerprint)throw new Error('跨框架核验时视频身份或文档已经改变。');
+    return {...record,media_ended:video.ended};
+  }
   async returnToCatalog(signal:AbortSignal):Promise<void>{
     const before=await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:this.#frame});
     try {await this.#page({operation:'directory',course_id:this.courseId},signal);}

@@ -87,7 +87,7 @@ export class LiveCoursePage {
     const cards=Array.from(section.querySelectorAll<HTMLElement>('.resources-list >.basic-info-video-card-container')).filter(card=>!isExplicitlyHidden(card));
     const requiredVideos=cards.filter(card=>card.querySelector(':scope >.video-wrap >.icon-box.video'));
     if(requiredVideos.length&&!this.document.querySelector('video.vjs-tech')){
-      requiredVideos[0]!.click();const deadline=Date.now()+15000;
+      if(!requiredVideos[0]!.classList.contains('active'))requiredVideos[0]!.click();const deadline=Date.now()+15000;
       while(!this.document.querySelector('video.vjs-tech')&&Date.now()<deadline){signal.throwIfAborted();await new Promise<void>(resolve=>setTimeout(resolve,100));}
       if(!this.document.querySelector('video.vjs-tech'))throw new Error('必学视频正常入口后播放器尚未加载。');
     }
@@ -149,7 +149,15 @@ export class LiveCoursePage {
       const point=this.#initial.tasks.find(task=>task.lesson_id===nav.point_id)!;
       const page=new KnowledgePracticePage(this.document);
       const base={course_id:this.#initial.course_id,context_id:this.#initial.context_id!,point:{id:point.lesson_id,title:point.title,order:point.order}};
-      page.execute({operation:'pause',...base},signal);page.execute({operation:'directory',...base},signal);
+      const readyDeadline=Date.now()+30000;
+      for(;;){
+        signal.throwIfAborted();const state=page.state({operation:'state',...base});
+        page.execute({operation:'pause',...base},signal);
+        if(state.navigation.ready)break;
+        if(Date.now()>=readyDeadline)throw new Error('知识点返回目录前导航尚未就绪。');
+        await new Promise<void>(resolve=>setTimeout(resolve,100));
+      }
+      page.execute({operation:'directory',...base},signal);
       const deadline=Date.now()+30000;
       while(Date.now()<deadline){signal.throwIfAborted();const directory=readZhidaoDirectory(this.document);if(directory?.course_id===base.course_id&&directory.context_id===base.context_id&&directory.points.length)return true;await new Promise<void>(resolve=>setTimeout(resolve,200));}
       throw new Error('返回目录后知识点清单尚未加载。');

@@ -40,7 +40,8 @@ function Test-VVProcessPath($Processes, [string]$Path) {
 }
 
 # 无法读取进程时终止；清理工具不关闭任何应用。
-$vvProcesses = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('chrome.exe', 'msedge.exe', 'node.exe') })
+$vvProcesses = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('chrome.exe', 'msedge.exe', 'node.exe', 'chromedriver.exe', 'msedgedriver.exe') })
+if ($vvProcesses | Where-Object { -not $_.CommandLine }) { throw 'Cannot inspect active browser or test process command lines.' }
 $vvSkipped = [Collections.Generic.List[object]]::new()
 $vvTargets = [Collections.Generic.List[object]]::new()
 $vvEvidence = [Collections.Generic.List[object]]::new()
@@ -75,15 +76,18 @@ foreach ($vvRun in $vvRuns) {
     }
 }
 
-# 明确选择的退休构建独立检查，活动课程可以保留使用中的其他构建。
+# 明确选择的旧构建及自有浏览器缓存独立检查，保留登录和扩展配置。
 foreach ($vvRelative in $vvRetiredPaths) {
     $vvParts = $vvRelative.Replace('/', '\').Split('\')
-    if ($vvParts.Count -ne 2 -or $vvParts[0] -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]+$' -or
-        $vvParts[1] -notmatch '^(?:extension(-[a-zA-Z0-9_.-]+)?|previous)$') { throw "Invalid retired build: $vvRelative" }
+    $vvBuild = $vvParts.Count -eq 2 -and $vvParts[0] -match '^[a-zA-Z0-9][a-zA-Z0-9_.-]+$' -and
+        $vvParts[1] -match '^(?:extension(-[a-zA-Z0-9_.-]+)?|previous)$'
+    $vvCache = $vvRelative.Replace('\', '/') -match '^(?:course-login-20261004-040551|snapshot-inspection-20261006-223503)/profile/(?:GPUPersistentCache|Default/(?:Cache|Code Cache|GPUCache|DawnGraphiteCache|DawnWebGPUCache))$'
+    if (-not $vvBuild -and -not $vvCache) { throw "Invalid retired build or browser cache: $vvRelative" }
     $vvPath = Join-Path $vvRuntime $vvRelative
     if (-not (Test-Path -LiteralPath $vvPath)) { continue }
     $vvFull = Assert-VVTarget $vvPath
-    if (Test-VVProcessPath $vvProcesses $vvFull) {
+    $vvProcessPath = if ($vvCache) { Join-Path $vvRuntime $vvParts[0] } else { $vvFull }
+    if (Test-VVProcessPath $vvProcesses $vvProcessPath) {
         $vvSkipped.Add(@{ path = $vvFull; reason = 'in_use' }); continue
     }
     if ($vvTargets | Where-Object path -eq $vvFull) { continue }
@@ -91,7 +95,7 @@ foreach ($vvRelative in $vvRetiredPaths) {
     if ($vvContents | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }) {
         $vvSkipped.Add(@{ path = $vvFull; reason = 'contains_reparse_point' }); continue
     }
-    $vvTargets.Add(@{ path = $vvFull; kind = 'directory'; process_path = $vvFull; bytes = [long](($vvContents | Where-Object { -not $_.PSIsContainer }) | Measure-Object Length -Sum).Sum })
+    $vvTargets.Add(@{ path = $vvFull; kind = 'directory'; process_path = $vvProcessPath; bytes = [long](($vvContents | Where-Object { -not $_.PSIsContainer }) | Measure-Object Length -Sum).Sum })
 }
 
 # 核验退休场内全部保留证据，包括嵌套的迟到响应与错误隔离报告。
@@ -132,7 +136,8 @@ try {
     foreach ($vvTarget in $vvTargets) {
         $vvFull = Assert-VVTarget $vvTarget.path
         # 每项回收前重新检查进程，拒绝正在使用的资料。
-        $vvCurrent = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('chrome.exe', 'msedge.exe', 'node.exe') })
+        $vvCurrent = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('chrome.exe', 'msedge.exe', 'node.exe', 'chromedriver.exe', 'msedgedriver.exe') })
+        if ($vvCurrent | Where-Object { -not $_.CommandLine }) { throw 'Cannot inspect active browser or test process command lines.' }
         $vvRunPath = if ($vvTarget.process_path) { $vvTarget.process_path } else { $vvFull }
         if (Test-VVProcessPath $vvCurrent $vvRunPath) {
             throw "Target became active; stopped cleanup: $vvRunPath"

@@ -116,7 +116,9 @@ export function readChaoxingLearningPage(document: Document): ChaoxingLearningRe
     }else if(/^\/ananas\/modules\/(?:document|pdf|ppt|office|read)\/index\.html$/.test(path))reading.excluded_resources.push({index:resources.indexOf(frame),title:'文档资源'});
     else unknownResource=true;
   }
-  reading.resources_ready=cards.readyState==='complete'&&!unknownResource&&(resources.length>0||/本节(?:课)?无任务点|当前课时无任务点/.test(rules));
+  const textOnly=resources.length===0&&cards.readyState==='complete'&&Array.from(cards.querySelectorAll<HTMLElement>('.ans-cc')).some(element=>!isExplicitlyHidden(element)&&normalizedText(element.innerText).length>0)&&!Array.from(cards.querySelectorAll('iframe,.ans-attach-ct,.ans-job-icon,video,audio[src],object,embed,[aria-busy="true"]')).some(element=>!isExplicitlyHidden(element));
+  if(textOnly){reading.excluded_resources.push({index:0,title:'图文资料'});reading.resource_count=1;}
+  reading.resources_ready=cards.readyState==='complete'&&!unknownResource&&(resources.length>0||textOnly||/本节(?:课)?无任务点|当前课时无任务点/.test(rules));
   reading.diagnostics.push('当前课时只读信息；完成图标不证明视频结束、测验提交或达到及格条件。');
   return reading;
 }

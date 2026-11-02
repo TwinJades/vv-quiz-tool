@@ -30,6 +30,8 @@
 
 已确认退休的场次或具体旧构建可以通过 `-SelectionFile` 指定 JSON 清单，使用 `retired_runs` 和 `retired_paths` 字段。具体构建支持场内 `extension`、`extension-*` 和构建场次的 `previous` 目录。工具检查实际路径、运行进程和重解析点，保护活动资料，并核验保留证据的 SHA256。UUID 构建的内部 `report.json` 保留，发行核验通过构建编号读取它。
 
+课程测试 `course-login-20261004-040551` 和网页诊断 `snapshot-inspection-20261006-223503` 支持单独回收 `profile/Default/Cache`、`Code Cache`、`GPUCache`、`DawnGraphiteCache`、`DawnWebGPUCache` 及 `profile/GPUPersistentCache`。将具体相对路径加入 `retired_paths`，先预览，再执行。即使只选择缓存，整个场次仍需没有活动浏览器或测试进程。保留 Cookie、网站存储、扩展配置、登录资料和人工验收资料。
+
 清理报告中的错误必须处理，保留证据摘要需要一致。回收失败时保留原资料并报告失败，不使用永久删除替代。清理资料不代表功能验收通过。
 
 ## 文件移除规则

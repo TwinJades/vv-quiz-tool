@@ -376,7 +376,6 @@ export class CourseOrchestrator {
       if(video.course_id!==catalog.course_id||video.task_id!==task.id||!video.video_id||videoId!==null&&videoId!==video.video_id||this.#now()-video.observed_at>5000||this.#now()<video.observed_at)throw new Error('视频身份或观察失效，暂停。');
       videoId=video.video_id;
       if(video.resource_fingerprint){if(task.resource_fingerprint&&task.resource_fingerprint!==video.resource_fingerprint)throw new Error('当前视频媒体身份已经改变。');task.resource_fingerprint=video.resource_fingerprint;}
-      if(!video.visible&&!video.background_input_confirmed&&video.paused)throw new Error('后台播放器输入未确认。');
       this.#runtime.video.rate=video.rate;
       this.#estimate.observe(video,this.#now());this.#emit();
       if(video.popup){
@@ -444,6 +443,7 @@ export class CourseOrchestrator {
   }
   async #loop(signal:AbortSignal):Promise<void> {
     this.#phase('OBSERVE_COURSE');
+    if(this.#auditCompleted)this.#issues.clear();
     if(!this.#pendingQuiz)await this.#audit(signal);
     for(;;){
       signal.throwIfAborted();const catalog=await this.adapter.catalog(signal);signal.throwIfAborted();this.#identity(catalog);

@@ -52,9 +52,9 @@ export class KnowledgePracticePage {
       if(nav.stage!=='learner'||!state.has_video)return true;
       const video=this.document.querySelector<HTMLVideoElement>('.videoNameBox >.video-js >video.vjs-tech')!;
       if(video.paused)return true;
-      const controls=visible(this.document,'.videoNameBox .controlsBar >.pauseButton');
-      if(controls.length!==1)throw new Error('没有唯一正常暂停控件。');
-      signal.throwIfAborted();controls[0]!.click();return video.paused;
+      signal.throwIfAborted();video.pause();
+      if(!video.paused)throw new Error('知识点视频暂停未确认。');
+      return true;
     }
     if(!nav.ready)throw new Error('知识点页面尚未就绪，未执行导航。');
     let control:HTMLElement;

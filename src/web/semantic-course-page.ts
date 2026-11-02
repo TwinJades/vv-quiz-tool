@@ -44,8 +44,16 @@ export class SemanticCoursePage {
     if(context&&(context.frame_url!==this.document.location.href||!context.current_lesson_id||!context.current_resource_id))throw new Error('课程框架身份已改变。');
     this.#attributes.clear();
     const learning=intent==='directory'?null:readChaoxingLearningPage(this.document);
-    const directory=intent==='directory'||learning&&!learning.cross_origin_resources?readNativeCourseDirectory(this.document):null;
-    const mapped=directory?this.#mapping.captureCourseNodes(directory.nodes):this.#mapping.capture(this.document.body,true);
+    const navigation=readZhidaoNavigation(this.document),learner=navigation?.stage==='learner'?navigation:null;
+    const directory=intent==='directory'||navigation?.stage==='directory'||learning&&!learning.cross_origin_resources?readNativeCourseDirectory(this.document):null;
+    const learnerBack=learner?[...this.document.querySelectorAll<HTMLElement>('.learn-header > img[alt="back"]')].filter(element=>!isExplicitlyHidden(element)):[];
+    if(learnerBack.length>1)throw new Error('知到学习页返回目录入口不唯一。');
+    const history=navigation?.stage==='mastery_history'?navigation:null;
+    const historyRoot=history?this.document.querySelector<HTMLElement>('.mastery-history-container'):null;
+    const historyItems=historyRoot?[...historyRoot.querySelectorAll<HTMLElement>('.history-item')].filter(element=>!isExplicitlyHidden(element)):[];
+    const historyBack=historyRoot?[...historyRoot.querySelectorAll<HTMLElement>(':scope > .backup > .backup-content > .backup-icon')].filter(element=>!isExplicitlyHidden(element)):[];
+    if(historyBack.length>1)throw new Error('知识点历史记录返回入口不唯一。');
+    const mapped=directory?this.#mapping.captureCourseNodes(directory.nodes):learner?this.#mapping.captureCourseNodes([this.document.body,...learnerBack]):history?this.#mapping.captureCourseNodes([...(historyRoot?[historyRoot]:[]),...historyItems,...historyBack]):this.#mapping.capture(this.document.body,true);
     const elements=mapped.map(element=>{
       const node=this.#mapping.element(element.element_id),attributes:Record<string,string>={};
       this.#attributes.set(element.element_id,Object.fromEntries([...node.attributes].filter(attribute=>/^(?:id|href|src|data-(?:id|course-id|video-id|chapter-id|lesson-id)|courseid|clazzid|chapterid|lessonid|resourceid|videoid|knowledgeid)$/.test(attribute.name)).map(attribute=>[attribute.name,attribute.value])));
@@ -67,6 +75,19 @@ export class SemanticCoursePage {
       const reading=nativeDirectoryReading(directory,this.#snapshot,new Map(mapped.map(element=>[this.#mapping.element(element.element_id),element.element_id])));
       if(learning){reading.busy=!learning.resources_ready;reading.resources_complete=learning.resources_ready;reading.resources_total=learning.resource_count;reading.visibility_required=learning.visibility_required;}
       this.#snapshot.native_reading=reading;
+    }else if(learner){
+      const back=mapped.find(element=>this.#mapping.element(element.element_id)===learnerBack[0]);
+      this.#snapshot.native_reading={capture_id:this.#snapshot.capture_id,stage:'lesson',course_id:learner.course_id,context_id:learner.context_id,title:this.#catalog?.title??this.document.title,
+        current_lesson_id:learner.point_id,current_resource_id:null,directory_root_id:null,lessons:[],expand_ids:[],more_id:null,previous_id:null,scroll_root_id:null,busy:!learner.ready||!back,total:null,
+        resources_complete:false,resources_total:null,resources:[],controls:back?[{id:back.element_id,role:'back'}]:[],video_root_id:null,quiz_root_id:null,record_ids:[],submission_ids:[],passed:null,
+        quiz_rules:{scored:null,retry_allowed:null,remaining_attempts:null,requires_pass:null,requires_rewatch:null},speed_allowed:null,visibility_required:null};
+    }else if(history){
+      const elementId=(node:HTMLElement)=>{const entry=mapped.find(element=>this.#mapping.element(element.element_id)===node);if(!entry)throw new Error('历史记录在读取期间改变。');return entry.element_id;};
+      const records=historyItems.filter(item=>/知识点练习/.test(item.innerText)&&/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(normalizedText(item.querySelector('.history-item-time')?.textContent))&&/查看解析/.test(item.innerText));
+      this.#snapshot.native_reading={capture_id:this.#snapshot.capture_id,stage:'result',course_id:history.course_id,context_id:history.context_id,title:this.#catalog?.title??this.document.title,
+        current_lesson_id:history.point_id,current_resource_id:null,directory_root_id:null,lessons:[],expand_ids:[],more_id:null,previous_id:null,scroll_root_id:null,busy:!history.ready||!historyRoot||historyBack.length===0,total:null,
+        resources_complete:false,resources_total:null,resources:[],controls:historyBack.length?[{id:elementId(historyBack[0]!),role:'back'}]:[],video_root_id:null,quiz_root_id:null,record_ids:[],submission_ids:records.map(elementId),passed:null,
+        quiz_rules:{scored:null,retry_allowed:null,remaining_attempts:null,requires_pass:null,requires_rewatch:null},speed_allowed:null,visibility_required:null};
     }
     return this.#snapshot;
   }
@@ -97,7 +118,7 @@ export class SemanticCoursePage {
       for(const [existingKey,existing] of this.#rows)if(existingKey.startsWith(kind+':')&&(existing.root.contains(root)||root.contains(existing.root)))throw new Error('课程任务行发生重复或范围重叠。');
       if(row.status==='completed'){
         const status=row.status_id?this.element(row.status_id):null;
-        const value=status?normalizedText((snapshot.native_reading&&status.matches('.icon_Completed')?status.textContent:status.innerText)+' '+(status.getAttribute('aria-label')??'')):'';
+        const value=status?normalizedText((snapshot.native_reading&&status.matches('.icon_Completed,.catalog_state.icon_yiwanc')?status.textContent:status.innerText)+' '+(status.getAttribute('aria-label')??'')):'';
         const explicit=/已完成|已学完|已提交|已通过|completed|finished|submitted/i.test(value);
         const resourceProgress=kind==='resource'&&/^100\s*%$/.test(value)&&!/掌握|正确率|mastery|accuracy/i.test(normalizedText(status?.parentElement?.innerText));
         if(!status||!root.contains(status)||!(explicit||resourceProgress))throw new Error('课程完成状态缺少所属任务的公开记录。');
@@ -204,6 +225,7 @@ export class SemanticCoursePage {
     return {id:this.#popup.id,course_id:this.#catalog!.course_id,task_id:task.id,kind:'video_popup',rules:this.reading().quiz_rules};
   }
   quizRoot(task:LearningTask,boundary:QuizBoundary):HTMLElement{
+    if(this.#snapshot?.native&&this.#catalog?.page_type==='zhidao_ai'&&boundary.kind==='video_popup'){this.#native.bind(this.#catalog);return this.#native.assertPopup(task,boundary);}
     if(this.#snapshot?.native&&readChaoxingLearningPage(this.document)){this.#native.bind(this.#catalog!);return boundary.kind==='video_popup'?this.#native.assertPopup(task,boundary):this.#native.quizRoot(task);}
     const id=this.reading().quiz_root_id;if(!id)throw new Error('课程测验页面尚未加载。');
     if(boundary.course_id!==this.#catalog?.course_id||boundary.task_id!==task.id)throw new Error('测验不属于当前课程任务。');
@@ -215,6 +237,9 @@ export class SemanticCoursePage {
     if(request.operation==='catalog'){if(request.known)this.bind(request.known);return this.catalog();}
     if(request.operation==='directory'){
       if(this.reading().lessons.length)return true;
+      if(this.#snapshot?.native&&this.#catalog?.page_type==='zhidao_ai'&&readZhidaoNavigation(this.document)?.stage==='learner'){
+        this.#native.bind(this.#catalog);return this.#native.execute(request,signal);
+      }
       this.click(this.control(this.reading().controls.some(control=>control.role==='directory')?'directory':'back'),signal);return true;
     }
     const {task}=request,catalog=this.#catalog;if(!catalog||catalog.course_id!==request.course_id||!catalog.tasks.some(parent=>parent.lesson_id===task.lesson_id))throw new Error('任务不属于已选择的课程目录。');
@@ -233,8 +258,8 @@ export class SemanticCoursePage {
     if(request.operation==='verify'&&catalog.page_type==='zhidao_ai'&&task.kind==='lesson_quiz'){
       const navigation=readZhidaoNavigation(this.document),reading=this.reading();
       if(navigation?.course_id!==catalog.course_id||navigation.context_id!==catalog.context_id||navigation.point_id!==task.lesson_id)throw new Error('知识点测验记录归属无法核验。');
-      const submitted=['result','review','mastery_history'].includes(navigation.stage)&&reading.submission_ids.length>0&&reading.submission_ids.every(id=>/已提交|提交成功|成绩|得分|作答记录|已答对|submitted|score|result/i.test(normalizedText(this.element(id).innerText)));
-      return {task_id:task.id,media_ended:false,progress_recorded:submitted,submission_confirmed:submitted,completed:submitted,passed:reading.passed,pending_grading:false,visible_score:submitted?reading.submission_ids.map(id=>normalizedText(this.element(id).innerText)).join(' ').slice(0,200):null} satisfies CourseVerification;
+      const submitted=['result','review','mastery_history'].includes(navigation.stage)&&reading.submission_ids.length>0&&reading.submission_ids.every(id=>{const element=this.element(id);return navigation.stage==='mastery_history'?element.matches('.history-item')&&/知识点练习/.test(element.innerText)&&/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(normalizedText(element.querySelector('.history-item-time')?.textContent))&&/查看解析/.test(element.innerText):/已提交|提交成功|成绩|得分|作答记录|已答对|submitted|score|result/i.test(normalizedText(element.innerText));});
+      return {task_id:task.id,media_ended:false,progress_recorded:submitted,submission_confirmed:submitted,completed:submitted,passed:reading.passed,pending_grading:false,visible_score:submitted&&navigation.stage!=='mastery_history'?reading.submission_ids.map(id=>normalizedText(this.element(id).innerText)).join(' ').slice(0,200):null} satisfies CourseVerification;
     }
     if(this.#snapshot?.native&&(readChaoxingLearningPage(this.document)||readZhidaoNavigation(this.document)&&catalog.page_type==='zhidao_ai')){
       if(request.operation==='enter')this.#active=task;
@@ -279,7 +304,17 @@ export class SemanticCoursePage {
       const scope=task.kind==='video'?row?.root:quizId?this.element(quizId):row?.root;
       const recorded=record_ids.length>0&&record_ids.every(id=>{const element=this.#mapping.element(id);return Boolean((row?.root.contains(element)||scope?.contains(element))&&/已完成|已学完|100\s*%|completed|finished/i.test(normalizedText(element.innerText+' '+element.getAttribute('aria-label'))));});
       const submitted=submission_ids.length>0&&submission_ids.every(id=>{const element=this.#mapping.element(id);return Boolean(scope?.contains(element)&&/已提交|提交成功|成绩|得分|已批阅|submitted|score|result/i.test(normalizedText(element.innerText)));});
-      return {task_id:task.id,media_ended:task.kind==='video'&&this.media().ended,progress_recorded:recorded,submission_confirmed:submitted,completed:recorded&&(task.kind==='video'||submitted),passed:this.reading().passed,pending_grading:false,visible_score:submission_ids.map(id=>normalizedText(this.#mapping.element(id).innerText)).join(' ').slice(0,200)||null} satisfies CourseVerification;
+      let mediaEnded=false;
+      if(task.kind==='video'){
+        const videoRoot=this.reading().video_root_id,root=videoRoot?this.element(videoRoot):null;
+        if(root&&(root.matches('video')||root.querySelector('video')))mediaEnded=this.media().ended;
+        else{
+          const frames=this.embeddedFrames().filter(frame=>frame.kind==='video'&&frame.context.current_resource_id===requireResourceId(task)),frame=frames[0];
+          if(frames.length!==1||!frame||frame.context.kind!=='video'||frame.context.course_id!==catalog.course_id||frame.context.context_id!==(catalog.context_id??null)||frame.context.current_lesson_id!==task.lesson_id||frame.context.source_url!==this.document.location.href||frame.context.frame_url!==frame.url)throw new Error('课程视频跨源框架无法唯一确认或资源归属不一致。');
+          // Only the bound child frame can supply ended; this result verifies parent resource records only.
+        }
+      }
+      return {task_id:task.id,media_ended:mediaEnded,progress_recorded:recorded,submission_confirmed:submitted,completed:recorded&&(task.kind==='video'||submitted),passed:this.reading().passed,pending_grading:false,visible_score:submission_ids.map(id=>normalizedText(this.#mapping.element(id).innerText)).join(' ').slice(0,200)||null} satisfies CourseVerification;
     }
     const video=this.media();
     if(request.operation==='speed'){

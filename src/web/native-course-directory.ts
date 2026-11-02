@@ -14,7 +14,7 @@ export interface NativeCourseDirectory {
 export function readNativeCourseDirectory(document:Document):NativeCourseDirectory|null {
   const url=new URL(document.location.href);
   const visible=(node:HTMLElement)=>!isExplicitlyHidden(node);
-  let course:string|null=null,context:string|null=null,lesson:string|null=null,rows:DirectoryRow[]=[];
+  let course:string|null=null,context:string|null=null,lesson:string|null=null,rows:DirectoryRow[]=[],courseTitle='';
   if(url.hostname==='chaoxing.com'||url.hostname.endsWith('.chaoxing.com')){
     course=url.searchParams.get('courseid')??url.searchParams.get('courseId');
     context=url.searchParams.get('clazzid')??url.searchParams.get('classId');
@@ -23,7 +23,7 @@ export function readNativeCourseDirectory(document:Document):NativeCourseDirecto
       const id=/^cur(\d+)$/.exec(root.id)?.[1],labels=[...root.querySelectorAll<HTMLElement>(':scope > .posCatalog_name,:scope > .catalog_title > .catalog_name > a.clicktitle')].filter(visible);
       if(!id||labels.length!==1||!normalizedText(labels[0]!.innerText))return null;
       const group=root.closest<HTMLElement>('[chapterid],[data-chapter-id]');
-      const completed=root.querySelector<HTMLElement>(':scope > .icon_Completed'),pending=root.querySelector<HTMLElement>(':scope > .catalog_points_yi');
+      const completed=root.querySelector<HTMLElement>(':scope > .icon_Completed,:scope > .catalog_title > .catalog_task > .icon_yiwanc'),pending=root.querySelector<HTMLElement>(':scope > .catalog_points_yi,:scope > .catalog_title > .catalog_task > .catalog_jindu');
       const statusElement=completed??pending??undefined;
       const status=completed&&/已完成/.test(completed.textContent??'')?'completed':pending&&/个待完成任务点/.test(pending.textContent??'')?'not_started':undefined;
       rows.push({id,chapter:group?.getAttribute('chapterid')??group?.getAttribute('data-chapter-id')??id,title:normalizedText(labels[0]!.innerText),root,entry:labels[0]!,label:labels[0]!,status,statusElement});
@@ -42,6 +42,8 @@ export function readNativeCourseDirectory(document:Document):NativeCourseDirecto
     const directory=readZhidaoDirectory(document);
     if(!directory||directory.diagnostics.length>2||!directory.points.length)return null;
     course=directory.course_id;context=directory.context_id;
+    const titles=[...document.querySelectorAll<HTMLElement>('.section-item.knowledge-list > .section-item-header > .header-left')].filter(visible);
+    if(titles.length===1)courseTitle=normalizedText(titles[0]!.innerText);
     for(const point of directory.points){
       const roots=[...document.querySelectorAll<HTMLElement>('.item-content[knowledgeid]')].filter(node=>visible(node)&&node.getAttribute('knowledgeid')===point.id);
       if(roots.length!==1)return null;
@@ -54,13 +56,14 @@ export function readNativeCourseDirectory(document:Document):NativeCourseDirecto
   let root=rows[0]!.root;
   while(rows.some(row=>!root.contains(row.root))&&root.parentElement)root=root.parentElement;
   // 未支持的分页和折叠结构交给语义识别，避免将部分目录认作全部。
-  if([...document.querySelectorAll<HTMLElement>('[aria-expanded=false],[aria-busy=true],.el-pagination,.pagination')].some(visible))return null;
+  const directoryScope=root.closest<HTMLElement>('.knowledge,#coursetree')??root.parentElement??root;
+  if(directoryScope.matches('[aria-expanded=false],[aria-busy=true]')||[...directoryScope.querySelectorAll<HTMLElement>('[aria-expanded=false],[aria-busy=true],.el-pagination,.pagination')].some(visible))return null;
   if([...root.querySelectorAll<HTMLElement>('.posCatalog_select[id^="cur"],.chapter_item[id^="cur"],.item-content[knowledgeid]')].some(node=>!visible(node)))return null;
   let scroll:HTMLElement|null=root;
   while(scroll&&!(scroll.scrollHeight>scroll.clientHeight+2&&/auto|scroll/.test(document.defaultView!.getComputedStyle(scroll).overflowY)))scroll=scroll.parentElement;
   scroll??=document.scrollingElement as HTMLElement|null;
   const parentTitle=document.defaultView?.frameElement?.ownerDocument.title;
-  return {course:course!,context,title:normalizedText(document.title)||normalizedText(parentTitle)||`课程 ${course}`,lesson,root,rows,scroll,nodes:[root,...(scroll?[scroll]:[]),...rows.flatMap(row=>[row.root,row.entry,row.label,...(row.statusElement?[row.statusElement]:[])])]};
+  return {course:course!,context,title:courseTitle||normalizedText(document.title)||normalizedText(parentTitle)||`课程 ${course}`,lesson,root,rows,scroll,nodes:[root,...(scroll?[scroll]:[]),...rows.flatMap(row=>[row.root,row.entry,row.label,...(row.statusElement?[row.statusElement]:[])])]};
 }
 
 export function nativeDirectoryReading(directory:NativeCourseDirectory,snapshot:CourseSurfaceSnapshot,nodes:Map<HTMLElement,string>):CourseSurfaceReading {
