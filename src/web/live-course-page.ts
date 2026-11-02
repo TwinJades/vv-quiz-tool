@@ -124,7 +124,7 @@ export class LiveCoursePage {
     let scope:HTMLElement|null=this.document.querySelector('.videoNameBox');
     const cx=readChaoxingLearningPage(this.document);
     if(cx){
-      const videos=[...resolveChaoxingResourceFrame(this.document,'video',requireResourceId(task)).contentDocument?.querySelectorAll<HTMLVideoElement>('video')??[]].filter(video=>!isExplicitlyHidden(video));
+      const videos=[...resolveChaoxingResourceFrame(this.document,'video',requireResourceId(task)).contentDocument?.querySelectorAll<HTMLVideoElement>('video.vjs-tech')??[]].filter(video=>!isExplicitlyHidden(video));
       if(videos.length>1)throw new Error('COURSE_IDENTITY_MISMATCH: 当前资源的视频媒体不唯一。');
       const candidate=videos.length===1?findChaoxingVideoQuiz(videos[0]!):null;
       if(!candidate){this.#activePopup=null;return null;}

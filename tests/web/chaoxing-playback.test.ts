@@ -82,7 +82,17 @@ describe('学习通实际课程执行边界',()=>{
     const children=await page.children(lesson,signal),task=children.find(child=>child.kind==='video')!;
     const popup=f.playerDoc.createElement('div');popup.className='ans-videoquiz';popup.innerHTML='<div class="tkItem"><input type="radio" name="answer"></div>';
     f.video.parentElement!.append(popup);
-    f.video.parentElement!.append(f.playerDoc.createElement('video'));
-    await expect(page.execute({operation:'quiz',course_id:'11',task},signal)).rejects.toThrow(/视频媒体不唯一/);
+    const second=f.playerDoc.createElement('video');second.className='vjs-tech';f.video.parentElement!.append(second);
+    await expect(page.execute({operation:'quiz',course_id:'11',task},signal)).rejects.toBeInstanceOf(Error);
+    expect(f.play).not.toHaveBeenCalled();
+  });
+  it('普通占位视频不改变实际播放器弹题归属',async()=>{
+    const f=fixture(),page=new LiveCoursePage(f.document),signal=new AbortController().signal;
+    Object.defineProperty(f.cardDoc,'readyState',{configurable:true,value:'complete'});
+    const lesson=page.catalog().tasks[0]!,children=await page.children(lesson,signal),task=children.find(child=>child.kind==='video')!;
+    f.playerDoc.body.prepend(f.playerDoc.createElement('video'));
+    const popup=f.playerDoc.createElement('div');popup.className='ans-videoquiz';popup.innerHTML='<div class="tkItem" data-questionid="q1"><label><input type="radio" name="answer">选项</label></div>';
+    f.video.parentElement!.append(popup);
+    await expect(page.execute({operation:'quiz',course_id:'11',task},signal)).resolves.toMatchObject({kind:'video_popup',task_id:task.id});
   });
 });
