@@ -44,6 +44,17 @@ describe('interface languages', () => {
   it('keeps unknown technical errors available with a readable explanation', () => {
     expect(describeNotice('Unexpected extension response','zh-CN')).toEqual({text:'操作未完成，请查看技术详情。',details:'Unexpected extension response'});
   });
+  it('显示离开课程和网站授权所需的直接操作',()=>{
+    const left='原任务标签已离开课程。请打开原课程核对后继续。';
+    const permission='当前网站尚未授权。请在 VV 中授予当前网站权限后再继续。';
+    expect(describeNotice(left,'zh-CN').text).toBe(left);
+    expect(describeNotice(left,'en').text).toContain('original course');
+    expect(describeNotice(permission,'zh-CN').text).toBe(permission);
+    expect(describeNotice(permission,'en').text).toContain('permission');
+    const detailed='当前页面的 frame 权限已撤销，请重新授权。';
+    expect(describeNotice(detailed,'zh-CN').text).toBe(detailed);
+    expect(describeNotice(detailed,'en').details).toBe(detailed);
+  });
   it('formats progress values and rejects missing translations', () => {
     expect(t('处理 {{title}}',{title:'Question 3'},'en')).toBe('Processing Question 3');
     expect(()=>t('missing.translation')).toThrow('UI_TRANSLATION_MISSING');

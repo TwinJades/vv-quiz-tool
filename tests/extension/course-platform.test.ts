@@ -1,6 +1,6 @@
-import {describe,expect,it} from 'vitest';
+import {describe,expect,it,vi} from 'vitest';
 import {courseFailureIsLocal} from '../../src/core/course';
-import {courseResumeUrl,courseCatalogMatchesUrl} from '../../src/extension/course-record';
+import {courseResumeUrl,courseCatalogMatchesUrl,validCourseResumeUrl,persistCourseRecord,COURSE_RECORD_PREFIX} from '../../src/extension/course-record';
 import {courseSnapshotHasIdentity,courseSurfaceFingerprint,directoryCourseReading,courseSurfaceSchema} from '../../src/web/course-surface';
 import type {CourseSurfaceSnapshot} from '../../src/web/course-surface';
 import type {CourseCatalog} from '../../src/core/course';
@@ -36,6 +36,10 @@ describe('course failure and persisted navigation policies',()=>{
   it.each(['登录失效。','当前网页未授权。','Provider rejected the local configuration.','Model call limit of 300 has been reached.','当前视频身份已改变。','会话保存失败。'])('pauses for %s',message=>{
     expect(courseFailureIsLocal(message)).toBe(false);
   });
+  it('只将观察失效、遮挡和播放停滞视为局部问题，身份冲突全局暂停',()=>{
+    for(const message of ['COURSE_OBSERVATION_STALE: 观察已失效','COURSE_TARGET_OBSCURED: 控件被遮挡','COURSE_VIDEO_STALLED: 视频没有进展'])expect(courseFailureIsLocal(message)).toBe(true);
+    expect(courseFailureIsLocal('COURSE_IDENTITY_MISMATCH: 课程身份不一致')).toBe(false);
+  });
   it('retains public navigation identities and removes credential parameters',()=>{
     expect(courseResumeUrl('https://mooc1.chaoxing.com/mycourse/studentstudy?courseId=265936720&clazzid=153460518&chapterId=1214865778&token=discarded'))
       .toBe('https://mooc1.chaoxing.com/mycourse/studentstudy?courseId=265936720&clazzid=153460518&chapterId=1214865778');
@@ -43,6 +47,32 @@ describe('course failure and persisted navigation policies',()=>{
   it('保留正常导航所需参数，拒绝范围外网站地址',()=>{
     expect(courseResumeUrl('https://study.zhihuishu.com/course?recruitAndCourseId=public&unitId=lesson&mode=video&access_token=removed')).toBe('https://study.zhihuishu.com/course?recruitAndCourseId=public&unitId=lesson&mode=video');
     expect(()=>courseResumeUrl('https://example.com/course')).toThrow();
+  });
+  it('优先保存匹配课程的地址，所有候选无效时保留旧记录',async()=>{
+    const catalog:CourseCatalog={course_id:'11',context_id:'33',platform:'chaoxing',title:'课程',revision:'',complete:true,tasks:[],rules:{visibility_required:null,speed_allowed:null},diagnostics:[]};
+    const url=(chapter:string)=>`https://mooc1.chaoxing.com/course?courseId=11&clazzid=33&chapterId=${chapter}`;
+    const request={provider_profile_id:'provider'};
+    const snapshot={session_id:'session',provider_profile_id:'provider',model_calls:{used:1,limit:2},course:{checkpoint:{catalog}}} as Parameters<typeof persistCourseRecord>[1];
+    let record:Record<string,unknown>={url:url('previous')};
+    let frameUrl=url('frame');
+    const set=vi.fn(async (value:Record<string,unknown>)=>{record=value[COURSE_RECORD_PREFIX+'session'] as Record<string,unknown>;});
+    vi.stubGlobal('chrome',{storage:{session:{get:async()=>({'vv-start-request:1':request})},local:{get:async()=>({[COURSE_RECORD_PREFIX+'session']:record}),set}},webNavigation:{getFrame:async()=>({url:frameUrl})}});
+    try {
+      expect(validCourseResumeUrl('not a URL',catalog)).toBeNull();
+      expect(validCourseResumeUrl(url('preferred')+'&token=secret',catalog)).toBe(url('preferred'));
+      await persistCourseRecord(1,snapshot,url('preferred'));
+      expect(record.url).toBe(url('preferred'));
+      await persistCourseRecord(1,snapshot,'https://example.com/');
+      expect(record.url).toBe(url('preferred'));
+      record={url:'https://mooc1.chaoxing.com/space/index'};
+      await persistCourseRecord(1,snapshot,url('wrong').replace('clazzid=33','clazzid=44'));
+      expect(record.url).toBe(url('frame'));
+      record={url:'https://mooc1.chaoxing.com/space/index'};frameUrl='https://mooc1.chaoxing.com/space/index';
+      const calls=set.mock.calls.length;
+      await expect(persistCourseRecord(1,snapshot,'invalid')).rejects.toThrow('课程保存缺少可恢复的匹配地址。');
+      expect(set).toHaveBeenCalledTimes(calls);
+      expect(record.url).toBe(frameUrl);
+    } finally {vi.unstubAllGlobals();}
   });
   it('公开课程和班级身份要求完整匹配，重复矛盾参数不能授权',()=>{
     const snapshot:CourseSurfaceSnapshot={capture_id:'capture',url:'https://mooc1.chaoxing.com/mycourse/studentstudy?courseId=265936720&clazzid=153460518',title:'',visible_text:'',native:false,elements:[]};

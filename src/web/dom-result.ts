@@ -6,8 +6,8 @@ export function readQuestionFeedback(root:HTMLElement|undefined,pageText:string,
   const liveGrading=localGrading&&root?Array.from(root.querySelectorAll<HTMLElement>('.h5p-hidden-read[aria-live]')).filter(element=>!isExplicitlyHidden(element)).map(elementText).join(' '):'';
   const pattern=/\byou got\s+(\d+)\s+(?:out\s+)?of\s+(\d+)\s+points?\b/i,points=liveGrading.match(pattern)??localGrading.match(pattern);
   const pointFeedback:PlatformState['feedback']=points&&Number(points[2])>0&&Number(points[1])<=Number(points[2])?Number(points[1])===Number(points[2])?'correct':Number(points[1])===0?'incorrect':'partial':null;
-  const strong=pageText.match(/(?:your answer is (?:correct|incorrect)|回答(?:正确|错误)|答(?:对|错)了?)/i)?.[0]??'';
+  const strong=(pageText.match(/(?:your answer is (?:correct|incorrect)|回答(?:正确|错误)|答(?:对|错)了?)/gi)??[]).join(' ');
   const feedbackEvidence=`${feedbackText} ${strong} ${localGrading}`;
-  const feedback=pointFeedback??(/\bcorrect\b|回答正确|答对/i.test(feedbackEvidence)?'correct':/\bincorrect\b|\bwrong\b|回答错误|答错/i.test(feedbackEvidence)?'incorrect':null);
+  const feedback=/\bincorrect\b|\bwrong\b|回答错误|答错/i.test(feedbackEvidence)?'incorrect':pointFeedback??(/\bcorrect\b|回答正确|答对/i.test(feedbackEvidence)?'correct':null);
   return {localGrading,feedback,feedbackEvidence,pointFeedback};
 }

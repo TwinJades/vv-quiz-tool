@@ -35,7 +35,7 @@ flowchart TD
 | `src/provider` | Provider 配置、模型目录、能力、请求和费用规则 |
 | `src/extension/background.ts` | 会话管理、准备会话、保存、恢复、权限和消息分发 |
 | `src/extension/content.ts` | 在实际页面中校验与执行操作 |
-| `src/extension/course-frame.ts`、`course-video-input.ts` | 课程框架消息、文档核验、坐标转换及播放器输入 |
+| `src/extension/course-frame.ts` | 课程框架消息、文档核验与题目坐标转换 |
 | `src/extension/course-quiz-platform.ts`、`course-record.ts` | 测验执行和课程持久保存 |
 | `src/core/course-checkpoint.ts` | 课程检查点版本和身份迁移 |
 | `src/web/dom-contexts.ts`、`dom-actions.ts`、`dom-result.ts` | 普通测验页面读取、填写动作和反馈判断 |

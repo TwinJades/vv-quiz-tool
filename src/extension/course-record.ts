@@ -12,10 +12,9 @@ export async function persistCourseRecord(tabId:number,snapshot:SessionRuntimeSn
   const stored=await chrome.storage.session.get('vv-start-request:'+tabId),request=stored['vv-start-request:'+tabId] as StartSessionRequest|undefined;
   if(!request||request.provider_profile_id!==snapshot.provider_profile_id)throw new Error('课程保存缺少原始任务配置。');
   const key=COURSE_RECORD_PREFIX+snapshot.session_id,previous=await chrome.storage.local.get(key),record=previous[key] as SavedCourseRecord|undefined;
-  const value=preferredUrl??record?.url??(await chrome.webNavigation.getFrame({tabId,frameId:0}))?.url;
-  if(!value)throw new Error('课程保存缺少可恢复页面地址。');
-  const url=courseResumeUrl(value);
-  if(!courseCatalogMatchesUrl(url,checkpoint.catalog))throw new Error('课程保存地址与课程、班级身份不一致。');
+  const catalog=checkpoint.catalog;
+  const url=validCourseResumeUrl(preferredUrl,catalog)??validCourseResumeUrl(record?.url,catalog)??validCourseResumeUrl((await chrome.webNavigation.getFrame({tabId,frameId:0}))?.url,catalog);
+  if(!url)throw new Error('课程保存缺少可恢复的匹配地址。');
   await chrome.storage.local.set({[key]:{snapshot:structuredClone(snapshot),request,url,updated_at:Date.now()} satisfies SavedCourseRecord});
 }
 
@@ -23,6 +22,14 @@ export function courseResumeUrl(value:string):string {
   const url=new URL(value);
   if(url.protocol!=='https:'||!(url.hostname==='chaoxing.com'||url.hostname.endsWith('.chaoxing.com')||url.hostname==='zhihuishu.com'||url.hostname.endsWith('.zhihuishu.com')))throw new Error('课程恢复地址未授权。');
   return publicCourseUrl(value);
+}
+
+export function validCourseResumeUrl(value:string|undefined,catalog:CourseCatalog):string|null {
+  if(!value)return null;
+  try {
+    const url=courseResumeUrl(value);
+    return courseCatalogMatchesUrl(url,catalog)?url:null;
+  } catch { return null; }
 }
 
 export function courseCatalogMatchesUrl(value:string,catalog:CourseCatalog):boolean {

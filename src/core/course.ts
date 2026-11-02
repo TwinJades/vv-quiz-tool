@@ -5,6 +5,12 @@ import type { SessionRuntimeSnapshot, SessionSummary } from './orchestrator';
 export type CoursePlatform = 'zhidao' | 'chaoxing';
 export type LearningTaskKind = 'lesson' | 'video' | 'lesson_quiz' | 'chapter_quiz' | 'excluded';
 export type TaskStatus = 'not_started' | 'in_progress' | 'completed' | 'locked' | 'unknown';
+export type CourseRecoverableCode = 'COURSE_OBSERVATION_STALE' | 'COURSE_TARGET_OBSCURED';
+export function courseRecoverableCode(message:string):CourseRecoverableCode|null {
+  if(message.startsWith('COURSE_OBSERVATION_STALE:'))return 'COURSE_OBSERVATION_STALE';
+  if(message.startsWith('COURSE_TARGET_OBSCURED:'))return 'COURSE_TARGET_OBSCURED';
+  return null;
+}
 export interface CourseRules {
   visibility_required: boolean | null;
   speed_allowed: boolean | null;
@@ -57,7 +63,6 @@ export interface VideoSnapshot {
   ended: boolean;
   visible: boolean;
   popup: QuizBoundary | null;
-  background_input_confirmed?:boolean;
 }
 export interface QuizBoundary {
   id: string;
@@ -168,6 +173,8 @@ export function courseScopeConfirmed(catalog:CourseCatalog,scope:string[],exclud
 }
 
 export function courseFailureIsLocal(message:string):boolean {
+  if(message.startsWith('COURSE_IDENTITY_MISMATCH:'))return false;
+  if(courseRecoverableCode(message)||message.startsWith('COURSE_VIDEO_STALLED:'))return true;
   return !/登录|验证码|滑块|监考|权限|未授权|预算|调用上限|model call|Provider|模型服务|识别服务|MODEL_NOT_FOUND|AUTHENTICATION|INVALID_OUTPUT|429|quota|credential|permission|401|403|身份.*改变|不属于|保存失败|断点/i.test(message);
 }
 
@@ -370,24 +377,37 @@ export class CourseOrchestrator {
   async #watch(task:LearningTask,catalog:CourseCatalog,signal:AbortSignal):Promise<void> {
     await this.adapter.mute(task,signal);signal.throwIfAborted();
     await this.adapter.highestAllowedSpeed(task,signal);signal.throwIfAborted();
-    let lastPosition:number|null=null;let lastProgress=this.#now();let lastPopup:string|null=null;let videoId:string|null=null;
+    let lastPosition:number|null=null,lastProgress=this.#now(),lastPopup:string|null=null,videoId:string|null=null;
+    let lastPlay=-Infinity,playAttempts=0,advancingSince:number|null=null;
     while(!signal.aborted){
       const video=await this.adapter.video(task,signal);signal.throwIfAborted();
-      if(video.course_id!==catalog.course_id||video.task_id!==task.id||!video.video_id||videoId!==null&&videoId!==video.video_id||this.#now()-video.observed_at>5000||this.#now()<video.observed_at)throw new Error('视频身份或观察失效，暂停。');
+      if(video.course_id!==catalog.course_id||video.task_id!==task.id||!video.video_id||videoId!==null&&videoId!==video.video_id)throw new Error('COURSE_IDENTITY_MISMATCH: 视频身份已经改变。');
+      if(this.#now()-video.observed_at>5000||this.#now()<video.observed_at)throw new Error('COURSE_OBSERVATION_STALE: 视频观察已经失效。');
       videoId=video.video_id;
-      if(video.resource_fingerprint){if(task.resource_fingerprint&&task.resource_fingerprint!==video.resource_fingerprint)throw new Error('当前视频媒体身份已经改变。');task.resource_fingerprint=video.resource_fingerprint;}
+      if(video.resource_fingerprint){if(task.resource_fingerprint&&task.resource_fingerprint!==video.resource_fingerprint)throw new Error('COURSE_IDENTITY_MISMATCH: 当前视频媒体身份已经改变。');task.resource_fingerprint=video.resource_fingerprint;}
       this.#runtime.video.rate=video.rate;
       this.#estimate.observe(video,this.#now());this.#emit();
       if(video.popup){
         if(video.popup.id===lastPopup)throw new Error('弹题仍未解除或要求回看，停止重复提交。');
-        await this.#quiz(video.popup,signal);lastPopup=video.popup.id;lastProgress=this.#now();continue;
+        await this.#quiz(video.popup,signal);lastPopup=video.popup.id;lastProgress=this.#now();lastPosition=null;advancingSince=null;continue;
       }
       lastPopup=null;
       if(video.ended){this.#runtime.video.ended=true;this.#phase('VERIFY_PROGRESS','VERIFY');return;}
-      if(video.position!==null){if(lastPosition!==null&&video.position>lastPosition&&!video.seeking)lastProgress=this.#now();lastPosition=video.position;}
-      if(video.paused&&!video.seeking){await this.adapter.play(task,signal);signal.throwIfAborted();}
-      if(this.#now()-lastProgress>=120000)throw new Error('视频连续两分钟没有有效播放进展，请检查网络或播放器。');
-      this.#phase(video.buffering?'BUFFERING':video.seeking?'REWATCHING':video.paused?'PLAYBACK_PAUSED':'PLAYING');await this.#wait(1000,signal);
+      const now=this.#now();
+      const advanced=video.position!==null&&lastPosition!==null&&video.position-lastPosition>=0.05&&!video.seeking&&!video.paused;
+      if(advanced){lastProgress=now;advancingSince??=now;if(now-advancingSince>=10000)playAttempts=0;}
+      else advancingSince=null;
+      lastPosition=video.position;
+      if(now-lastProgress>=300000)throw new Error('COURSE_VIDEO_STALLED: 视频持续无有效播放进展，已保留当前资源。');
+      if(video.paused&&!video.seeking&&now-lastPlay>=3000){
+        if(playAttempts>=8){
+          if(!await this.adapter.pauseVideo(task,signal))throw new Error('视频恢复次数耗尽后暂停未确认。');
+          throw new Error('COURSE_VIDEO_STALLED: 视频播放恢复次数已耗尽，已保留当前资源。');
+        }
+        lastPlay=now;playAttempts++;
+        await this.adapter.play(task,signal);signal.throwIfAborted();
+      }
+      this.#phase(video.buffering?'BUFFERING':video.seeking?'REWATCHING':video.paused?'PLAYBACK_PAUSED':'PLAYING');await this.#wait(500,signal);
     }
   }
   async #progress(task:LearningTask,signal:AbortSignal):Promise<void> {
@@ -558,7 +578,10 @@ export class CourseOrchestrator {
           await this.adapter.enter(child,signal);
           if(child.kind==='video'){await this.#watch(child,catalog,signal);await this.#progress(child,signal);}
           else{
-            const boundary=await this.adapter.quiz(child,signal);this.#pendingQuiz=boundary;this.#emit();await this.#quiz(boundary,signal);
+            const boundary=await this.adapter.quiz(child,signal);this.#validateQuizBoundary(boundary);
+            const existing=await this.adapter.verify(child,signal);signal.throwIfAborted();
+            if(existing.task_id!==child.id)throw new Error('COURSE_IDENTITY_MISMATCH: 测验提交记录不属于当前任务。');
+            if(!existing.submission_confirmed||!existing.pending_grading&&boundary.rules.requires_pass===true&&existing.passed===false){this.#pendingQuiz=boundary;this.#emit();await this.#quiz(boundary,signal);}
             const deadline=this.#now()+120000;let verified=await this.adapter.verify(child,signal);
             while(!courseRecordConfirms(child,verified,boundary.rules)&&!verified.pending_grading&&this.#now()<deadline){await this.#wait(1000,signal);verified=await this.adapter.verify(child,signal);}
             if(!courseRecordConfirms(child,verified,boundary.rules))throw new Error('课时测验提交、及格条件或平台记录尚未确认。');

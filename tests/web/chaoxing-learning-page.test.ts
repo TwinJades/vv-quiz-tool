@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import {Window} from 'happy-dom';
+import {readChaoxingDirectory} from '../../src/web/chaoxing-directory';
 import {chaoxingWorkEntryIdentity} from '../../src/web/course-resource-identity';
 
 describe('学习通测验入口与实际答题地址',()=>{
@@ -54,5 +56,19 @@ describe('Chaoxing task conversion',()=>{
     expect(()=>validateCourseResources(parent,children)).not.toThrow();
     expect(children).toHaveLength(2);
     expect(nextCourseResource(children,new Set(),new Set([children[0]!.id]))?.id).toBe(children[1]!.id);
+  });
+});
+
+describe('学习通公开目录读取',()=>{
+  it('读取现代及旧版 DOM 课时编号而不是使用索引',()=>{
+    const page=new Window({url:'https://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/studentcourse?courseid=11'});
+    page.document.body.innerHTML='<div class="posCatalog_select" id="cur22"><span class="posCatalog_name">现代课时</span></div><h4 id="cur33"><a title="旧版课时">旧版课时</a></h4>';
+    const reading=readChaoxingDirectory(page.document as unknown as Document);
+    expect(reading?.lessons.map(lesson=>[lesson.id,lesson.title])).toEqual([['22','现代课时'],['33','旧版课时']]);
+  });
+  it('未知平台任务状态不转换为已完成',()=>{
+    const parent=chaoxingLessonTasks('11','33',[{id:'22',title:'视频',locked:false}])[0]!;
+    const tasks=chaoxingResourceTasks(parent,{course_id:'11',class_id:'33',lesson_id:'22',lesson_title:'视频',observed_at:0,visibility_required:null,seek_forbidden:null,required_watch_percent:null,resources_ready:true,resource_count:1,videos:[{index:0,resource_id:'video:44',title:null,task_recorded:null,media:null}],quizzes:[],diagnostics:[]});
+    expect(tasks[0]?.status).not.toBe('completed');
   });
 });

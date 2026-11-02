@@ -1,0 +1,55 @@
+Source: https://github.com/zhu-hailin/chaoxing-ai-assistant/tree/a34e9beefe50c2db92625367ca9e49eafc2c143f
+Fixed commit: a34e9beefe50c2db92625367ca9e49eafc2c143f
+Ported functions: readCourseCatalog, courseCatalogMarker, courseURLContext, courseChapterNavigation, courseFrameTree, courseTabs, courseTabSnapshot, coursePageTasks, courseTaskContainer, courseTaskContains, courseTaskRequired, courseTaskLabel, courseTaskComplete, courseVisibleMarker, requestCourseVideoPlayback, courseVideoStartButton, courseVideoQuizCandidate, native quiz submit/continue lookup.
+Modifications: Adapted to TypeScript, VV public DOM identities, authorized frame routing, cancellation, conservative task completion, VV question parsing and submission guards. No userscript storage/UI, hidden mArg, private API, solver loop, seeking or progress reporting ported.
+
+MIT License
+
+Copyright (c) 2026 zhu-hailin
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------
+
+Source: https://github.com/CXRunfree/Autovisor/tree/5c715623030877d1daac0eaa14ac91f0abb2d003
+Fixed commit: 5c715623030877d1daac0eaa14ac91f0abb2d003
+Ported functions: CatalogSelectors (wisdom/fusion/hike/legacy), catalog_candidates, parse_progress_value, lesson_progress, lesson_is_complete, wait_for_lesson_active.
+Modifications: Adapted to TypeScript DOM selectors and abortable polling. Missing/invalid progress remains unknown (null); only visible finish markers count. AI course domains are excluded. No browser/account automation or private API ported.
+
+MIT License
+
+Copyright (c) 2024 PengChengxu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

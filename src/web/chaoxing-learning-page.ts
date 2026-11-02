@@ -41,14 +41,16 @@ function childDocument(frame: HTMLIFrameElement, parent: Document, path: string)
   } catch { return null; }
 }
 function jobRecorded(frame: HTMLIFrameElement): boolean | null {
-  const parent=frame.parentElement;
-  if(!parent?.matches('.ans-attach-ct'))return null;
-  const markers=Array.from(parent.querySelectorAll(':scope > .ans-job-icon')).filter(e=>!isExplicitlyHidden(e));
-  if(markers.length!==1)return null;
-  // The real pending sample also has ans-job-icon-clear. Its accessible
-  // status label is the completion evidence, not that presentation class.
-  const status=normalizedText(markers[0]!.getAttribute('aria-label'));
-  return status==='任务点已完成' ? true : status==='任务点未完成' ? false : null;
+  const parent=frame.closest<HTMLElement>('.ans-attach-ct,[data-course-task]');
+  if(!parent)return null;
+  // Adapted from courseTaskLabel/courseTaskComplete in upstream course-page-adapter.js.
+  const visible=(selector:string)=>Array.from(parent.querySelectorAll<HTMLElement>(selector)).some(e=>!isExplicitlyHidden(e));
+  const labels=Array.from(parent.querySelectorAll<HTMLElement>('span,em,p,div')).filter(e=>!e.children.length&&!isExplicitlyHidden(e)).map(e=>normalizedText(e.textContent).replace(/\s/g,''));
+  if(labels.includes('任务点已完成')||parent.matches('[data-completed="true"],[data-task-completed="true"]')||visible('.ans-job-finished,.icon_Completed,[data-completed="true"],[data-task-completed="true"]'))return true;
+  const markers=Array.from(parent.querySelectorAll<HTMLElement>('.ans-job-icon')).filter(e=>!isExplicitlyHidden(e));
+  if(markers.some(marker=>normalizedText(marker.getAttribute('aria-label'))==='任务点已完成'))return true;
+  if(parent.matches('[data-completed="false"]')||labels.includes('任务点')||markers.some(marker=>normalizedText(marker.getAttribute('aria-label'))==='任务点未完成')||visible('.orangeNew'))return false;
+  return null;
 }
 
 /** Observed studentstudy -> cards -> video/work hierarchy, read only. Frame
@@ -61,15 +63,19 @@ export function readChaoxingLearningPage(document: Document): ChaoxingLearningRe
   const course=id(url,'courseId'), lesson=id(url,'chapterId'), clazz=id(url,'clazzid');
   if(!course || !lesson || !clazz)return null;
   const rows=Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(e=>e.id===`cur${lesson}`&&!isExplicitlyHidden(e));
-  const titles=rows.length===1 ? Array.from(rows[0]!.querySelectorAll(':scope > .posCatalog_name')).filter(e=>!isExplicitlyHidden(e)) : [];
+  const titles=rows.length===1 ? Array.from(rows[0]!.querySelectorAll(':scope > .posCatalog_name,:scope > a[title]')).filter(e=>!isExplicitlyHidden(e)) : [];
   const reading:ChaoxingLearningReading={course_id:course,class_id:clazz,lesson_id:lesson,
-    lesson_title:titles.length===1 ? normalizedText(titles[0]!.textContent) : null,observed_at:Date.now(),
+    lesson_title:titles.length===1 ? normalizedText(titles[0]!.getAttribute('title')||titles[0]!.textContent) : null,observed_at:Date.now(),
     visibility_required:null,seek_forbidden:null,required_watch_percent:null,resources_ready:false,resource_count:0,videos:[],quizzes:[],diagnostics:[]};
   if(!reading.lesson_title)reading.diagnostics.push('当前课时目录身份或标题不唯一。');
   const frames=Array.from(document.querySelectorAll<HTMLIFrameElement>('iframe#iframe')).filter(e=>!isExplicitlyHidden(e));
   reading.cross_origin_resources=frames.some(frame=>new URL(frame.src,document.location.href).origin!==url.origin);
   const cards=frames.length===1 ? childDocument(frames[0]!,document,'/mooc-ans/knowledge/cards') : null;
   if(!cards){reading.diagnostics.push('课时任务frame尚未加载或无法读取。');return reading;}
+  // Visible tab identities must settle before treating the current frame as complete.
+  const tabs=Array.from(document.querySelectorAll<HTMLElement>('#prev_tab li[id^="dct"],#prev_tab [data-course-tab]'));
+  const active=tabs.filter(tab=>tab.classList.contains('active')||tab.getAttribute('aria-selected')==='true');
+  const tabsReady=!tabs.length||(tabs.every(tab=>Boolean(tab.id))&&new Set(tabs.map(tab=>tab.id)).size===tabs.length&&active.length===1);
   const cardsUrl=new URL(cards.location.href);
   if(id(cardsUrl,'courseid')!==course || id(cardsUrl,'knowledgeid')!==lesson || id(cardsUrl,'clazzid')!==clazz){
     reading.diagnostics.push('课时任务frame与当前课程、班级或课时失配。');return reading;
@@ -96,7 +102,7 @@ export function readChaoxingLearningPage(document: Document): ChaoxingLearningRe
         paused:video.paused,ended:video.ended,seeking:video.seeking,ready_state:video.readyState,muted:video.muted,volume:video.volume,
         source_fingerprint:publicSource?fnv1a(publicSource):'',
       } : null});
-      if(!video)reading.diagnostics.push('视频尚未加载或播放器不唯一。');
+      if(!video){unknownResource=true;reading.diagnostics.push('视频尚未加载或播放器不唯一。');}
     }else if(path==='/ananas/modules/work/index.html'){
       const module=childDocument(frame,cards,path);
       const workFrames=module ? Array.from(module.querySelectorAll<HTMLIFrameElement>('iframe#frame_content')).filter(e=>!isExplicitlyHidden(e)) : [];
@@ -112,13 +118,13 @@ export function readChaoxingLearningPage(document: Document): ChaoxingLearningRe
         status:review?'submitted':/章节测验\s+待完成/.test(body)?'pending':'unknown',
         visual_text_required:Boolean(work&&Array.from(work.querySelectorAll('.font-cxsecret')).some(e=>!isExplicitlyHidden(e))),
         submission_confirmed:Boolean(review),score:review?.score??null,attempt:review?.attempt??null});
-      if(!work)reading.diagnostics.push('章节测验frame尚未加载或无法读取。');
+      if(!work){unknownResource=true;reading.diagnostics.push('章节测验frame尚未加载或无法读取。');}
     }else if(/^\/ananas\/modules\/(?:document|pdf|ppt|office|read)\/index\.html$/.test(path))reading.excluded_resources.push({index:resources.indexOf(frame),title:'文档资源'});
     else unknownResource=true;
   }
   const textOnly=resources.length===0&&cards.readyState==='complete'&&Array.from(cards.querySelectorAll<HTMLElement>('.ans-cc')).some(element=>!isExplicitlyHidden(element)&&normalizedText(element.innerText).length>0)&&!Array.from(cards.querySelectorAll('iframe,.ans-attach-ct,.ans-job-icon,video,audio[src],object,embed,[aria-busy="true"]')).some(element=>!isExplicitlyHidden(element));
   if(textOnly){reading.excluded_resources.push({index:0,title:'图文资料'});reading.resource_count=1;}
-  reading.resources_ready=cards.readyState==='complete'&&!unknownResource&&(resources.length>0||textOnly||/本节(?:课)?无任务点|当前课时无任务点/.test(rules));
+  reading.resources_ready=tabsReady&&cards.readyState==='complete'&&!unknownResource&&(resources.length>0||textOnly||/本节(?:课)?无任务点|当前课时无任务点/.test(rules));
   reading.diagnostics.push('当前课时只读信息；完成图标不证明视频结束、测验提交或达到及格条件。');
   return reading;
 }

@@ -3,11 +3,12 @@ import type {VisualGeometry} from '../core/visual';
 import type {CourseSurfaceReading,CourseSurfaceSnapshot,CourseFrameContext,CourseEmbeddedFrame} from './course-surface';
 import {LiveCoursePage} from './live-course-page';
 import {SemanticCoursePage} from './semantic-course-page';
+import {isObservedCourseInteraction} from './course-interaction';
 
 export type CoursePageRequest=
   | {operation:'bind';catalog:CourseCatalog}
   | {operation:'catalog';known?:CourseCatalog}
-  | {operation:'children'|'enter'|'video'|'speed'|'speed_target'|'mute'|'play'|'pause'|'verify'|'quiz'|'rewatch'|'retry'|'record';course_id:string;task:LearningTask;hover_at?:number;tab_muted?:boolean}
+  | {operation:'children'|'enter'|'video'|'speed'|'speed_target'|'mute'|'play'|'pause'|'verify'|'quiz'|'rewatch'|'retry'|'record';course_id:string;task:LearningTask;tab_muted?:boolean}
   | {operation:'directory';course_id:string};
 export type CourseSpeedTarget={point:{x:number;y:number};captured_at:number;geometry:VisualGeometry};
 export type CoursePageResult=CourseCatalog|LearningTask[]|VideoSnapshot|CourseVerification|QuizBoundary|CourseSpeedTarget|boolean|null;
@@ -30,7 +31,7 @@ export class CoursePageAdapter {
   pauseCurrent(courseId:string,contextId:string|null,context?:CourseFrameContext):boolean{return this.#semantic.pauseCurrent(courseId,contextId,context);}
   applySemantic(reading:CourseSurfaceReading):void{this.#semantic.apply(reading);}
   expandSemantic(signal:AbortSignal,direction:'next'|'previous'='next'):boolean{return this.#semantic.loadNext(signal,direction);}
-  semanticInteractionTarget(target:EventTarget|null):boolean{return this.#semantic.ready()&&target instanceof this.document.defaultView!.Element&&Boolean(this.document.body?.contains(target));}
+  semanticInteractionTarget(target:EventTarget|null):boolean{return this.#semantic.ready()&&isObservedCourseInteraction(this.document,target);}
   assertBoundary(courseId:string,task:LearningTask,boundary:QuizBoundary):HTMLElement{
     if(boundary.course_id!==courseId||boundary.task_id!==task.id||(boundary.kind==='video_popup'?task.kind!=='video':boundary.kind!==task.kind))throw new Error('测验课程、资源或类型身份已经改变。');
     if(this.#semantic.ready())return this.#semantic.quizRoot(task,boundary);

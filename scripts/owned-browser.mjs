@@ -8,10 +8,12 @@ export async function ownedBrowserConnection(file){
   if(connection.scope!=='owned-isolated-course-materials')throw new Error('Browser connection has no owned course scope.');
   const profile=resolve(connection.profile),path=relative(runtime,profile);
   if(path.startsWith('..')||isAbsolute(path)||!path||(await realpath(profile)).toLowerCase()!==profile.toLowerCase()||(await lstat(profile)).isSymbolicLink())throw new Error('Browser profile is outside the owned runtime.');
-  const port=Number((await readFile(resolve(profile,'DevToolsActivePort'),'utf8')).split(/\r?\n/,1)[0]);
+  const processes=JSON.parse(execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',"@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.Name -in @('chrome.exe','msedge.exe') -and $_.CommandLine -and $_.CommandLine -notmatch '(?:^|\\s)--type=' -and $_.CommandLine.Contains($env:VV_OWNED_BROWSER_PROFILE) -and $_.CommandLine.Contains('--remote-debugging-port') } | Select-Object -ExpandProperty CommandLine) | ConvertTo-Json -Compress"],{env:{...process.env,VV_OWNED_BROWSER_PROFILE:profile},encoding:'utf8',windowsHide:true}).trim());
+  const commands=typeof processes==='string'?[processes]:processes;
+  if(!Array.isArray(commands)||commands.length!==1)throw new Error('Owned browser process could not be uniquely verified.');
+  const declared=[...commands[0].matchAll(/--remote-debugging-port(?:=|\s+)(\d+)/g)].at(-1)?.[1];
+  const port=Number(declared&&declared!=='0'?declared:(await readFile(resolve(profile,'DevToolsActivePort'),'utf8')).split(/\r?\n/,1)[0]);
   if(!Number.isInteger(port)||port<1||port>65535)throw new Error('Owned browser port is invalid.');
-  const count=Number(execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',"@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.Name -in @('chrome.exe','msedge.exe') -and $_.CommandLine -and $_.CommandLine.Contains($env:VV_OWNED_BROWSER_PROFILE) -and $_.CommandLine.Contains('--remote-debugging-port') }).Count"],{env:{...process.env,VV_OWNED_BROWSER_PROFILE:profile},encoding:'utf8',windowsHide:true}).trim());
-  if(count!==1)throw new Error('Owned browser process could not be uniquely verified.');
   return {...connection,profile,port};
 }
 

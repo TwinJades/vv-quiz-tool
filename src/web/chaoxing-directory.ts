@@ -20,14 +20,15 @@ export function readChaoxingDirectory(document: Document): ChaoxingDirectoryRead
   ] };
   if (!courseId) reading.diagnostics.push('当前frame无法唯一确认公开课程ID。');
   const seen = new Set<string>();
-  for (const row of Array.from(document.querySelectorAll<HTMLElement>('.chapter_item[id]')).filter(e => !isExplicitlyHidden(e))) {
+  // Adapted from upstream course_catalog.js readCourseCatalog; IDs remain public DOM IDs.
+  for (const row of Array.from(document.querySelectorAll<HTMLElement>('.chapter_item[id],.posCatalog_select[id^="cur"],h4[id^="cur"]')).filter(e => !isExplicitlyHidden(e))) {
     const id = /^cur(\d+)$/.exec(row.id)?.[1];
-    const titles = Array.from(row.querySelectorAll<HTMLElement>(':scope > .catalog_title > .catalog_name > a.clicktitle')).filter(e => !isExplicitlyHidden(e));
-    if (!id || seen.has(id) || titles.length !== 1 || !titles[0]!.innerText.trim()) {
+    const titles = Array.from(row.querySelectorAll<HTMLElement>(':scope > .catalog_title > .catalog_name > a.clicktitle,:scope > .posCatalog_name,:scope > a[title]')).filter(e => !isExplicitlyHidden(e));
+    if (!id || seen.has(id) || titles.length !== 1 || !normalizedText(titles[0]!.getAttribute('title')||titles[0]!.textContent)) {
       reading.diagnostics.push('课时公开ID或标题无法唯一确认。'); continue;
     }
     seen.add(id);
-    reading.lessons.push({ id, title: normalizedText(titles[0]!.innerText), order: reading.lessons.length,
+    reading.lessons.push({ id, title: normalizedText(titles[0]!.getAttribute('title')||titles[0]!.textContent), order: reading.lessons.length,
       observed_markers: Array.from(row.querySelectorAll('.catalog_task .catalog_state')).filter(e => !isExplicitlyHidden(e))
         .flatMap(e => Array.from(e.classList)).filter(c => /^[a-zA-Z0-9_-]{1,64}$/.test(c)) });
   }

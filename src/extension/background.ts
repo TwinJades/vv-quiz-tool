@@ -17,7 +17,7 @@ import {createKnowledgeRun,KnowledgeTabPlatform,previewKnowledge} from './knowle
 declare const __VV_BUILD_ID__: string;
 import type {KnowledgePracticeOrchestrator} from '../core/knowledge-practice';
 import {hasActiveDebuggerTransport} from './visual-transport';
-import {COURSE_RECORD_PREFIX,courseResumeUrl,savedCourseMatches,courseCatalogMatchesUrl,persistCourseRecord} from './course-record';
+import {COURSE_RECORD_PREFIX,courseResumeUrl,savedCourseMatches,courseCatalogMatchesUrl,persistCourseRecord,validCourseResumeUrl} from './course-record';
 import type {SavedCourseRecord} from './course-record';
 import type {CourseCatalog} from '../core/course';
 
@@ -35,6 +35,7 @@ const pendingCommits = new Map<number, Promise<SessionRuntimeSnapshot>>();
 const startingTabs = new Set<number>();
 const snapshotWrites=new Map<number,Promise<void>>();
 const courseUrls=new Map<number,string>();
+const courseOpenRequests=new Map<string,Promise<chrome.tabs.Tab>>();
 interface PreparedCourse {id:string;tab_id:number;provider_profile_id:string;model_id:string;budget:ModelCallBudget;catalog:CourseCatalog;platform:CourseTabPlatform}
 const preparedCourses=new Map<number,PreparedCourse>();
 const preparationRuns=new Map<number,{controller:AbortController;platform:CourseTabPlatform;id:string}>();
@@ -138,7 +139,8 @@ async function loadSessionSnapshot(tabId: number): Promise<SessionRuntimeSnapsho
       ![...sessions.values()].some(session=>session.snapshot.session_id===(value as SavedCourseRecord).snapshot.session_id)&&savedCourseMatches(frame.url,value as SavedCourseRecord)).map(([,value])=>value as SavedCourseRecord);
     if(matches.length>1)throw new Error('当前课程有多个保存任务，请在所有任务中选择需要恢复的任务。');
     const record=matches[0];if(!record)return undefined;
-    courseUrls.set(tabId,frame.url);
+    const resumeUrl=validCourseResumeUrl(frame.url,record.snapshot.course!.checkpoint!.catalog);if(!resumeUrl)return undefined;
+    courseUrls.set(tabId,resumeUrl);
     const recovered={...record.snapshot,state:'PAUSED' as const,notice:'课程断点已保存。确认登录后点击继续，重新核对平台记录。'};
     await chrome.storage.session.set({[key]:recovered,['vv-start-request:'+tabId]:{...record.request,tab_id:tabId}});
     return recovered;
@@ -309,7 +311,8 @@ async function startSession(request: StartSessionRequest,restore?:SessionRuntime
     if(!catalog)throw new Error('请先加载课程并确认范围。');
     if([...sessions.values()].some(session=>session.snapshot.course?.course_id===catalog.course_id&&session.snapshot.course.checkpoint?.catalog.context_id===catalog.context_id&&!['COMPLETE','CANCELLED','FAILED'].includes(session.snapshot.state)))throw new Error('这门课程已有运行任务，请在所有任务中继续该任务。');
     const sessionId=restore?.session_id??prepared!.id;
-    const frame=await chrome.webNavigation.getFrame({tabId:request.tab_id,frameId:0});if(!frame?.url)throw new Error('课程页面已关闭。');courseUrls.set(request.tab_id,frame.url);
+    const frame=await chrome.webNavigation.getFrame({tabId:request.tab_id,frameId:0}),resumeUrl=validCourseResumeUrl(frame?.url,catalog);
+    if(!resumeUrl)throw new Error('课程页面地址与课程、班级身份不匹配。');courseUrls.set(request.tab_id,resumeUrl);
     const initial:SessionRuntimeSnapshot=restore??{session_id:sessionId,state:'WAIT_READY',strategy:request.strategy,observation_input_mode:'structured',provider_profile_id:profile.provider_profile_id,model_id:request.model_id,
       model_calls:{used:budget.used,limit:budget.limit},progress:{total:request.course.scope.length,answered:0,guessed:0,retried:0,skipped:0,failed:0},notice:'正在核对课程页面。',summary:null,
       course:{phase:'OBSERVE_COURSE',course_id:catalog.course_id,title:catalog.title,scope:request.course.scope,current_task_id:null,estimate_seconds:null,estimate_frozen:true,video:{ended:false,progress_recorded:false},results:[],tasks:catalog.tasks,excluded:[],checkpoint:{format_version:2,catalog,completed:[],children:[],pending_quiz:null}}};
@@ -409,7 +412,14 @@ async function taskPanelSnapshot(): Promise<TaskPanelSnapshot> {
     try {
       const tab = await chrome.tabs.get(tabId);
       const snapshot = await visibleSessionSnapshot(tabId);
-      if (snapshot) tasks.push({ tab_id: tabId, title: tab.title || `标签 ${tabId}`, url: tab.url ?? null, provider_name: (await providerManager.get(snapshot.provider_profile_id))?.display_name || "Provider 已移除", snapshot, resumable: sessions.has(tabId)||snapshot.state==='PAUSED'&&Boolean(snapshot.checkpoint||snapshot.course?.checkpoint||snapshot.practice?.checkpoint?.child_active===false) });
+      if(snapshot){
+        const catalog=snapshot.course?.checkpoint?.catalog;
+        if(catalog&&!validCourseResumeUrl(tab.url,catalog)){
+          const key=COURSE_RECORD_PREFIX+snapshot.session_id,record=(await chrome.storage.local.get(key))[key] as SavedCourseRecord|undefined;
+          const url=validCourseResumeUrl(record?.url,catalog);
+          tasks.push({tab_id:tabId,saved_session_id:snapshot.session_id,title:snapshot.course!.title,url,provider_name:(await providerManager.get(snapshot.provider_profile_id))?.display_name??'Provider 已移除',snapshot:{...snapshot,notice:'原任务标签已离开课程。请打开原课程核对后继续。'},resumable:false});
+        }else tasks.push({tab_id:tabId,title:tab.title||`标签 ${tabId}`,url:tab.url??null,provider_name:(await providerManager.get(snapshot.provider_profile_id))?.display_name||'Provider 已移除',snapshot,resumable:sessions.has(tabId)||snapshot.state==='PAUSED'&&Boolean(snapshot.checkpoint||snapshot.course?.checkpoint||snapshot.practice?.checkpoint?.child_active===false)});
+      }
     } catch { /* A closed target is not a task. */ }
   }
   const records=await chrome.storage.local.get(null),activeIds=new Set(tasks.map(task=>task.snapshot.session_id));
@@ -551,13 +561,37 @@ async function handleRequest(
     }
   }
   if(request.type==='VV_OPEN_SAVED_COURSE'){
-    const key=COURSE_RECORD_PREFIX+request.session_id,stored=await chrome.storage.local.get(key),record=stored[key] as SavedCourseRecord|undefined;
-    if(!record)throw new Error('保存的课程已被清除。');
-    const tab=await chrome.tabs.create({url:record.url});
-    if(tab.id===undefined)throw new Error('课程标签创建失败。');
-    courseUrls.set(tab.id,record.url);
-    await chrome.storage.session.set({[sessionSnapshotKey(tab.id)]:{...record.snapshot,state:'PAUSED',notice:'课程断点已保存。确认登录后点击继续。'},['vv-start-request:'+tab.id]:{...record.request,tab_id:tab.id}});
-    return tab;
+    const opening=courseOpenRequests.get(request.session_id);if(opening)return opening;
+    const open=(async()=>{
+      const key=COURSE_RECORD_PREFIX+request.session_id,stored=await chrome.storage.local.get(key),record=stored[key] as SavedCourseRecord|undefined;
+      if(!record)throw new Error('保存的课程已被清除。');
+      const catalog=record.snapshot.course?.checkpoint?.catalog,url=catalog?validCourseResumeUrl(record.url,catalog):null;
+      if(!catalog||!url)throw new Error('课程保存缺少可恢复的匹配地址。');
+      const snapshots=await chrome.storage.session.get(null);
+      const bindings=new Set([...sessions.entries()].filter(([,session])=>session.snapshot.session_id===request.session_id).map(([id])=>id));
+      for(const [snapshotKey,value] of Object.entries(snapshots))if(snapshotKey.startsWith(SESSION_SNAPSHOT_PREFIX)&&(value as SessionRuntimeSnapshot).session_id===request.session_id)bindings.add(Number(snapshotKey.slice(SESSION_SNAPSHOT_PREFIX.length)));
+      for(const id of bindings){
+        let tab:chrome.tabs.Tab|undefined;try{tab=await chrome.tabs.get(id);}catch{/* Closed old binding. */}
+        if(tab&&validCourseResumeUrl(tab.url,catalog)){if(tab.windowId!==undefined)await chrome.windows.update(tab.windowId,{focused:true});const focused=await chrome.tabs.update(id,{active:true});if(!focused)throw new Error('原课程标签已关闭。');return focused;}
+      }
+      for(const id of bindings){
+        const managed=sessions.get(id);queue.cancelQueued(id);
+        if(managed){managed.orchestrator.pause('原任务标签已离开课程。请打开原课程核对后继续。');await managed.platform.disableInteraction();}
+        const deadline=Date.now()+30000;
+        while(queue.has(id)){if(Date.now()>=deadline)throw new Error('原课程任务仍在完成暂停，请稍后打开。');await new Promise<void>(resolve=>setTimeout(resolve,50));}
+        await snapshotWrites.get(id);
+        sessions.delete(id);startupFailures.delete(id);courseUrls.delete(id);
+        await chrome.storage.session.remove([sessionSnapshotKey(id),'vv-start-request:'+id]);
+      }
+      const latest=(await chrome.storage.local.get(key))[key] as SavedCourseRecord|undefined;
+      const saved=latest??record,tab=await chrome.tabs.create({url});
+      if(tab.id===undefined)throw new Error('课程标签创建失败。');
+      courseUrls.set(tab.id,url);
+      await chrome.storage.session.set({[sessionSnapshotKey(tab.id)]:{...saved.snapshot,state:'PAUSED',notice:'课程断点已保存。确认登录后点击继续。'},['vv-start-request:'+tab.id]:{...saved.request,tab_id:tab.id}});
+      return tab;
+    })();
+    courseOpenRequests.set(request.session_id,open);
+    try{return await open;}finally{courseOpenRequests.delete(request.session_id);}
   }
   if (request.type === "VV_GET_TASKS") return taskPanelSnapshot();
   if(request.type==='VV_INSPECT_COURSE'){
@@ -734,14 +768,21 @@ async function pauseWithoutWebsitePermission(tabId: number, url: string): Promis
 // The already-required webNavigation permission supplies the actual main URL.
 function checkMainNavigation(details: { tabId: number; frameId: number; url: string }): void {
   if(details.frameId===0)preparedCourses.delete(details.tabId);
-  if(details.frameId===0&&sessions.get(details.tabId)?.snapshot.course)courseUrls.set(details.tabId,details.url);
+    // A requested navigation is not yet a valid resumable course address.
   if (details.frameId !== 0 || !sessions.has(details.tabId)) return;
   latestMainNavigation.set(details.tabId, details.url);
   void pauseWithoutWebsitePermission(details.tabId, details.url);
 }
 chrome.webNavigation.onBeforeNavigate.addListener(checkMainNavigation);
-chrome.webNavigation.onCommitted.addListener(checkMainNavigation);
-chrome.webNavigation.onHistoryStateUpdated.addListener(checkMainNavigation);
+function committedCourseNavigation(details:{tabId:number;frameId:number;url:string}):void{
+  checkMainNavigation(details);if(details.frameId!==0)return;
+  const session=sessions.get(details.tabId),catalog=session?.snapshot.course?.checkpoint?.catalog;
+  if(!catalog)return;const url=validCourseResumeUrl(details.url,catalog);
+  if(url)courseUrls.set(details.tabId,url);
+  else if(session&&!['PAUSED','COMPLETE','CANCELLED','FAILED'].includes(session.snapshot.state)){queue.cancelQueued(details.tabId);session.orchestrator.pause('原任务标签已离开课程。请打开原课程核对后继续。');}
+}
+chrome.webNavigation.onCommitted.addListener(committedCourseNavigation);
+chrome.webNavigation.onHistoryStateUpdated.addListener(committedCourseNavigation);
 
 chrome.permissions.onRemoved.addListener(() => {
   for (const tabId of sessions.keys()) {

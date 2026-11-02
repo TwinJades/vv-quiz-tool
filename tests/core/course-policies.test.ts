@@ -1,6 +1,6 @@
 import {describe,expect,it} from 'vitest';
-import {courseRecordConfirms,courseScopeForSelection,courseScopeConfirmed,nextCourseResource,validateCourseResources,validateCourseScope,VideoEstimate} from '../../src/core/course';
-import type {CourseCatalog,LearningTask,CourseVerification,VideoSnapshot} from '../../src/core/course';
+import {CourseOrchestrator,courseRecordConfirms,courseScopeForSelection,courseScopeConfirmed,nextCourseResource,validateCourseResources,validateCourseScope,VideoEstimate} from '../../src/core/course';
+import type {CourseAdapter,CourseCatalog,CourseQuizRunner,LearningTask,CourseVerification,QuizBoundary,VideoSnapshot} from '../../src/core/course';
 import {ModelCallBudget} from '../../src/core/call-budget';
 import {projectCourseFrame} from '../../src/web/frame-projection';
 
@@ -75,5 +75,153 @@ describe('课程预算、播放估计和框架坐标的纯逻辑',()=>{
     const secondProjection=projectCourseFrame(firstProjection.point,firstProjection.region,{rect:{x:5,y:10,width:500,height:400},width:500,height:400,left:1,top:1});
     expect(secondProjection.point).toEqual({x:150,y:277});
     expect(()=>projectCourseFrame({x:0,y:0},{x:0,y:0,width:1,height:1},{rect:{x:0,y:0,width:1,height:1},width:0,height:1,left:0,top:0})).toThrow();
+  });
+});
+
+type PlaybackScenario={
+  video:(time:number)=>Partial<VideoSnapshot>;
+  verified?:boolean;
+  popupDuration?:number;
+};
+
+function playbackScenario(scenario:PlaybackScenario){
+  let time=0,pauses=0,returns=0,quizRuns=0,mediaEnded=false;
+  const plays:number[]=[],waits:number[]=[];
+  const course:CourseCatalog={...catalog,tasks:[{...parent}]};
+  const child:LearningTask={...first,prerequisites:[]};
+  const boundary:QuizBoundary={id:'popup',course_id:'course',task_id:child.id,kind:'video_popup',rules:{scored:false,retry_allowed:false,remaining_attempts:null,requires_pass:false,requires_rewatch:false}};
+  const adapter:CourseAdapter={
+    catalog:async()=>structuredClone(course),children:async()=>[{...child}],enter:async()=>{},
+    video:async()=>{const video:VideoSnapshot={course_id:'course',task_id:child.id,video_id:'media-a',observed_at:time,duration:1000,position:0,rate:1,paused:false,buffering:false,seeking:false,ended:false,visible:true,popup:null,...scenario.video(time)};mediaEnded ||= video.ended;return video;},
+    highestAllowedSpeed:async()=>{},mute:async()=>{},play:async()=>{plays.push(time);},pauseVideo:async()=>{pauses++;return true;},
+    verify:async task=>({...record,task_id:task.id,progress_recorded:mediaEnded&&scenario.verified!==false,completed:mediaEnded&&scenario.verified!==false}),
+    returnToCatalog:async()=>{returns++;},quiz:async()=>boundary,
+  };
+  const quizzes:CourseQuizRunner={pause:()=>{},run:async()=>{quizRuns++;time+=scenario.popupDuration??0;return {status:'completed',reason:null,submission_confirmed:true,passed:true,visible_score:null,retried:0};}};
+  const orchestrator=new CourseOrchestrator(adapter,quizzes,{session_id:'session',catalog:course,scope:[parent.id],strategy:'unattended',provider_profile_id:'profile',model_id:'model',budget:new ModelCallBudget(10),now:()=>time,wait:async(ms,signal)=>{signal.throwIfAborted();waits.push(ms);time+=ms;}});
+  return {orchestrator,boundary,plays,waits,get time(){return time;},get pauses(){return pauses;},get returns(){return returns;},get quizRuns(){return quizRuns;}};
+}
+
+describe('课程编排器的有界播放恢复',()=>{
+  it('缓冲超过两分钟后仍可恢复，并只在平台确认记录后完成',async()=>{
+    const run=playbackScenario({video:time=>time<130000?{buffering:true}:{position:(time-130000)/1000,ended:time>=132000}});
+    await run.orchestrator.run();
+    expect(run.time).toBeGreaterThanOrEqual(132000);
+    expect(run.plays).toEqual([]);
+    expect(run.orchestrator.snapshot().state).toBe('COMPLETE');
+    expect(run.orchestrator.snapshot().course?.video.progress_recorded).toBe(true);
+    expect(run.waits).toContain(500);
+  });
+  it('持续无进展到五分钟停止，边界不再发起播放',async()=>{
+    const run=playbackScenario({video:time=>({buffering:true,paused:time>=300000})});
+    await run.orchestrator.run();
+    expect(run.time).toBe(300000);
+    expect(run.plays).toEqual([]);
+    expect(run.orchestrator.snapshot().state).toBe('PAUSED');
+    expect(run.orchestrator.snapshot().course?.issues?.some(issue=>issue.reason.startsWith('COURSE_VIDEO_STALLED:'))).toBe(true);
+    expect(run.pauses).toBeGreaterThan(0);
+  });
+  it('同一资源的播放器重建不会重置五分钟停滞时钟',async()=>{
+    let surface={video_id:'media-a',resource_fingerprint:'same-resource',buffering:true,position:0},rebuilds=0;
+    const run=playbackScenario({video:time=>{
+      if(time>0&&time%60000===0){surface={...surface};rebuilds++;}
+      return surface;
+    }});
+    await run.orchestrator.run();
+    expect(rebuilds).toBe(5);
+    expect(run.time).toBe(300000);
+    expect(run.plays).toEqual([]);
+    expect(run.orchestrator.snapshot().state).toBe('PAUSED');
+    expect(run.orchestrator.snapshot().course?.issues?.some(issue=>issue.reason.startsWith('COURSE_VIDEO_STALLED:'))).toBe(true);
+  });
+  it('暂停恢复每三秒最多一次，八次后确认暂停而不发第九次',async()=>{
+    const run=playbackScenario({video:()=>({paused:true})});
+    await run.orchestrator.run();
+    expect(run.plays).toEqual([0,3000,6000,9000,12000,15000,18000,21000]);
+    expect(run.time).toBe(24000);
+    expect(run.pauses).toBeGreaterThan(0);
+    expect(run.orchestrator.snapshot().state).toBe('PAUSED');
+  });
+  it('真实连续前进十秒后重置恢复次数',async()=>{
+    const run=playbackScenario({video:time=>time<21000?{paused:true}:time<32500?{position:(time-21000)/1000}:time<60000?{position:11.5,paused:true}:{position:12,ended:true}});
+    await run.orchestrator.run();
+    expect(run.plays.slice(0,7)).toEqual([0,3000,6000,9000,12000,15000,18000]);
+    expect(run.plays.filter(time=>time>=32500).length).toBe(8);
+    expect(run.orchestrator.snapshot().state).toBe('PAUSED');
+  });
+  it('拖动产生的位置变化不计有效进展',async()=>{
+    const run=playbackScenario({video:time=>({position:time/500,seeking:true})});
+    await run.orchestrator.run();
+    expect(run.time).toBe(300000);
+    expect(run.plays).toEqual([]);
+    expect(run.orchestrator.snapshot().state).toBe('PAUSED');
+  });
+  it('弹题处理耗时不计入停滞，解除后重新计时',async()=>{
+    let boundary:QuizBoundary;
+    const run=playbackScenario({popupDuration:200000,video:time=>time===100000?{popup:boundary}:time>=499000?{ended:true}: {buffering:true}});
+    boundary=run.boundary;
+    await run.orchestrator.run();
+    expect(run.quizRuns).toBe(1);
+    expect(run.time).toBe(499000);
+    expect(run.orchestrator.snapshot().state).toBe('COMPLETE');
+  });
+  it('媒体结束但平台始终无记录时两分钟后停止且不显示完成',async()=>{
+    const run=playbackScenario({video:()=>({ended:true}),verified:false});
+    await run.orchestrator.run();
+    expect(run.time).toBe(120000);
+    expect(run.returns).toBeGreaterThanOrEqual(1);
+    expect(run.orchestrator.snapshot().state).not.toBe('COMPLETE');
+    expect(run.orchestrator.snapshot().course?.video.progress_recorded).toBe(false);
+  });
+  it('关联测验目录状态滞后但已有记录时不请求模型或再次提交',async()=>{
+    const course:CourseCatalog={...catalog,tasks:[{...parent}]};
+    const child:LearningTask={...quiz,prerequisites:[],status:'in_progress'};
+    const boundary:QuizBoundary={id:'existing-child',course_id:'course',task_id:child.id,kind:'lesson_quiz',rules:{scored:true,retry_allowed:false,remaining_attempts:0,requires_pass:true,requires_rewatch:false}};
+    let runs=0,reads=0;
+    const adapter:CourseAdapter={catalog:async()=>structuredClone(course),children:async()=>[{...child}],enter:async()=>{},video:async()=>{throw new Error('unexpected video');},highestAllowedSpeed:async()=>{},mute:async()=>{},play:async()=>{},pauseVideo:async()=>true,verify:async task=>{reads++;return {...record,task_id:task.id,submission_confirmed:true,passed:true,record_source:'existing_record'};},returnToCatalog:async()=>{},quiz:async()=>boundary};
+    const quizzes:CourseQuizRunner={pause:()=>{},run:async()=>{runs++;throw new Error('已有记录不应请求模型');}};
+    const orchestrator=new CourseOrchestrator(adapter,quizzes,{session_id:'child-existing',catalog:course,scope:[parent.id],strategy:'unattended',provider_profile_id:'profile',model_id:'model',budget:new ModelCallBudget(10)});
+    await orchestrator.run();
+    expect(reads).toBeGreaterThan(0);
+    expect(runs).toBe(0);
+    expect(orchestrator.snapshot().model_calls.used).toBe(0);
+    expect(orchestrator.snapshot().state).toBe('COMPLETE');
+  });
+  it('关联子测验已提交不及格且要求及格时交由答题器处理重试',async()=>{
+    const course:CourseCatalog={...catalog,tasks:[{...parent}]};
+    const child:LearningTask={...quiz,prerequisites:[],status:'in_progress'};
+    const boundary:QuizBoundary={id:'retry-child',course_id:'course',task_id:child.id,kind:'lesson_quiz',rules:{scored:true,retry_allowed:true,remaining_attempts:1,requires_pass:true,requires_rewatch:false}};
+    let runs=0;
+    const adapter:CourseAdapter={catalog:async()=>structuredClone(course),children:async()=>[{...child}],enter:async()=>{},video:async()=>{throw new Error('unexpected video');},highestAllowedSpeed:async()=>{},mute:async()=>{},play:async()=>{},pauseVideo:async()=>true,verify:async task=>({...record,task_id:task.id,submission_confirmed:true,passed:runs>0,record_source:'existing_record'}),returnToCatalog:async()=>{},quiz:async()=>boundary};
+    const quizzes:CourseQuizRunner={pause:()=>{},run:async received=>{expect(received).toEqual(boundary);runs++;return {status:'completed',reason:null,submission_confirmed:true,passed:true,visible_score:null,retried:1};}};
+    const orchestrator=new CourseOrchestrator(adapter,quizzes,{session_id:'child-retry',catalog:course,scope:[parent.id],strategy:'unattended',provider_profile_id:'profile',model_id:'model',budget:new ModelCallBudget(10)});
+    await orchestrator.run();
+    expect(runs).toBe(1);
+    expect(orchestrator.snapshot().state).toBe('COMPLETE');
+  });
+  it('关联子测验已提交待批阅时即使显示不及格也不调用答题器',async()=>{
+    const course:CourseCatalog={...catalog,tasks:[{...parent}]};
+    const child:LearningTask={...quiz,prerequisites:[],status:'in_progress'};
+    const boundary:QuizBoundary={id:'pending-child',course_id:'course',task_id:child.id,kind:'lesson_quiz',rules:{scored:true,retry_allowed:true,remaining_attempts:1,requires_pass:true,requires_rewatch:false}};
+    let runs=0;
+    const adapter:CourseAdapter={catalog:async()=>structuredClone(course),children:async()=>[{...child}],enter:async()=>{},video:async()=>{throw new Error('unexpected video');},highestAllowedSpeed:async()=>{},mute:async()=>{},play:async()=>{},pauseVideo:async()=>true,verify:async task=>({...record,task_id:task.id,submission_confirmed:true,passed:false,pending_grading:true,record_source:'existing_record'}),returnToCatalog:async()=>{},quiz:async()=>boundary};
+    const quizzes:CourseQuizRunner={pause:()=>{},run:async()=>{runs++;throw new Error('待批阅不应请求模型');}};
+    const orchestrator=new CourseOrchestrator(adapter,quizzes,{session_id:'child-pending',catalog:course,scope:[parent.id],strategy:'unattended',provider_profile_id:'profile',model_id:'model',budget:new ModelCallBudget(10)});
+    await orchestrator.run();
+    expect(runs).toBe(0);
+    expect(orchestrator.snapshot().model_calls.used).toBe(0);
+    expect(orchestrator.snapshot().state).not.toBe('COMPLETE');
+  });
+  it('已有测验记录直接核对，不再调用答题模型',async()=>{
+    const course:CourseCatalog={...catalog,tasks:[{...quiz,prerequisites:[]}]};
+    const boundary:QuizBoundary={id:'quiz-boundary',course_id:'course',task_id:quiz.id,kind:'lesson_quiz',rules:{scored:true,retry_allowed:false,remaining_attempts:0,requires_pass:true,requires_rewatch:false}};
+    let runs=0,finished=false;
+    const adapter:CourseAdapter={catalog:async()=>({...course,tasks:[{...course.tasks[0]!,status:finished?'completed':'not_started'}]}),enter:async()=>{},video:async()=>{throw new Error('unexpected video');},highestAllowedSpeed:async()=>{},mute:async()=>{},play:async()=>{},pauseVideo:async()=>true,verify:async()=>({...record,task_id:quiz.id,submission_confirmed:true,passed:true,record_source:'existing_record'}),returnToCatalog:async()=>{finished=true;},quiz:async()=>boundary};
+    const quizzes:CourseQuizRunner={pause:()=>{},run:async()=>{runs++;throw new Error('已有记录不应请求模型');}};
+    const orchestrator=new CourseOrchestrator(adapter,quizzes,{session_id:'existing',catalog:course,scope:[quiz.id],strategy:'unattended',provider_profile_id:'profile',model_id:'model',budget:new ModelCallBudget(10)});
+    await orchestrator.run();
+    expect(orchestrator.snapshot().state).toBe('COMPLETE');
+    expect(orchestrator.snapshot().model_calls.used).toBe(0);
+    expect(runs).toBe(0);
   });
 });

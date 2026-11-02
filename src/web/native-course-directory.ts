@@ -19,14 +19,15 @@ export function readNativeCourseDirectory(document:Document):NativeCourseDirecto
     course=url.searchParams.get('courseid')??url.searchParams.get('courseId');
     context=url.searchParams.get('clazzid')??url.searchParams.get('classId');
     lesson=url.searchParams.get('chapterId')??url.searchParams.get('knowledgeid');
-    for(const root of [...document.querySelectorAll<HTMLElement>('.posCatalog_select[id^="cur"],.chapter_item[id^="cur"]')].filter(visible)){
-      const id=/^cur(\d+)$/.exec(root.id)?.[1],labels=[...root.querySelectorAll<HTMLElement>(':scope > .posCatalog_name,:scope > .catalog_title > .catalog_name > a.clicktitle')].filter(visible);
-      if(!id||labels.length!==1||!normalizedText(labels[0]!.innerText))return null;
+    // Modern and legacy public catalog rows, adapted from upstream readCourseCatalog.
+    for(const root of [...document.querySelectorAll<HTMLElement>('.posCatalog_select[id^="cur"],.chapter_item[id^="cur"],h4[id^="cur"]')].filter(visible)){
+      const id=/^cur(\d+)$/.exec(root.id)?.[1],labels=[...root.querySelectorAll<HTMLElement>(':scope > .posCatalog_name,:scope > .catalog_title > .catalog_name > a.clicktitle,:scope > a[title]')].filter(visible);
+      if(!id||labels.length!==1||!normalizedText(labels[0]!.getAttribute('title')||labels[0]!.innerText))return null;
       const group=root.closest<HTMLElement>('[chapterid],[data-chapter-id]');
       const completed=root.querySelector<HTMLElement>(':scope > .icon_Completed,:scope > .catalog_title > .catalog_task > .icon_yiwanc'),pending=root.querySelector<HTMLElement>(':scope > .catalog_points_yi,:scope > .catalog_title > .catalog_task > .catalog_jindu');
       const statusElement=completed??pending??undefined;
       const status=completed&&/已完成/.test(completed.textContent??'')?'completed':pending&&/个待完成任务点/.test(pending.textContent??'')?'not_started':undefined;
-      rows.push({id,chapter:group?.getAttribute('chapterid')??group?.getAttribute('data-chapter-id')??id,title:normalizedText(labels[0]!.innerText),root,entry:labels[0]!,label:labels[0]!,status,statusElement});
+      rows.push({id,chapter:group?.getAttribute('chapterid')??group?.getAttribute('data-chapter-id')??id,title:normalizedText(labels[0]!.getAttribute('title')||labels[0]!.innerText),root,entry:labels[0]!,label:labels[0]!,status,statusElement});
     }
     if(!rows.length)return null;
     if(!course||!context){
@@ -58,7 +59,7 @@ export function readNativeCourseDirectory(document:Document):NativeCourseDirecto
   // 未支持的分页和折叠结构交给语义识别，避免将部分目录认作全部。
   const directoryScope=root.closest<HTMLElement>('.knowledge,#coursetree')??root.parentElement??root;
   if(directoryScope.matches('[aria-expanded=false],[aria-busy=true]')||[...directoryScope.querySelectorAll<HTMLElement>('[aria-expanded=false],[aria-busy=true],.el-pagination,.pagination')].some(visible))return null;
-  if([...root.querySelectorAll<HTMLElement>('.posCatalog_select[id^="cur"],.chapter_item[id^="cur"],.item-content[knowledgeid]')].some(node=>!visible(node)))return null;
+  if([...root.querySelectorAll<HTMLElement>('.posCatalog_select[id^="cur"],.chapter_item[id^="cur"],h4[id^="cur"],.item-content[knowledgeid]')].some(node=>!visible(node)))return null;
   let scroll:HTMLElement|null=root;
   while(scroll&&!(scroll.scrollHeight>scroll.clientHeight+2&&/auto|scroll/.test(document.defaultView!.getComputedStyle(scroll).overflowY)))scroll=scroll.parentElement;
   scroll??=document.scrollingElement as HTMLElement|null;

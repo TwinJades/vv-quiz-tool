@@ -43,6 +43,7 @@ export function describeNotice(message: string, language?: UiLanguage): {text: s
     return {text:t('当前题目已经评分，网页没有提供重试按钮，运行已暂停。', {}, language)};
   if (message === 'The current question has already been graded. Open an unanswered question on the page before continuing.')
     return {text:t('当前题目已经评分，请在网页进入未作答题目后继续。', {}, language)};
+  if (/^[\u4e00-\u9fff]/.test(message)&&/权限|未授权/.test(message)) return (language??translations.language)==='zh-CN'?{text:message}:{text:t('当前网页权限不足，请授权该网站后继续。',{},language),details:message};
   if(/^[\u4e00-\u9fff]/.test(message)&&/课程|课时|知识点|视频|测验|弹题|目录|断点/.test(message))return (language??translations.language)==='zh-CN'?{text:message}:{text:t('课程任务需要处理。',{},language),details:message};
   const key = /SEMANTIC_NO_QUESTIONS/.test(message) ? '模型没有返回当前可答题目，请检查页面内容并重新识别。'
     : /PAGE_CHANGED/.test(message) ? '课程页面已经变化，请重新核验当前任务。'

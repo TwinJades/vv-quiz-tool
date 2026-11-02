@@ -17,6 +17,7 @@ import {collectContexts,queryAllDeep} from './dom-contexts';
 import {setDomSelected,setDomValue} from './dom-actions';
 import type {DomTarget,TargetIdentity} from './dom-actions';
 import {readQuestionFeedback} from './dom-result';
+import {chaoxingVideoQuizQuestions,chaoxingVideoQuizControl} from './chaoxing-video-quiz';
 import { SeparationTrial, cleanedVisibleText } from "./separation-trial";
 import type { InitialSemanticSnapshot, InitialSemanticReading } from "./initial-snapshot";
 import { SemanticDomMapping, semanticRoots, semanticQuestion, semanticOptionType, semanticOptionLabel, semanticSelected } from './semantic-dom-mapping';
@@ -283,6 +284,10 @@ function targetIdentity(
 }
 
 function questionStem(document: Document, root: HTMLElement): string {
+  if(root.matches('.tkItem')) {
+    const nativeStem=root.querySelector<HTMLElement>(':scope > .tkItem_title');
+    if(nativeStem)return elementText(nativeStem);
+  }
   const practiceStem = zhidaoStem(root);
   if (practiceStem) return practiceStem;
   const labelledBy = root.getAttribute("aria-labelledby");
@@ -427,6 +432,12 @@ export class DomWebAdapter implements PlatformAdapter {
   #initialDocumentIdentity: string | null = null;
   readonly #semanticMapping: SemanticDomMapping;
   #pageQuestions: Array<{ adapter: DomWebAdapter; prefix: string; parsed: PlatformObservation["questions"][number] }> = [];
+  #popupFeedbackBaseline: string | null = null;
+
+  #nativePopup(): HTMLElement | null {
+    const root=this.courseScope;
+    return root && (root.matches('.ans-videoquiz,[data-video-quiz-root]') || root.matches('[role=dialog],dialog,form') && Boolean(root.querySelector('#videoquiz-submit'))) ? root : null;
+  }
 
   constructor(document: Document, private readonly rootOverride?: HTMLElement, private readonly courseScope?: HTMLElement) {
     this.#document = document;
@@ -565,7 +576,7 @@ export class DomWebAdapter implements PlatformAdapter {
       if (this.#calibratedRoot) return this.#calibratedRoot;
       return undefined;
     }
-    return candidateRoots(this.#document).filter(root => !this.courseScope || this.courseScope.contains(root))[0];
+    return (this.#nativePopup() ? chaoxingVideoQuizQuestions(this.#nativePopup()!) : candidateRoots(this.#document).filter(root => !this.courseScope || this.courseScope.contains(root)))[0];
   }
 
   capabilities(): PlatformCapabilities {
@@ -592,10 +603,9 @@ export class DomWebAdapter implements PlatformAdapter {
       const blocker = this.detectHardBlocker();
       if (blocker) return { ready: false, reason: blocker };
       if (this.#semanticMapping.needsRecognition()) return { ready: false, reason: 'semantic_structure_changed' };
-      const roots = (this.#liveInitialRoots().length ? this.#initialRoots : this.#calibratedRoot?.isConnected ? [this.#calibratedRoot] : candidateRoots(this.#document))
-        .filter(root=>!this.courseScope||this.courseScope.contains(root));
+      const roots = this.#nativePopup() && !this.rootOverride ? chaoxingVideoQuizQuestions(this.#nativePopup()!) : (this.#liveInitialRoots().length ? this.#initialRoots : this.#calibratedRoot?.isConnected ? [this.#calibratedRoot] : candidateRoots(this.#document)).filter(root=>!this.courseScope||this.courseScope.contains(root));
       const activeRoot = roots[0];
-      if (activeRoot && !semanticQuestion(activeRoot) && Array.from(activeRoot.querySelectorAll("textarea, [contenteditable='true']"))
+      if (activeRoot && !semanticQuestion(activeRoot) && !(this.#nativePopup() && activeRoot.matches('.tkItem')) && Array.from(activeRoot.querySelectorAll("textarea, [contenteditable='true']"))
         .some((element) => !isExplicitlyHidden(element) && supportedInput(element))) {
         return { ready: false, reason: "unsupported_subjective_question" };
       }
@@ -630,12 +640,12 @@ export class DomWebAdapter implements PlatformAdapter {
     const blocker = this.detectHardBlocker();
     if (blocker) throw new Error(`HARD_BLOCKER:${blocker}`);
     const activeRoot = this.#activeRoot();
-    const roots = this.#liveInitialRoots().length ? this.#initialRoots : this.rootOverride || this.#separationTrial.structure() ? (activeRoot ? [activeRoot] : []) : candidateRoots(this.#document).filter(root => !this.courseScope || this.courseScope.contains(root));
+    const roots = this.#nativePopup() && !this.rootOverride ? chaoxingVideoQuizQuestions(this.#nativePopup()!) : this.#liveInitialRoots().length ? this.#initialRoots : this.rootOverride || this.#separationTrial.structure() ? (activeRoot ? [activeRoot] : []) : candidateRoots(this.#document).filter(root => !this.courseScope || this.courseScope.contains(root));
     if (roots.length === 0) throw new Error("No supported question was found.");
     if (roots.length > 1 && !this.rootOverride) return this.#observePage(roots, sessionId, signal, mode);
     this.#pageQuestions = [];
     const root = roots[0]!;
-    if (!semanticQuestion(root) && Array.from(root.querySelectorAll("textarea, [contenteditable='true']"))
+    if (!semanticQuestion(root) && !(this.#nativePopup() && root.matches('.tkItem')) && Array.from(root.querySelectorAll("textarea, [contenteditable='true']"))
       .some((element) => !isExplicitlyHidden(element) && supportedInput(element))) {
       throw new Error("HARD_BLOCKER:unsupported_subjective_question");
     }
@@ -737,6 +747,11 @@ export class DomWebAdapter implements PlatformAdapter {
         } else if (action.kind === "set_value") {
           setDomValue(target, action.value);
         } else {
+          if (this.#nativePopup() && (action.kind === 'submit_question' || action.kind === 'submit_session')) {
+            const scope=this.courseScope!;
+            const feedback=Array.from(scope.querySelectorAll<HTMLElement>("[role='alert'],[aria-live],.feedback,.answer-feedback,.result,[data-feedback]")).map(elementText).join(' ');
+            this.#popupFeedbackBaseline=readQuestionFeedback(undefined,'',feedback).feedbackEvidence.trim();
+          }
           if (target.kind !== "element") throw new Error("Control target is invalid.");
           target.element.click();
         }
@@ -820,7 +835,9 @@ export class DomWebAdapter implements PlatformAdapter {
     // H5P announces the new grade immediately, while its animated scorebar can
     // still display the previous attempt. Only use the current question's live
     // grade while grading is visible; unrelated page announcements are excluded.
-    const {localGrading,pointFeedback,feedbackEvidence,feedback}=readQuestionFeedback(feedbackRoot,pageText,feedbackText);
+    const rawFeedback=this.#nativePopup() ? readQuestionFeedback(undefined,'',feedbackText) : readQuestionFeedback(feedbackRoot,pageText,feedbackText);
+    const unchangedPopup=this.#nativePopup() && (this.#popupFeedbackBaseline === null || this.#popupFeedbackBaseline === rawFeedback.feedbackEvidence.trim());
+    const {localGrading,pointFeedback,feedbackEvidence,feedback}=unchangedPopup ? {localGrading:'',pointFeedback:null,feedbackEvidence:'',feedback:null} : rawFeedback;
     const editableAnswerTarget = [...this.#targets.values()].some(target => {
       if (target.identity.role !== 'option' && target.identity.role !== 'blank') return false;
       return !isExplicitlyHidden(target.element) && supportedInput(target.element);
@@ -858,7 +875,7 @@ export class DomWebAdapter implements PlatformAdapter {
       selected_target_ids: selectedTargetIds,
       field_values: fieldValues,
       feedback,
-      question_graded: Boolean(localGrading),
+      question_graded: Boolean(localGrading) || Boolean(this.#nativePopup() && feedback),
       ...(feedbackEvidence.trim() ? { feedback_text: feedbackEvidence.trim() } : {}),
       ...(personalSessionScore || visibleScore ? { visible_score: personalSessionScore ?? visibleScore! } : {}),
       can_retry:
@@ -890,8 +907,9 @@ export class DomWebAdapter implements PlatformAdapter {
       return { adapter, observation, parsed: observation.questions[0]!, prefix: `page_${index + 1}_` };
     }));
     this.#pageQuestions = children;
-    const globalSubmit = queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
-      .filter(element => !isExplicitlyHidden(element) && supportedInput(element) && !roots.some(root => root.contains(element)))
+    const popupSubmit=this.#nativePopup() && chaoxingVideoQuizControl(this.#nativePopup()!,'submit');
+    const globalSubmit = popupSubmit ? [popupSubmit] : queryAllDeep<HTMLElement>(this.#document, "button, input[type='submit'], input[type='button'], [role='button']")
+      .filter(element => (!this.courseScope || this.courseScope.contains(element)) && !isExplicitlyHidden(element) && supportedInput(element) && !roots.some(root => root.contains(element)))
       .filter(element => SESSION_SUBMIT_PATTERN.test(targetText(this.#document, element)) || SUBMIT_PATTERN.test(targetText(this.#document, element)));
     if (globalSubmit.length === 1) {
       const first = children[0]!;
@@ -1100,7 +1118,16 @@ export class DomWebAdapter implements PlatformAdapter {
         : checkboxControls.length > 0
           ? "multiple_choice"
           : "fill_blank";
-    const stemText = type === "fill_blank" ? blankQuestionStem(root, textControls, stem.text) : stem.text;
+    if(this.#nativePopup() && root.matches('.tkItem')) {
+      const topic=root.closest('.tkTopic');
+      const titles=topic ? Array.from(topic.querySelectorAll<HTMLElement>('.tkTopic_title')).filter(node=>node.closest('.tkTopic')===topic&&!isExplicitlyHidden(node)) : [];
+      if(titles.length>1)throw new Error('HARD_BLOCKER:ambiguous_native_question_type');
+      const title=elementText(titles[0]??null);
+      const expected=/单选/.test(title)?'single_choice':/多选/.test(title)?'multiple_choice':/填空/.test(title)?'fill_blank':null;
+      if(expected && (type!==expected || expected==='single_choice' && (!radioControls.length || checkboxControls.length>0 || textControls.length>0) || expected==='multiple_choice' && (!checkboxControls.length || radioControls.length>0 || textControls.length>0) || expected==='fill_blank' && (!textControls.length || radioControls.length>0 || checkboxControls.length>0)))throw new Error('HARD_BLOCKER:native_question_type_mismatch');
+      if(!expected && !semanticQuestion(root))throw new Error('HARD_BLOCKER:unknown_native_question_type');
+    }
+    const stemText = type === "fill_blank" && !root.matches('.tkItem') ? blankQuestionStem(root, textControls, stem.text) : stem.text;
     const options: QuestionFrame["options"] = [];
     const optionImages = new Set<HTMLImageElement>();
     const blanks: QuestionFrame["blanks"] = [];
@@ -1187,7 +1214,7 @@ export class DomWebAdapter implements PlatformAdapter {
     const nativeSubmit=nativeSubmits[0];
     let submit = nativeSubmit && !NEXT_PATTERN.test(targetText(ownerDocument, nativeSubmit))
       ? nativeSubmit
-      : this.#findButton(SUBMIT_PATTERN, root);
+      : this.#nativePopup() ? chaoxingVideoQuizControl(this.#nativePopup()!,'submit') : this.#findButton(SUBMIT_PATTERN, root);
     // A newly visible H5P Finish is a session control even after Check disappears.
     if (submit?.matches('button.h5p-question-finish') || semanticQuestion(root)?.controls.some(control => control.element === submit && control.role === 'session_submit')) submit = null;
     if (!submit && !this.rootOverride && !this.courseScope && candidateRoots(this.#document).length === 1) {
@@ -1205,7 +1232,7 @@ export class DomWebAdapter implements PlatformAdapter {
       targets.control_submit = { kind: "semantic", local_ref: localRef, role: "button" };
       this.#targets.set("control_submit", { kind: "element", element: submit, identity: targetIdentity(ownerDocument, submit, "submit") });
     }
-    const next = this.#findButton(NEXT_PATTERN, root) ?? this.#findButton(NEXT_PATTERN);
+    const next = this.#nativePopup() ? chaoxingVideoQuizControl(this.#nativePopup()!,'continue') : this.#findButton(NEXT_PATTERN, root) ?? this.#findButton(NEXT_PATTERN);
     if (next && next !== submit) {
       const localRef = randomId("node");
       targets.control_next = { kind: "semantic", local_ref: localRef, role: "button" };
@@ -1342,7 +1369,7 @@ export class DomWebAdapter implements PlatformAdapter {
       ? semanticQuestion(root)?.blanks ?? Array.from(root.querySelectorAll<HTMLElement>("input[type='text'], input[type='number'], input:not([type]), textarea, [contenteditable='true']"))
           .filter((element) => !isExplicitlyHidden(element) && (supportedInput(element) || hasVisibleQuestionSetGrade(root)))
       : [];
-    const stem = type === "fill_blank" ? blankQuestionStem(root, textControls, baseStem) : baseStem;
+    const stem = type === "fill_blank" && !root.matches('.tkItem') ? blankQuestionStem(root, textControls, baseStem) : baseStem;
     const options = select
       ? Array.from(select.options)
           .filter((option) => !option.disabled && option.value !== "")

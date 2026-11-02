@@ -8,6 +8,7 @@ import type {VideoSnapshot} from '../core/course';
 import { inspectCoursePage } from '../web/course-inspection';
 import { isExplicitlyHidden, normalizedText } from '../web/dom-utils';
 import { isObservedCourseInteraction } from '../web/course-interaction';
+import {chaoxingVideoQuizReady} from '../web/chaoxing-video-quiz';
 import { readZhidaoResult } from '../web/zhidao-result';
 import {KnowledgePracticePage} from '../web/knowledge-practice-page';
 import {readChaoxingPractice,applyChaoxingPracticeAnswers,submitChaoxingPractice} from '../web/chaoxing-practice';
@@ -145,7 +146,7 @@ if (window.__vvContentInstallation?.build_id!==__VV_BUILD_ID__) {
             if(inner.type==='VV_APPLY_INITIAL_SEMANTIC'){sendResponse({ok:true,result:quiz.applyInitialSemantic(inner.reading)});return;}
             if(inner.type==='VV_WAIT_READY'){
               if(request.boundary.kind==='video_popup'){
-                const ready=root.isConnected&&!isExplicitlyHidden(root)&&Array.from(root.querySelectorAll('input[type=radio],input[type=checkbox],[role=radio],[role=checkbox],.radio-view >li')).some(element=>!isExplicitlyHidden(element));
+                const ready=chaoxingVideoQuizReady(root)||root.isConnected&&!isExplicitlyHidden(root)&&Array.from(root.querySelectorAll('[role=radio],[role=checkbox],.radio-view >li')).some(element=>!isExplicitlyHidden(element));
                 sendResponse({ok:true,result:{ready,...(ready?{}:{reason:'实际弹题控件尚未加载。'})}});return;
               }
               sendResponse({ok:true,result:await quiz.waitUntilReady(signal)});return;
@@ -165,6 +166,7 @@ if (window.__vvContentInstallation?.build_id!==__VV_BUILD_ID__) {
             }
             if(inner.type==='VV_READ_STATE'){
               const result:PlatformState=await quiz.readState(signal);
+              if(request.boundary.kind==='video_popup'&&courseSubmit?.parentId===request.parent_session_id&&courseSubmit.boundaryId===request.boundary.id&&courseSubmit.taskId===request.task.id&&result.feedback===courseSubmit.state.feedback){result.feedback=null;result.question_graded=false;}
               if(request.boundary.kind==='video_popup')result.completed=false;
               else{
                 const record=await coursePage.execute({operation:'verify',course_id:request.course_id,task:request.task},signal) as import('../core/course').CourseVerification;

@@ -72,6 +72,7 @@ for (const file of [
   "icon48.png",
   "icon128.png",
   "_locales",
+  "THIRD_PARTY_NOTICES.txt",
 ]) {
   await cp(resolve(root, "static", file), resolve(outputDirectory, file), { force: true, recursive: true });
 }

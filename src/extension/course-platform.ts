@@ -1,5 +1,6 @@
 import { CourseOrchestrator, QuizOrchestrator, validateCourseScope } from '../core';
 import type { CourseAdapter, CourseCatalog, CourseOptions, CourseQuizResult, CourseQuizRunner, CourseVerification, LearningTask, QuizBoundary, VideoSnapshot } from '../core/course';
+import {courseRecoverableCode} from '../core/course';
 import type { RuntimePlatform, SessionRuntimeSnapshot } from '../core/orchestrator';
 import type {ProviderProfile, RunStrategy } from '../core/schema';
 import { ModelCallBudget, ModelCallLimitError } from '../core/call-budget';
@@ -19,7 +20,6 @@ import {ChaoxingQuizPlatform,ScopedQuizPlatform} from './course-quiz-platform';
 import {courseSurfaceFingerprint,courseSnapshotHasIdentity,courseResourceTasks} from '../web/course-surface';
 import type {CourseSurfaceReading,CourseSurfaceSnapshot,CourseFrameContext,CourseEmbeddedFrame} from '../web/course-surface';
 import {sendCourseMessage as send,projectCourseTarget} from './course-frame';
-import {CourseVideoInput} from './course-video-input';
 import {requireResourceId} from '../web/course-resource-identity';
 import {migrateCourseCheckpoint,COURSE_CHECKPOINT_VERSION} from '../core/course-checkpoint';
 
@@ -28,15 +28,47 @@ export class CourseTabPlatform implements CourseAdapter {
   #epoch=crypto.randomUUID();
   #frames:number[]=[];
   #interactionEnabled=false;
-  readonly #videoInput:CourseVideoInput;
   #documentId:string|null=null;
   #catalog:CourseCatalog|null=null;
-  #inputAt=0;
   #surfaceCache=new Map<number,{fingerprint:string;reading:CourseSurfaceReading;native:boolean;intent:CourseSurfaceSnapshot['intent']}>();
   #nativeFrames=new Map<number,{document_id:string;native:boolean}>();
   #activeTask:LearningTask|null=null;
-  #hoverFrame=0;
   #resourceBindings=new Map<number,{task_id:string;lesson_id:string;document_id:string}>();
+  #recoveryDeadline:number|null=null;
+  private async recoverObservation<T>(task:LearningTask|undefined,operation:(signal:AbortSignal)=>Promise<T>,signal:AbortSignal):Promise<T>{
+    const epoch=this.#epoch;
+    const check=()=>{signal.throwIfAborted();if(!this.#interactionEnabled||this.#epoch!==epoch)throw new Error('USER_INTERACTION: 课程交互已取消。');};
+    check();
+    try{return await operation(signal);}catch(error){
+      if(!courseRecoverableCode(error instanceof Error?error.message:String(error)))throw error;
+      const deadline=Date.now()+5000;let last=error;
+      const recovery=new AbortController(),cancel=()=>recovery.abort(signal.reason);
+      signal.addEventListener('abort',cancel,{once:true});
+      const expired=setTimeout(()=>recovery.abort(last),5000);
+      this.#recoveryDeadline=deadline;
+      const bounded=async<R>(action:()=>Promise<R>):Promise<R>=>{
+        check();recovery.signal.throwIfAborted();const remaining=deadline-Date.now();if(remaining<=0)throw last;
+        let timer:NodeJS.Timeout|undefined,abort=()=>{};
+        const stopped=new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(last),remaining);abort=()=>reject(signal.reason);signal.addEventListener('abort',abort,{once:true});});
+        try{return await Promise.race([action(),stopped]);}finally{clearTimeout(timer);signal.removeEventListener('abort',abort);}
+      };
+      try{
+        for(let attempt=0;attempt<2;attempt++){
+          await bounded(()=>new Promise<void>(resolve=>setTimeout(resolve,250)));check();
+          this.#surfaceCache.clear();this.#nativeFrames.clear();this.#resourceBindings.clear();
+          try{
+            await bounded(()=>this.locateCourseFrame(recovery.signal,task?'task':'directory'));check();
+            const reading=await bounded(()=>this.#surface(this.#frame,recovery.signal));check();
+            if(task&&(reading.current_lesson_id!==task.lesson_id||reading.current_resource_id!==null&&task.kind!=='lesson'&&reading.current_resource_id!==requireResourceId(task)))throw new Error('COURSE_IDENTITY_MISMATCH: 重新定位后目标资源已经改变。');
+            this.#documentId=(await bounded(()=>chrome.webNavigation.getFrame({tabId:this.tabId,frameId:this.#frame})))?.documentId??null;
+            await bounded(()=>send(this.tabId,this.#frame,{type:'VV_SET_INTERACTION',binding:this.interactionBinding()},recovery.signal));check();
+            return await bounded(()=>operation(recovery.signal));
+          }catch(next){check();if(!courseRecoverableCode(next instanceof Error?next.message:String(next)))throw next;last=next;}
+        }
+        throw last;
+      }finally{clearTimeout(expired);signal.removeEventListener('abort',cancel);recovery.abort();this.#recoveryDeadline=null;}
+    }
+  }
   #childBindings=new Set<{interactionMatches(id:string,epoch:string):boolean;disableInteraction():Promise<void>}>();
   private frameCandidates(results:PromiseSettledResult<{frame:number;snapshot:CourseSurfaceSnapshot}>[]):Array<{frame:number;snapshot:CourseSurfaceSnapshot}>{
     return results.flatMap(result=>result.status==='fulfilled'&&(result.value.snapshot.native_reading||result.value.snapshot.elements.length>3)?[result.value]:[])
@@ -60,7 +92,7 @@ export class CourseTabPlatform implements CourseAdapter {
         else failures.push(`框架 ${candidate.frame}：没有课时目录或返回目录入口。`);
       }catch(error){
         signal.throwIfAborted();
-        if(error instanceof SolverProviderError||error instanceof ModelCallLimitError)throw error;
+        if(error instanceof SolverProviderError||error instanceof ModelCallLimitError||error instanceof Error&&error.message.startsWith('COURSE_IDENTITY_MISMATCH:'))throw error;
         failures.push(`框架 ${candidate.frame}：${error instanceof Error?error.message:String(error)}`);
       }
     }
@@ -75,9 +107,9 @@ export class CourseTabPlatform implements CourseAdapter {
   activeTask():LearningTask|null{return this.#activeTask?structuredClone(this.#activeTask):null;}
   interactionBinding(){return {session_id:this.sessionId,epoch:this.#epoch,enabled:this.#interactionEnabled};}
   interactionMatches(sessionId:string,epoch:string):boolean{return [...this.#childBindings].some(child=>child.interactionMatches(sessionId,epoch))||this.#interactionEnabled&&this.sessionId===sessionId&&this.#epoch===epoch;}
-  constructor(readonly tabId:number,readonly sessionId:string,public courseId:string,known:CourseCatalog|undefined,private recognize:(snapshot:CourseSurfaceSnapshot,signal:AbortSignal)=>Promise<CourseSurfaceReading>){this.#catalog=known??null;this.#videoInput=new CourseVideoInput(tabId,(task,signal)=>this.projectedTarget(task,signal),()=>this.interactionBinding());}
+  constructor(readonly tabId:number,readonly sessionId:string,public courseId:string,known:CourseCatalog|undefined,private recognize:(snapshot:CourseSurfaceSnapshot,signal:AbortSignal)=>Promise<CourseSurfaceReading>){this.#catalog=known??null;}
   async #surface(frame:number,signal:AbortSignal,context?:CourseFrameContext,intent:CourseSurfaceSnapshot['intent']='task'):Promise<CourseSurfaceReading>{
-    const deadline=Date.now()+30000;let snapshot:CourseSurfaceSnapshot;
+    const deadline=Math.min(Date.now()+30000,this.#recoveryDeadline??Infinity);let snapshot:CourseSurfaceSnapshot;
     for(;;){
       signal.throwIfAborted();snapshot=await send<CourseSurfaceSnapshot>(this.tabId,frame,{type:'VV_CAPTURE_COURSE_SURFACE',session_id:this.sessionId,intent,...(context?{context}:{})},signal);
       if(snapshot.native_reading?(!snapshot.native_reading.busy||snapshot.native_reading.lessons.length>0||snapshot.native_reading.controls.length>0):snapshot.elements.length>3&&(snapshot.visible_text.trim()||snapshot.elements.some(element=>element.tag==='video')))break;
@@ -92,11 +124,11 @@ export class CourseTabPlatform implements CourseAdapter {
       const tab=await chrome.tabs.get(this.tabId);signal.throwIfAborted();
       if(tab.title?.trim()&&tab.url&&courseSnapshotHasIdentity({capture_id:snapshot.capture_id,url:tab.url,title:tab.title,native:snapshot.native,visible_text:'',elements:[]},reading.course_id,reading.context_id))reading.title=tab.title.trim();
     }
-    if(this.#catalog&&(reading.course_id!==this.#catalog.course_id||reading.context_id!==(this.#catalog.context_id??null)))throw new Error('当前页面课程或班级身份已改变。');
+    if(this.#catalog&&(reading.course_id!==this.#catalog.course_id||reading.context_id!==(this.#catalog.context_id??null)))throw new Error('COURSE_IDENTITY_MISMATCH: 当前页面课程或班级身份已改变。');
     await send(this.tabId,frame,{type:'VV_APPLY_COURSE_SURFACE',session_id:this.sessionId,reading},signal);
     if(intent!=='directory'){
       const current=await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:frame});signal.throwIfAborted();
-      if(!current?.documentId||current.url!==snapshot.url)throw new Error('课程资源读取期间框架文档已经改变。');
+      if(!current?.documentId||current.url!==snapshot.url)throw new Error('COURSE_OBSERVATION_STALE: 课程资源读取期间框架文档已经改变。');
       this.#nativeFrames.set(frame,{document_id:current.documentId,native:snapshot.native});
     }
     this.#surfaceCache.set(frame,{fingerprint,reading,native:snapshot.native,intent});return reading;
@@ -213,7 +245,6 @@ export class CourseTabPlatform implements CourseAdapter {
     this.#interactionEnabled=false;
     await Promise.all([...this.#childBindings].map(child=>child.disableInteraction()));
     await Promise.allSettled(this.#frames.map(frame=>send(this.tabId,frame,{type:'VV_SET_INTERACTION',binding:{session_id:this.sessionId,epoch:this.#epoch,enabled:false}})));
-    await this.#videoInput.close();
   }
   async #page<T>(request:CoursePageRequest,signal:AbortSignal):Promise<T>{
     if(request.operation==='pause'){
@@ -223,18 +254,17 @@ export class CourseTabPlatform implements CourseAdapter {
       if(!this.#catalog)throw new Error('视频暂停缺少课程身份。');
       return send<T>(this.tabId,frameId,{type:'VV_PAUSE_COURSE_MEDIA',course_id:this.courseId,context_id:this.#catalog.context_id??null,session_id:this.sessionId,interaction_epoch:this.#epoch},signal);
     }
-    if(!await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:this.#frame})){await this.selectFrame(signal);await this.enableInteraction();}
+    if(!await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:this.#frame}))throw new Error('COURSE_OBSERVATION_STALE: 课程框架需要重新定位。');
     await this.#authorize(signal);
     const frame=await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:this.#frame});signal.throwIfAborted();
-    if(frame?.documentId!==this.#documentId){await this.enableInteraction();signal.throwIfAborted();}
+    if(frame?.documentId!==this.#documentId){if(!this.#interactionEnabled)throw new Error('USER_INTERACTION: 课程交互已取消。');throw new Error('COURSE_OBSERVATION_STALE: 课程文档需要重新绑定。');}
     await this.#surface(this.#frame,signal,undefined,request.operation==='catalog'||request.operation==='directory'||request.operation==='enter'&&request.task.kind==='lesson'?'directory':'task');
     if(this.#catalog)await send(this.tabId,this.#frame,{type:'VV_COURSE',request:{operation:'bind',catalog:this.#catalog},session_id:this.sessionId,interaction_epoch:this.#epoch},signal);
     const mediaOperation=['video','speed','speed_target','mute','play','rewatch'].includes(request.operation);
     const target=mediaOperation&&'task' in request?await this.resourceFrame('video',request.task,signal):this.#frame;
-    if(request.operation==='speed_target')this.#hoverFrame=target;
     return send<T>(this.tabId,target,{type:'VV_COURSE',request,session_id:this.sessionId,interaction_epoch:this.#epoch},signal);
   }
-  catalog(signal:AbortSignal):Promise<CourseCatalog>{return this.#page({operation:'catalog'},signal);}
+  catalog(signal:AbortSignal):Promise<CourseCatalog>{return this.recoverObservation(undefined,recovered=>this.#page({operation:'catalog'},recovered),signal);}
   private async reconcileNavigation(before:chrome.webNavigation.GetFrameResultDetails|null,task:LearningTask|null,error:unknown,signal:AbortSignal):Promise<void>{
     if(!before?.documentId)throw error;
     const observed=this.#surfaceCache.get(this.#frame)?.reading;
@@ -360,26 +390,21 @@ export class CourseTabPlatform implements CourseAdapter {
     catch(error){await this.reconcileNavigation(before,task,error,signal);}
   }
   async video(task:LearningTask,signal:AbortSignal):Promise<VideoSnapshot>{
-    await this.hover(task,signal);
-    const video=await this.#page<VideoSnapshot>({operation:'video',course_id:this.courseId,task,hover_at:this.#inputAt},signal);
-    return {...video,background_input_confirmed:this.#inputAt>0&&Date.now()-this.#inputAt<5000};
-  }
-  private async projectedTarget(task:LearningTask,signal:AbortSignal):Promise<CourseSpeedTarget|null>{
-    const target=await this.#page<CourseSpeedTarget|null>({operation:'speed_target',course_id:this.courseId,task},signal);if(!target)return target;
-    return this.projectTarget(target,this.#hoverFrame,signal);
+    return this.recoverObservation(task,recovered=>this.#page<VideoSnapshot>({operation:'video',course_id:this.courseId,task},recovered),signal);
   }
   private async projectTarget(target:CourseSpeedTarget,frameId:number,signal:AbortSignal):Promise<CourseSpeedTarget>{
     return projectCourseTarget(this.tabId,frameId,target,signal);
   }
-  private async hover(task:LearningTask,signal:AbortSignal):Promise<void>{
-    await this.#videoInput.hover(task,signal);this.#inputAt=this.#videoInput.capturedAt;
-  }
   async highestAllowedSpeed(task:LearningTask,signal:AbortSignal):Promise<void>{
-    await this.hover(task,signal);
     await this.#page({operation:'speed',course_id:this.courseId,task},signal);
   }
   async mute(task:LearningTask,signal:AbortSignal):Promise<void>{const tab=await chrome.tabs.update(this.tabId,{muted:true});signal.throwIfAborted();if(!tab?.mutedInfo?.muted)throw new Error('课程标签静音未确认。');await this.#page({operation:'mute',course_id:this.courseId,task,tab_muted:true},signal);}
-  async play(task:LearningTask,signal:AbortSignal):Promise<void>{await this.hover(task,signal);const tab=await chrome.tabs.get(this.tabId);signal.throwIfAborted();await this.#page({operation:'play',course_id:this.courseId,task,hover_at:this.#inputAt,tab_muted:tab.mutedInfo?.muted===true},signal);}
+  async play(task:LearningTask,signal:AbortSignal):Promise<void>{
+    const state=await this.video(task,signal);if(!state.paused||state.ended||state.popup)return;
+    const tab=await chrome.tabs.get(this.tabId);signal.throwIfAborted();
+    try{await this.#page({operation:'play',course_id:this.courseId,task,tab_muted:tab.mutedInfo?.muted===true},signal);}
+    catch(error){signal.throwIfAborted();const observed=await this.video(task,signal);if(!observed.paused||observed.ended||observed.popup)return;throw error;}
+  }
   pauseVideo(task:LearningTask,signal:AbortSignal):Promise<boolean>{return this.#page({operation:'pause',course_id:this.courseId,task},signal);}
   async pauseCurrent(signal:AbortSignal):Promise<boolean>{
     if(!this.#catalog)throw new Error('课程暂停缺少目录身份。');
@@ -407,7 +432,7 @@ export class CourseTabPlatform implements CourseAdapter {
   async verify(task:LearningTask,signal:AbortSignal):Promise<CourseVerification>{
     await this.#authorize(signal);
     const cached=this.quizResults.get(task.id);if(cached)return cached;
-    const record=await this.#page<CourseVerification>({operation:'verify',course_id:this.courseId,task},signal);
+    const record=await this.recoverObservation(task,recovered=>this.#page<CourseVerification>({operation:'verify',course_id:this.courseId,task},recovered),signal);
     if(record.task_id!==task.id)throw new Error('平台记录不属于当前任务。');
     if(task.kind!=='video')return record;
     const parent=await chrome.webNavigation.getFrame({tabId:this.tabId,frameId:this.#frame});signal.throwIfAborted();
@@ -458,7 +483,6 @@ export class CourseTabPlatform implements CourseAdapter {
     return result;
   }
   async quizTransport(boundary:QuizBoundary,task:LearningTask,signal:AbortSignal,questionId?:string):Promise<VisualTransport>{
-    await this.#videoInput.close();
     return new VisualTransport(this.tabId,()=>this.quizRequest<VisualGeometry>(boundary,task,questionId?{type:'VV_CHAOXING_QUESTION_GEOMETRY',question_id:questionId}:{type:'VV_VISUAL_GEOMETRY'},signal),
       ()=>this.#interactionEnabled?this.interactionBinding():null,
       async ticket=>{await Promise.all(this.#frames.map(frame=>send(this.tabId,frame,{type:'VV_ARM_NATIVE_INPUT',ticket})));},false);
